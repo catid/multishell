@@ -124,9 +124,12 @@ def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path,
     install_root = tmp_path / "install"
     bin_dir = tmp_path / "bin"
     wrapper = bin_dir / "multishell"
+    state_dir = tmp_path / "state"
     install_root.mkdir()
     bin_dir.mkdir()
+    state_dir.mkdir()
     wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr("multishell.__main__.state_root", lambda: state_dir)
 
     args = parser.parse_args(
         [
@@ -143,23 +146,25 @@ def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path,
     out = capsys.readouterr().out
     assert f"removed {wrapper}" in out
     assert f"removed {install_root}" in out
+    assert f"removed {state_dir}" in out
     assert not wrapper.exists()
     assert not install_root.exists()
+    assert not state_dir.exists()
 
 
-def test_uninstall_can_purge_state(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+def test_uninstall_can_keep_state(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     parser = build_parser()
     state_dir = tmp_path / "state"
     state_dir.mkdir()
 
     monkeypatch.setattr("multishell.__main__.state_root", lambda: state_dir)
 
-    args = parser.parse_args(["uninstall", "--yes", "--purge-state"])
+    args = parser.parse_args(["uninstall", "--yes", "--keep-state"])
 
     assert args.func(args) == 0
     out = capsys.readouterr().out
-    assert f"removed {state_dir}" in out
-    assert not state_dir.exists()
+    assert f"removed {state_dir}" not in out
+    assert state_dir.exists()
 
 
 def test_uninstall_aborts_without_confirmation(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

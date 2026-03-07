@@ -57,16 +57,16 @@ multishell auth-login worker-1
 
 ## Uninstall
 
-Remove the installed wrapper and runtime:
+Remove the installed wrapper, runtime, and saved state:
 
 ```bash
 multishell uninstall
 ```
 
-Remove the install plus all saved account data, auth state, browser profiles, and other runtime files under `~/.multishell`:
+Remove the install but keep the saved account data, auth state, browser profiles, and other runtime files under `~/.multishell`:
 
 ```bash
-multishell uninstall --purge-state
+multishell uninstall --keep-state
 ```
 
 ## Notes

@@ -138,7 +138,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     runtime_state = state_root()
 
     targets = [str(wrapper), str(install_root)]
-    if args.purge_state:
+    if not args.keep_state:
         targets.append(str(runtime_state))
 
     if not args.yes:
@@ -165,7 +165,7 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     else:
         missing.append(str(install_root))
 
-    if args.purge_state:
+    if not args.keep_state:
         if runtime_state.exists():
             shutil.rmtree(runtime_state)
             removed.append(str(runtime_state))
@@ -264,7 +264,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     uninstall_parser = subparsers.add_parser("uninstall")
     uninstall_parser.add_argument("--yes", action="store_true")
-    uninstall_parser.add_argument("--purge-state", action="store_true")
+    uninstall_parser.add_argument("--keep-state", action="store_true")
     uninstall_parser.add_argument("--install-root")
     uninstall_parser.add_argument("--bin-dir")
     uninstall_parser.set_defaults(func=cmd_uninstall)
