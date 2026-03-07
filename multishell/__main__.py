@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,10 @@ from .config import (
 )
 from .homes import agent_home, all_agent_names, auth_path, claude_home, claude_logged_in, ensure_agent_home, ensure_claude_home
 from .runtime import cleanup_stale_runtime, ensure_runtime_environment, suppress_node_warnings
+
+
+DEFAULT_INSTALL_ROOT = Path.home() / ".local" / "share" / "multishell"
+DEFAULT_BIN_DIR = Path.home() / ".local" / "bin"
 
 
 def _bridge_command(role: str, agent: str) -> list[str]:
@@ -52,6 +57,16 @@ def _write_default_config(target: Path, *, force: bool) -> None:
     if target.exists() and not force:
         return
     target.write_text(dotenv_template_text().rstrip("\n") + "\n", encoding="utf-8")
+
+
+def _install_root() -> Path:
+    override = os.environ.get("MULTISHELL_INSTALL_ROOT", "").strip()
+    return Path(override).expanduser() if override else DEFAULT_INSTALL_ROOT
+
+
+def _bin_dir() -> Path:
+    override = os.environ.get("MULTISHELL_BIN_DIR", "").strip()
+    return Path(override).expanduser() if override else DEFAULT_BIN_DIR
 
 
 def cmd_run(_: argparse.Namespace) -> int:
@@ -113,6 +128,54 @@ def cmd_install_browser(_: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("playwright"):
         return 0
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    return 0
+
+
+def cmd_uninstall(args: argparse.Namespace) -> int:
+    install_root = Path(args.install_root).expanduser() if args.install_root else _install_root()
+    bin_dir = Path(args.bin_dir).expanduser() if args.bin_dir else _bin_dir()
+    wrapper = bin_dir / "multishell"
+    runtime_state = state_root()
+
+    targets = [str(wrapper), str(install_root)]
+    if args.purge_state:
+        targets.append(str(runtime_state))
+
+    if not args.yes:
+        print("This will remove:")
+        for target in targets:
+            print(f"  {target}")
+        confirm = input("Continue? [y/N] ").strip().lower()
+        if confirm not in {"y", "yes"}:
+            print("aborted")
+            return 1
+
+    removed: list[str] = []
+    missing: list[str] = []
+
+    if wrapper.exists() or wrapper.is_symlink():
+        wrapper.unlink()
+        removed.append(str(wrapper))
+    else:
+        missing.append(str(wrapper))
+
+    if install_root.exists():
+        shutil.rmtree(install_root)
+        removed.append(str(install_root))
+    else:
+        missing.append(str(install_root))
+
+    if args.purge_state:
+        if runtime_state.exists():
+            shutil.rmtree(runtime_state)
+            removed.append(str(runtime_state))
+        else:
+            missing.append(str(runtime_state))
+
+    for target in removed:
+        print(f"removed {target}")
+    for target in missing:
+        print(f"not found {target}")
     return 0
 
 
@@ -198,6 +261,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     browser_parser = subparsers.add_parser("install-browser")
     browser_parser.set_defaults(func=cmd_install_browser)
+
+    uninstall_parser = subparsers.add_parser("uninstall")
+    uninstall_parser.add_argument("--yes", action="store_true")
+    uninstall_parser.add_argument("--purge-state", action="store_true")
+    uninstall_parser.add_argument("--install-root")
+    uninstall_parser.add_argument("--bin-dir")
+    uninstall_parser.set_defaults(func=cmd_uninstall)
 
     run_parser = subparsers.add_parser("run")
     run_parser.set_defaults(func=cmd_run)

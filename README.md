@@ -55,6 +55,20 @@ Do a single agent auth login without the automation flow:
 multishell auth-login worker-1
 ```
 
+## Uninstall
+
+Remove the installed wrapper and runtime:
+
+```bash
+multishell uninstall
+```
+
+Remove the install plus all saved account data, auth state, browser profiles, and other runtime files under `~/.multishell`:
+
+```bash
+multishell uninstall --purge-state
+```
+
 ## Notes
 
 - Runtime state lives under `~/.multishell` by default.

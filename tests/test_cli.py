@@ -119,6 +119,63 @@ def test_install_browser_runs_playwright_install(monkeypatch) -> None:
     assert captured["check"] is True
 
 
+def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    install_root = tmp_path / "install"
+    bin_dir = tmp_path / "bin"
+    wrapper = bin_dir / "multishell"
+    install_root.mkdir()
+    bin_dir.mkdir()
+    wrapper.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    args = parser.parse_args(
+        [
+            "uninstall",
+            "--yes",
+            "--install-root",
+            str(install_root),
+            "--bin-dir",
+            str(bin_dir),
+        ]
+    )
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert f"removed {wrapper}" in out
+    assert f"removed {install_root}" in out
+    assert not wrapper.exists()
+    assert not install_root.exists()
+
+
+def test_uninstall_can_purge_state(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    monkeypatch.setattr("multishell.__main__.state_root", lambda: state_dir)
+
+    args = parser.parse_args(["uninstall", "--yes", "--purge-state"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert f"removed {state_dir}" in out
+    assert not state_dir.exists()
+
+
+def test_uninstall_aborts_without_confirmation(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    install_root = tmp_path / "install"
+    install_root.mkdir()
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+
+    args = parser.parse_args(["uninstall", "--install-root", str(install_root)])
+
+    assert args.func(args) == 1
+    out = capsys.readouterr().out
+    assert "aborted" in out
+    assert install_root.exists()
+
+
 def test_main_defaults_to_run_when_no_subcommand(monkeypatch) -> None:
     monkeypatch.setattr("multishell.__main__.cmd_run", lambda _args: 7)
 
