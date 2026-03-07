@@ -43,18 +43,6 @@ Edit the account list again later:
 multishell login
 ```
 
-Run the browser auth automation again:
-
-```bash
-multishell auto-login --all --headed
-```
-
-Do a single agent auth login without the automation flow:
-
-```bash
-multishell auth-login worker-1
-```
-
 ## Uninstall
 
 Remove the installed wrapper, runtime, and saved state:
