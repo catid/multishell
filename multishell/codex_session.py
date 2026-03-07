@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable
 import json
 import os
@@ -15,6 +16,10 @@ from pathlib import Path
 
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.client import ClientConnection, connect
+
+
+ABRUPT_CLOSE_CODES = {1005, 1006, 1011}
+CLEAN_CLOSE_CODES = {1000, 1001}
 
 from .config import MODEL, MODEL_REASONING_EFFORT, AgentSpec, workspace_root
 from .homes import ensure_agent_home
@@ -37,6 +42,14 @@ OPT_OUT_NOTIFICATION_METHODS = [
     "item/reasoning/summaryTextDelta",
     "item/reasoning/textDelta",
 ]
+
+
+IGNORED_STDERR_PATTERNS = (
+    "DeprecationWarning:",
+    "Use `node --trace-deprecation",
+    "[DEP",
+    "warning was created)",
+)
 
 
 def _now() -> float:
@@ -99,6 +112,12 @@ class SessionState:
     auth_mode: str | None = None
     plan_type: str | None = None
     persona_label: str = ""
+    last_disconnect_kind: str | None = None
+    last_disconnect_retryable: bool = False
+    last_disconnect_code: int | None = None
+    last_disconnect_reason: str | None = None
+    last_process_exit_code: int | None = None
+    last_transport_diagnostics: str | None = None
 
     def push(self, source: str, text: str) -> TranscriptEntry | None:
         clean = text.strip()
@@ -165,6 +184,8 @@ class CodexSession:
         self._turn_done = threading.Event()
         self._current_turn_error: str | None = None
         self._intentional_transport_close = threading.Event()
+        self._transport_closed = threading.Event()
+        self._stderr_tail: deque[str] = deque(maxlen=8)
 
     def start(self) -> None:
         if self._started:
@@ -222,6 +243,12 @@ class CodexSession:
             self.state.status = "stopped" if not self._stop.is_set() else "stopped"
             self.state.current_task_source = ""
             self.state.updated_at = _now()
+            self.state.last_disconnect_kind = None
+            self.state.last_disconnect_retryable = False
+            self.state.last_disconnect_code = None
+            self.state.last_disconnect_reason = None
+            self.state.last_process_exit_code = None
+            self.state.last_transport_diagnostics = None
             current_cwd = self.state.current_cwd
         self._emit_event("session_stopped", "session stopped", cwd=current_cwd)
 
@@ -277,6 +304,12 @@ class CodexSession:
                 "auth_mode": self.state.auth_mode,
                 "plan_type": self.state.plan_type,
                 "persona_label": self.state.persona_label,
+                "last_disconnect_kind": self.state.last_disconnect_kind,
+                "last_disconnect_retryable": self.state.last_disconnect_retryable,
+                "last_disconnect_code": self.state.last_disconnect_code,
+                "last_disconnect_reason": self.state.last_disconnect_reason,
+                "last_process_exit_code": self.state.last_process_exit_code,
+                "last_transport_diagnostics": self.state.last_transport_diagnostics,
                 "engine": self.spec.engine,
                 "model": self.model,
             }
@@ -323,8 +356,10 @@ class CodexSession:
         port = _reserve_port()
         env = child_env(os.environ.copy(), role="codex-session", agent=self.spec.name)
         env["HOME"] = str(self.home)
+        env.setdefault("NODE_NO_WARNINGS", "1")
         process = subprocess.Popen(
             ["codex", "app-server", "--listen", f"ws://127.0.0.1:{port}"],
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
@@ -343,6 +378,8 @@ class CodexSession:
 
         self._turn_done.clear()
         self._current_turn_error = None
+        self._transport_closed.clear()
+        self._stderr_tail.clear()
         self._reader_thread = threading.Thread(target=self._socket_reader, name=f"multishell-{self.spec.name}-ws", daemon=True)
         self._reader_thread.start()
         if process.stderr is not None:
@@ -387,6 +424,12 @@ class CodexSession:
             self.state.current_cwd = str(thread.get("cwd") or self.working_dir)
             self.state.updated_at = _now()
             self.state.last_error = None
+            self.state.last_disconnect_kind = None
+            self.state.last_disconnect_retryable = False
+            self.state.last_disconnect_code = None
+            self.state.last_disconnect_reason = None
+            self.state.last_process_exit_code = None
+            self.state.last_transport_diagnostics = None
             current_cwd = self.state.current_cwd
             persona_label = self.state.persona_label
         self._push_line("system", f"session started in {current_cwd} as {persona_label}")
@@ -426,10 +469,17 @@ class CodexSession:
 
     def _send(self, payload: dict[str, object]) -> None:
         message = json.dumps(payload, ensure_ascii=True)
-        with self._ws_lock:
-            if self._ws is None:
-                raise RuntimeError("app-server websocket is not connected")
-            self._ws.send(message)
+        try:
+            with self._ws_lock:
+                if self._ws is None:
+                    raise RuntimeError("app-server websocket is not connected")
+                self._ws.send(message)
+        except ConnectionClosed as exc:
+            detail = self._handle_transport_closed(connection_closed=exc)
+            raise RuntimeError(detail) from exc
+        except OSError as exc:
+            detail = self._handle_transport_closed(reader_error=exc)
+            raise RuntimeError(detail) from exc
 
     def _run_turn(self, turn: TurnRequest) -> None:
         started_at = _now()
@@ -475,6 +525,8 @@ class CodexSession:
             raise RuntimeError(self._current_turn_error)
 
     def _socket_reader(self) -> None:
+        close_exc: ConnectionClosed | None = None
+        reader_error: Exception | None = None
         try:
             while not self._stop.is_set():
                 with self._ws_lock:
@@ -494,12 +546,13 @@ class CodexSession:
                     continue
                 if "method" in message:
                     self._handle_notification(message)
-        except ConnectionClosed:
-            pass
+        except ConnectionClosed as exc:
+            close_exc = exc
         except Exception as exc:  # pragma: no cover - defensive
+            reader_error = exc
             self._push_line("error", f"app-server reader failed: {exc}")
         finally:
-            self._handle_transport_closed()
+            self._handle_transport_closed(connection_closed=close_exc, reader_error=reader_error)
 
     def _stderr_reader(self, stderr: subprocess.PIPE[str]) -> None:
         try:
@@ -507,6 +560,9 @@ class CodexSession:
                 clean = line.strip()
                 if not clean:
                     continue
+                if _ignore_process_noise(clean):
+                    continue
+                self._stderr_tail.append(clean)
                 source = "event"
                 if "error" in clean.lower():
                     source = "error"
@@ -514,30 +570,133 @@ class CodexSession:
         except Exception:  # pragma: no cover - defensive
             return
 
-    def _handle_transport_closed(self) -> None:
+    def _describe_transport_close(
+        self,
+        *,
+        intentional: bool,
+        was_running: bool,
+        connection_closed: ConnectionClosed | None,
+        reader_error: Exception | None,
+    ) -> tuple[str, bool, str, dict[str, object]]:
+        close_code = getattr(connection_closed, "code", None)
+        close_reason = getattr(connection_closed, "reason", None)
+        with self._process_lock:
+            process = self._process
+        exit_code = process.poll() if process is not None else None
+        stderr_tail = list(self._stderr_tail)
+        stderr_summary = " | ".join(stderr_tail[-3:]) if stderr_tail else None
+
+        if intentional:
+            disconnect_kind = "intentional_shutdown"
+            retryable = False
+            summary = "app-server transport closed during shutdown"
+        elif reader_error is not None:
+            disconnect_kind = "reader_error"
+            retryable = True
+            summary = "app-server transport failed while reading events"
+        elif close_code in CLEAN_CLOSE_CODES and exit_code in (None, 0) and not was_running:
+            disconnect_kind = "clean_disconnect"
+            retryable = False
+            summary = "app-server closed the websocket cleanly"
+        elif close_code in ABRUPT_CLOSE_CODES or exit_code not in (None, 0) or was_running:
+            disconnect_kind = "abrupt_disconnect"
+            retryable = True
+            summary = "app-server disconnected unexpectedly"
+        else:
+            disconnect_kind = "connection_closed"
+            retryable = True
+            summary = "app-server connection closed"
+
+        parts = [summary]
+        if was_running and not intentional:
+            parts.append("during active turn")
+        if close_code is not None:
+            parts.append(f"ws_code={close_code}")
+        if close_reason:
+            parts.append(f"ws_reason={close_reason}")
+        if exit_code is not None:
+            parts.append(f"exit_code={exit_code}")
+        if reader_error is not None:
+            parts.append(f"reader_error={reader_error}")
+        if stderr_summary:
+            parts.append(f"stderr_tail={stderr_summary}")
+        detail = "; ".join(parts)
+        data: dict[str, object] = {
+            "disconnect_kind": disconnect_kind,
+            "retryable": retryable,
+            "recommended_action": "restart_session" if retryable else "none",
+            "during_turn": was_running,
+        }
+        if close_code is not None:
+            data["ws_code"] = close_code
+        if close_reason:
+            data["ws_reason"] = close_reason
+        if exit_code is not None:
+            data["exit_code"] = exit_code
+        if stderr_tail:
+            data["stderr_tail"] = stderr_tail
+        if reader_error is not None:
+            data["reader_error"] = str(reader_error)
+        return disconnect_kind, retryable, detail, data
+
+    def _handle_transport_closed(
+        self,
+        *,
+        connection_closed: ConnectionClosed | None = None,
+        reader_error: Exception | None = None,
+    ) -> str:
+        if self._transport_closed.is_set():
+            with self._state_lock:
+                return self.state.last_transport_diagnostics or self.state.last_error or "app-server connection closed"
+        self._transport_closed.set()
+
         intentional = self._intentional_transport_close.is_set()
+        finished_at = _now()
         with self._state_lock:
             was_running = self.state.turn_id is not None
+        disconnect_kind, retryable, detail, event_data = self._describe_transport_close(
+            intentional=intentional,
+            was_running=was_running,
+            connection_closed=connection_closed,
+            reader_error=reader_error,
+        )
+        with self._state_lock:
             self.state.process_alive = False
             self.state.session_active = False
             self.state.turn_id = None
+            self.state.updated_at = finished_at
+            self.state.last_disconnect_kind = disconnect_kind
+            self.state.last_disconnect_retryable = retryable
+            self.state.last_disconnect_code = event_data.get("ws_code") if isinstance(event_data.get("ws_code"), int) else None
+            self.state.last_disconnect_reason = str(event_data.get("ws_reason")) if event_data.get("ws_reason") else None
+            self.state.last_process_exit_code = event_data.get("exit_code") if isinstance(event_data.get("exit_code"), int) else None
+            self.state.last_transport_diagnostics = detail
+            if was_running:
+                self.state.last_turn_finished_at = finished_at
+                if self.state.last_turn_started_at is not None:
+                    self.state.last_turn_duration = finished_at - self.state.last_turn_started_at
+                self.state.current_task_source = ""
             if not intentional and not self._stop.is_set() and self.state.status != "stopped":
                 self.state.status = "error"
-                self.state.last_error = self.state.last_error or "app-server connection closed"
+                self.state.last_error = detail
                 if was_running:
                     self.state.failed_turns += 1
                     self.state.consecutive_failures += 1
-            self.state.updated_at = _now()
-            detail = self.state.last_error or "app-server connection closed"
-        self._current_turn_error = self._current_turn_error or "app-server connection closed"
+            elif not intentional:
+                self.state.last_error = detail
+        if not intentional:
+            self._push_line("error" if retryable else "event", detail)
+        self._current_turn_error = self._current_turn_error or detail
         self._turn_done.set()
         if not intentional:
-            self._emit_event("transport_closed", detail)
+            self._emit_event("transport_closed", detail, **event_data)
         with self._request_lock:
             waiters = list(self._response_waiters.values())
             self._response_waiters.clear()
+        error_payload = {"message": detail, "retryable": retryable, **event_data}
         for waiter in waiters:
-            waiter.put({"error": {"message": "app-server connection closed"}})
+            waiter.put({"error": error_payload})
+        return detail
 
     def _handle_notification(self, message: dict[str, object]) -> None:
         method = str(message.get("method", ""))
@@ -800,3 +959,11 @@ class CodexSession:
         if stderr_thread is not None and stderr_thread.is_alive():
             stderr_thread.join(timeout=1)
         self._intentional_transport_close.clear()
+
+
+def _ignore_process_noise(line: str) -> bool:
+    if any(pattern in line for pattern in IGNORED_STDERR_PATTERNS):
+        return True
+    if line.startswith("(node:") and "[DEP" in line:
+        return True
+    return False

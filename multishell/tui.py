@@ -30,11 +30,36 @@ class InputState:
         self.cursor = 0
 
 
+@dataclass(frozen=True)
+class ComposerBuffer:
+    lines: list[str]
+    cursor_row: int
+    cursor_col: int
+
+
+@dataclass(frozen=True)
+class ComposerLayout:
+    title: str
+    hint: str
+    visible_lines: list[str]
+    content_rows: int
+    box_top: int
+    box_bottom: int
+    cursor_y: int
+    cursor_x: int
+
+
 def run_tui(controller: MultiShellController) -> None:
     curses.wrapper(lambda stdscr: _main(stdscr, controller))
 
 
 def _main(stdscr: curses.window, controller: MultiShellController) -> None:
+    try:
+        curses.noecho()
+        curses.cbreak()
+        curses.nonl()
+    except curses.error:
+        pass
     try:
         curses.curs_set(1)
     except curses.error:
@@ -51,18 +76,20 @@ def _main(stdscr: curses.window, controller: MultiShellController) -> None:
         stdscr.erase()
         height, width = stdscr.getmaxyx()
         session_names = [row["name"] for row in controller.session_rows()]
+        composer = _layout_composer(input_state, height, width, debug_mode)
 
         if height < MIN_HEIGHT or width < MIN_WIDTH:
             _draw_too_small(stdscr, height, width)
         else:
             content_top = _draw_header(stdscr, controller, width)
-            content_bottom = height - 4
+            footer_row = max(content_top, composer.box_top - 1)
+            content_bottom = max(content_top, footer_row - 1)
             if debug_mode:
                 _draw_debug_view(stdscr, controller, debug_state, content_top, content_bottom, width)
             else:
                 _draw_chat_view(stdscr, controller, content_top, content_bottom, width)
-            _draw_footer(stdscr, controller, debug_mode, debug_state, height, width)
-            _draw_input(stdscr, input_state, height, width, debug_mode)
+            _draw_footer(stdscr, controller, debug_mode, debug_state, footer_row, width)
+            _draw_composer(stdscr, input_state, composer, width)
 
         try:
             stdscr.refresh()
@@ -90,6 +117,9 @@ def _main(stdscr: curses.window, controller: MultiShellController) -> None:
             if text:
                 controller.send_user_message(text)
             input_state.clear()
+            continue
+        if key == "\x0e":
+            _insert_text(input_state, "\n")
             continue
         if key in ("\x08", "\x7f") or key == curses.KEY_BACKSPACE:
             _delete_backwards(input_state)
@@ -148,31 +178,30 @@ def _draw_too_small(stdscr: curses.window, height: int, width: int) -> None:
 
 
 def _draw_header(stdscr: curses.window, controller: MultiShellController, width: int) -> int:
-    sessions = controller.session_rows()
-    worker_count = max(0, len(sessions) - 1)
-    title = f" Multishell  manager + {worker_count} workers  Tab=debug  Ctrl+C=quit "
+    items = controller.monitor_items()
+    title = " Multishell  swarm monitor  Tab=debug  Ctrl+C=quit "
     _safe_fill_line(stdscr, 0, width, " ", curses.color_pair(7))
     _safe_add_display_text(stdscr, 0, 0, title, width - 1, curses.color_pair(7))
 
     row = 1
     col = 0
     _safe_fill_line(stdscr, row, width, " ")
-    for session in sessions:
-        label = _session_chip(session)
+    for item in items:
+        label = _monitor_chip(item)
         if col and col + _display_width(label) >= width:
             row += 1
             col = 0
             _safe_fill_line(stdscr, row, width, " ")
-        attr = curses.color_pair(_status_color(session)) | curses.A_BOLD
+        attr = curses.color_pair(_monitor_color(item)) | curses.A_BOLD | curses.A_REVERSE
         _safe_add_display_text(stdscr, row, col, label, max(0, width - col - 1), attr)
-        col += _display_width(label)
+        col += _display_width(label) + 1
 
     reasoners = controller.active_reasoner_counts()
     summary = (
         f" chat={len(controller.recent_messages(200))}"
         f"  web_run={reasoners['running']}"
         f"  web_q={reasoners['queued']}"
-        f"  updated={format_timestamp(time.time())} "
+        f"  updated={format_timestamp(_last_activity_timestamp(controller))} "
     )
     _safe_fill_line(stdscr, row + 1, width, " ")
     _safe_add_display_text(stdscr, row + 1, 0, summary, width - 1, curses.color_pair(1))
@@ -194,7 +223,11 @@ def _draw_chat_view(
     for message in messages:
         prefix = f"[{format_timestamp(message.ts)}] {message.source}: "
         prefix_width = _display_width(prefix)
-        wrapped = _wrap_display_text(message.text, max(12, width - prefix_width - 1)) or [""]
+        body_width = max(12, width - prefix_width - 1)
+        if message.source in accent_by_source and message.source != "manager":
+            wrapped = [_single_line_snippet(message.text, body_width)]
+        else:
+            wrapped = _wrap_display_text(message.text, body_width) or [""]
         color = _message_color(message.source, message.level, accent_by_source)
         rendered.append((prefix + wrapped[0], 0, color))
         for continuation in wrapped[1:]:
@@ -343,7 +376,7 @@ def _draw_footer(
     controller: MultiShellController,
     debug_mode: bool,
     debug_state: DebugState,
-    height: int,
+    row: int,
     width: int,
 ) -> None:
     sessions = controller.session_rows()
@@ -358,26 +391,48 @@ def _draw_footer(
         )
     else:
         footer = "Enter=send  Tab=debug  Ctrl+C=quit"
-    _safe_fill_line(stdscr, height - 3, width, " ")
-    _safe_addnstr(stdscr, height - 3, 0, footer, width - 1, curses.color_pair(3))
+    _safe_fill_line(stdscr, row, width, " ")
+    _safe_addnstr(stdscr, row, 0, footer, width - 1, curses.color_pair(3))
 
 
-def _draw_input(
+def _draw_composer(
     stdscr: curses.window,
     input_state: InputState,
-    height: int,
+    layout: ComposerLayout,
     width: int,
-    debug_mode: bool,
 ) -> None:
-    prompt = "chat(debug)> " if debug_mode else "chat> "
-    _safe_hline(stdscr, height - 2, width, "-")
-    available = max(1, width - _display_width(prompt) - 1)
-    visible_input, cursor_column = _visible_input_window(input_state.text, input_state.cursor, available)
-    _safe_fill_line(stdscr, height - 1, width, " ")
-    _safe_add_display_text(stdscr, height - 1, 0, prompt + visible_input, width - 1)
-    cursor_x = min(width - 1, _display_width(prompt) + cursor_column)
+    top = layout.box_top
+    bottom = layout.box_bottom
+    content_width = max(1, width - 4)
+
+    _safe_fill_line(stdscr, top, width, " ")
+    _safe_fill_line(stdscr, bottom, width, " ")
+    _safe_addnstr(stdscr, top, 0, "+" + "-" * max(0, width - 3) + "+", width - 1)
+    _safe_add_display_text(stdscr, top, 2, layout.title, max(0, width - 5), curses.color_pair(1) | curses.A_BOLD)
+    hint_width = max(0, width - _display_width(layout.title) - 8)
+    if hint_width > 0:
+        _safe_add_display_text(stdscr, top, max(2, width - hint_width - 3), layout.hint, hint_width, curses.color_pair(3))
+    for row in range(top + 1, bottom):
+        _safe_fill_line(stdscr, row, width, " ")
+        _safe_addnstr(stdscr, row, 0, "|", 1)
+        _safe_addnstr(stdscr, row, width - 2, "|", 1)
+    _safe_addnstr(stdscr, bottom, 0, "+" + "-" * max(0, width - 3) + "+", width - 1)
+
+    for index in range(layout.content_rows):
+        row = top + 1 + index
+        text = layout.visible_lines[index] if index < len(layout.visible_lines) else ""
+        if not text and not input_state.text:
+            text = "Type a message for the manager..."
+            attr = curses.color_pair(3)
+        else:
+            attr = 0
+        _safe_fill_line(stdscr, row, width, " ")
+        _safe_addnstr(stdscr, row, 0, "|", 1)
+        _safe_addnstr(stdscr, row, width - 2, "|", 1)
+        _safe_add_display_text(stdscr, row, 2, text, content_width, attr)
+
     try:
-        stdscr.move(height - 1, cursor_x)
+        stdscr.move(layout.cursor_y, layout.cursor_x)
     except curses.error:
         pass
 
@@ -404,37 +459,28 @@ def _delete_forwards(input_state: InputState) -> None:
     input_state.text = input_state.text[: input_state.cursor] + input_state.text[input_state.cursor + 1 :]
 
 
-def _visible_input_window(text: str, cursor: int, available: int) -> tuple[str, int]:
-    bounded_cursor = max(0, min(cursor, len(text)))
-    if available <= 0:
-        return "", 0
-    if _display_width(text) <= available:
-        return text, _display_width(text[:bounded_cursor])
-
-    if available == 1:
-        return "<", 0
-
-    body_width = max(1, available - 2)
-    cursor_left = _display_width(text[:bounded_cursor])
-    start = 0
-    max_start = len(text)
-    while start < max_start and cursor_left - _display_width(text[:start]) > body_width // 2:
-        start += 1
-    visible_body = _truncate_display(text[start:], body_width)
-    visible_width = _display_width(visible_body)
-    while start > 0 and cursor_left - _display_width(text[:start]) < 0:
-        start -= 1
-        visible_body = _truncate_display(text[start:], body_width)
-        visible_width = _display_width(visible_body)
-    prefix = "<" if start > 0 else ""
-    suffix = ">" if start + len(visible_body) < len(text) else ""
-    cursor_column = len(prefix) + max(0, cursor_left - _display_width(text[:start]))
-    visible = prefix + visible_body
-    if suffix and visible_width < body_width:
-        visible += suffix
-    elif suffix:
-        visible = _truncate_display(visible, max(0, available - 1)) + suffix
-    return visible, min(_display_width(visible), cursor_column)
+def _layout_composer(input_state: InputState, height: int, width: int, debug_mode: bool) -> ComposerLayout:
+    content_width = max(1, width - 4)
+    buffer = _compose_buffer(input_state.text, input_state.cursor, content_width)
+    max_content_rows = max(1, min(6, max(1, height // 4)))
+    content_rows = min(max_content_rows, max(1, len(buffer.lines)))
+    scroll_offset = max(0, buffer.cursor_row - content_rows + 1)
+    box_height = content_rows + 2
+    box_bottom = height - 1
+    box_top = max(0, box_bottom - box_height + 1)
+    visible_lines = buffer.lines[scroll_offset : scroll_offset + content_rows]
+    title = " chat(debug) " if debug_mode else " chat "
+    hint = "Enter send  Ctrl+N newline  Tab debug  Ctrl+C quit"
+    return ComposerLayout(
+        title=title,
+        hint=hint,
+        visible_lines=visible_lines,
+        content_rows=content_rows,
+        box_top=box_top,
+        box_bottom=box_bottom,
+        cursor_y=min(box_bottom - 1, box_top + 1 + (buffer.cursor_row - scroll_offset)),
+        cursor_x=min(width - 3, 2 + buffer.cursor_col),
+    )
 
 
 def _handle_debug_key(key: object, debug_state: DebugState, session_names: list[str], columns: int) -> bool:
@@ -476,11 +522,38 @@ def _shift_scroll(debug_state: DebugState, session_names: list[str], delta: int)
     debug_state.scroll_offsets[name] = max(0, current + delta)
 
 
-def _session_chip(session: dict[str, object]) -> str:
-    return (
-        f" {session['name']}:{session['status']} "
-        f"q={session['pending_tasks']} ok={session['completed_turns']} fail={session['failed_turns']} "
-    )
+def _monitor_chip(item: dict[str, object]) -> str:
+    return f" {item['label']} {_monitor_status_token(item)} "
+
+
+def _monitor_status_token(item: dict[str, object]) -> str:
+    status = str(item.get("status") or "idle")
+    pending = int(item.get("pending_tasks", 0))
+    failed = int(item.get("failed_turns", 0))
+    completed = int(item.get("completed_turns", 0))
+
+    if status == "error" or failed:
+        return f"FAIL{failed or ''}".rstrip()
+    if status in {"queued", "running", "canceling"}:
+        return f"RUN{pending}" if pending > 0 else "RUN"
+    if status == "completed":
+        return f"DONE{completed}" if completed > 0 else "DONE"
+    if status in {"canceled", "stopped"}:
+        return "OFF"
+    return "IDLE"
+
+
+def _monitor_color(item: dict[str, object]) -> int:
+    status = str(item.get("status") or "idle")
+    if status == "error" or int(item.get("failed_turns", 0)) > 0:
+        return 6
+    if status in {"queued", "running", "canceling"}:
+        return int(item.get("accent_color", 1))
+    if status == "completed":
+        return 1
+    if status in {"canceled", "stopped"}:
+        return 4
+    return 2
 
 
 def _status_color(session: dict[str, object]) -> int:
@@ -528,6 +601,18 @@ def _debug_column_count(width: int) -> int:
     return 1 if width < 110 else 2
 
 
+def _last_activity_timestamp(controller: MultiShellController) -> float:
+    last = 0.0
+    for row in controller.session_rows():
+        updated_at = row.get("updated_at")
+        if isinstance(updated_at, (int, float)):
+            last = max(last, float(updated_at))
+    messages = controller.recent_messages(1)
+    if messages:
+        last = max(last, messages[-1].ts)
+    return last or time.time()
+
+
 def _cell_width(char: str) -> int:
     if not char:
         return 0
@@ -558,6 +643,45 @@ def _truncate_display(text: str, max_width: int) -> str:
     return "".join(result)
 
 
+def _compose_buffer(text: str, cursor: int, width: int) -> ComposerBuffer:
+    bounded_cursor = max(0, min(cursor, len(text)))
+    if width <= 0:
+        return ComposerBuffer(lines=[""], cursor_row=0, cursor_col=0)
+
+    lines: list[str] = []
+    current: list[str] = []
+    current_width = 0
+    cursor_row = 0
+    cursor_col = 0
+
+    for index in range(len(text) + 1):
+        if index == bounded_cursor:
+            cursor_row = len(lines)
+            cursor_col = current_width
+        if index == len(text):
+            break
+
+        char = text[index]
+        if char == "\n":
+            lines.append("".join(current))
+            current = []
+            current_width = 0
+            continue
+
+        cell_width = max(1, _cell_width(char))
+        if current and current_width + cell_width > width:
+            lines.append("".join(current))
+            current = [char]
+            current_width = cell_width
+            continue
+
+        current.append(char)
+        current_width += cell_width
+
+    lines.append("".join(current))
+    return ComposerBuffer(lines=lines, cursor_row=cursor_row, cursor_col=cursor_col)
+
+
 def _wrap_display_text(text: str, width: int) -> list[str]:
     if width <= 0:
         return [""]
@@ -586,6 +710,17 @@ def _wrap_display_text(text: str, width: int) -> list[str]:
 
 def _safe_add_display_text(stdscr: curses.window, row: int, col: int, text: str, max_cells: int, attr: int = 0) -> None:
     _safe_addnstr(stdscr, row, col, _truncate_display(text, max_cells), max_cells, attr)
+
+
+def _single_line_snippet(text: str, max_width: int) -> str:
+    collapsed = " ".join(text.split())
+    if max_width <= 0:
+        return ""
+    if _display_width(collapsed) <= max_width:
+        return collapsed
+    if max_width <= 3:
+        return _truncate_display(collapsed, max_width)
+    return f"{_truncate_display(collapsed, max_width - 3)}..."
 
 
 def _safe_addnstr(stdscr: curses.window, row: int, col: int, text: str, max_chars: int, attr: int = 0) -> None:

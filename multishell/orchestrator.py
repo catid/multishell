@@ -64,6 +64,60 @@ class WorkerArchetype:
     coaching: str
 
 
+@dataclass
+class SessionLifecycleMetadata:
+    last_failure_at: float | None = None
+    last_failure_detail: str | None = None
+    last_failure_kind: str | None = None
+    disconnect_streak: int = 0
+    auto_restarts: int = 0
+    auto_restart_suppressed: bool = False
+    last_recovery_at: float | None = None
+    last_recovery_action: str | None = None
+
+    def record_failure(self, *, kind: str, detail: str, now: float) -> None:
+        self.last_failure_at = now
+        self.last_failure_kind = kind
+        self.last_failure_detail = detail.strip() or kind
+        if kind == "transport_closed":
+            self.disconnect_streak += 1
+
+    def note_recovery(self, *, action: str, now: float) -> None:
+        self.last_recovery_at = now
+        self.last_recovery_action = action
+        if action in {"manual_restart", "session_started"}:
+            self.disconnect_streak = 0
+            self.auto_restart_suppressed = False
+
+    def note_stop(self, *, now: float) -> None:
+        self.last_recovery_at = now
+        self.last_recovery_action = "stopped"
+        self.disconnect_streak = 0
+        self.auto_restart_suppressed = False
+
+    def failure_context(self) -> str | None:
+        parts: list[str] = []
+        if self.last_failure_kind == "transport_closed":
+            if self.disconnect_streak > 1:
+                parts.append(f"app-server disconnected {self.disconnect_streak} times")
+            elif self.last_failure_detail:
+                parts.append(self.last_failure_detail)
+            if self.auto_restart_suppressed:
+                parts.append("auto-restart suppressed")
+                parts.append("manual restart recommended")
+            elif self.last_recovery_action == "auto_restart":
+                parts.append("auto-restarted once")
+        elif self.last_failure_detail:
+            parts.append(self.last_failure_detail)
+        if self.last_failure_kind != "transport_closed" and self.auto_restart_suppressed:
+            parts.append("auto-restart suppressed; manual restart recommended")
+        elif self.last_recovery_action == "manual_restart":
+            parts.append("manually restarted")
+        elif self.last_recovery_action == "stopped":
+            parts.append("stopped intentionally")
+        return "; ".join(parts) if parts else None
+
+
 WORKER_ARCHETYPES = {
     "worker-1": WorkerArchetype(
         persona_name="Grace Hopper",
@@ -233,6 +287,9 @@ Rules:
 
 
 class MultiShellController:
+    _AUTO_RECOVERY_COOLDOWN_SECONDS = 120.0
+    _AUTO_RECOVERY_MAX_DISCONNECTS = 1
+
     def __init__(self) -> None:
         self.manager = CodexSession(
             MANAGER_SPEC,
@@ -306,10 +363,19 @@ class MultiShellController:
         self._last_session_alerts: dict[str, tuple[object, ...]] = {}
         self._last_stall_alerts: dict[str, int] = {}
         self._last_manager_event_signatures: dict[tuple[str, str], float] = {}
+        self._lifecycle: dict[str, SessionLifecycleMetadata] = {}
         self._user_message_count = 0
         self._last_user_message = ""
         self._last_manager_interrupt_turn: str | None = None
         self._shutting_down = False
+
+        for session_name in [
+            self.manager.spec.name,
+            *self.codex_workers.keys(),
+            *self.claude_workers.keys(),
+            *[spark.spec.name for spark in self.spark_workers.values()],
+        ]:
+            self._lifecycle[session_name] = SessionLifecycleMetadata()
 
     def start(self) -> None:
         self._shutting_down = False
@@ -387,6 +453,7 @@ class MultiShellController:
                 return {"ok": False, "error": f"{worker_name} session is already running; use restart_worker_session"}
             system_prompt, persona_label = self._resolve_worker_session_prompt(worker_name, arguments)
             worker.start_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
+            self._mark_manual_recovery(worker_name, action="session_started")
             self._sync_paired_spark_session(
                 worker_name,
                 cwd=cwd,
@@ -403,6 +470,7 @@ class MultiShellController:
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             worker.stop_session(clear_pending=True)
+            self._mark_session_stopped(worker_name)
             self._sync_paired_spark_session(worker_name, action="stop")
             self._push_message("manager", f"stopped {worker_name} session")
             return {"ok": True, "message": f"stopped {worker_name}"}
@@ -415,6 +483,7 @@ class MultiShellController:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             system_prompt, persona_label = self._resolve_worker_session_prompt(worker_name, arguments)
             worker.restart_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
+            self._mark_manual_recovery(worker_name, action="manual_restart")
             self._sync_paired_spark_session(
                 worker_name,
                 cwd=cwd,
@@ -542,10 +611,30 @@ class MultiShellController:
         self.manager.enqueue(prompt, source="user")
 
     def session_rows(self) -> list[dict[str, object]]:
-        rows = [self.manager.overview()]
-        rows.extend(worker.overview() for worker in self.codex_workers.values())
-        rows.extend(worker.overview() for worker in self.claude_workers.values())
+        rows = [self._decorate_overview(self.manager.spec.name, self.manager.overview())]
+        rows.extend(self._decorate_overview(worker.spec.name, worker.overview()) for worker in self.codex_workers.values())
+        rows.extend(self._decorate_overview(worker.spec.name, worker.overview()) for worker in self.claude_workers.values())
         return rows
+
+    def monitor_items(self) -> list[dict[str, object]]:
+        items = [self._monitor_from_session("manager", self.manager.overview())]
+
+        for index, spec in enumerate(WORKER_SPECS, start=1):
+            items.append(self._monitor_from_session(f"codex-{index}", self.codex_workers[spec.name].overview()))
+
+        for index, spec in enumerate(CLAUDE_WORKER_SPECS, start=1):
+            items.append(self._monitor_from_session(f"claude-{index}", self.claude_workers[spec.name].overview()))
+
+        for index, spec in enumerate(WORKER_SPECS, start=1):
+            items.append(self._monitor_from_session(f"spark-{index}", self.spark_workers[spec.name].overview()))
+
+        gptpro_jobs = self.web_reasoners.list_jobs(provider="chatgpt_pro")
+        items.append(self._monitor_from_reasoner("gptpro-1", gptpro_jobs[0] if len(gptpro_jobs) >= 1 else None, accent_color=1))
+        items.append(self._monitor_from_reasoner("gptpro-2", gptpro_jobs[1] if len(gptpro_jobs) >= 2 else None, accent_color=1))
+
+        deepthink_jobs = self.web_reasoners.list_jobs(provider="gemini_deepthink")
+        items.append(self._monitor_from_reasoner("deepthink", deepthink_jobs[0] if deepthink_jobs else None, accent_color=3))
+        return items
 
     def recent_messages(self, limit: int = 80) -> list[UiMessage]:
         with self._lock:
@@ -576,28 +665,92 @@ class MultiShellController:
     def _overview_text(self) -> str:
         lines = []
         for worker in self.workers.values():
-            overview = worker.overview()
+            overview = self._decorate_overview(worker.spec.name, worker.overview())
             timing = ""
             if overview["status"] == "running" and overview["running_for_seconds"] is not None:
                 timing = f" running_for={overview['running_for_seconds']:.1f}s"
             elif overview["last_turn_duration"] is not None:
                 timing = f" last_turn={overview['last_turn_duration']:.1f}s"
+            failure_context = str(overview.get("failure_context") or "").strip()
+            failure_suffix = f" failure_context={failure_context!r}" if failure_context else ""
             lines.append(
                 f"- {overview['name']}: engine={overview.get('engine', 'codex')} model={overview.get('model', '-')!r} "
                 f"persona={overview['persona_label']!r} status={overview['status']} cwd={overview['cwd']!r} "
                 f"pending={overview['pending_tasks']} completed={overview['completed_turns']} failed={overview['failed_turns']}{timing} "
-                f"last_message={overview['last_message']!r}"
+                f"last_message={overview['last_message']!r}{failure_suffix}"
             )
         return "\n".join(lines)
+
+    def _decorate_overview(self, session_name: str, overview: dict[str, object]) -> dict[str, object]:
+        meta = self._lifecycle.get(session_name)
+        row = dict(overview)
+        failure_context = meta.failure_context() if meta is not None else None
+        row["failure_context"] = failure_context
+        row["disconnect_streak"] = meta.disconnect_streak if meta is not None else 0
+        row["auto_restarts"] = meta.auto_restarts if meta is not None else 0
+        row["last_failure_kind"] = meta.last_failure_kind if meta is not None else None
+        row["last_failure_at"] = meta.last_failure_at if meta is not None else None
+        row["last_recovery_action"] = meta.last_recovery_action if meta is not None else None
+        row["last_recovery_at"] = meta.last_recovery_at if meta is not None else None
+        if row.get("status") == "stopped":
+            row["last_error"] = None
+        elif failure_context and not row.get("last_error"):
+            row["last_error"] = failure_context
+        return row
 
     def _push_message(self, source: str, text: str, level: str = "info") -> None:
         with self._lock:
             self.messages.append(UiMessage(ts=time.time(), source=source, text=text, level=level))
             self.messages = self.messages[-260:]
 
+    def _mark_manual_recovery(self, session_name: str, *, action: str) -> None:
+        meta = self._lifecycle.get(session_name)
+        if meta is not None:
+            meta.note_recovery(action=action, now=time.time())
+
+    def _mark_session_stopped(self, session_name: str) -> None:
+        meta = self._lifecycle.get(session_name)
+        if meta is not None:
+            meta.note_stop(now=time.time())
+
+    def _record_session_failure(self, event: SessionEvent) -> None:
+        meta = self._lifecycle.get(event.agent)
+        if meta is None:
+            return
+        meta.record_failure(kind=event.kind, detail=event.message, now=event.ts or time.time())
+
+    def _maybe_auto_recover_transport(self, event: SessionEvent) -> bool:
+        worker = self.codex_workers.get(event.agent)
+        if worker is None or self._shutting_down:
+            return False
+        meta = self._lifecycle.get(event.agent)
+        if meta is None:
+            return False
+        overview = worker.overview()
+        if overview.get("status") == "stopped":
+            return False
+        if overview.get("turn_id") or overview.get("status") == "running" or int(overview.get("pending_tasks", 0)) > 0:
+            meta.auto_restart_suppressed = True
+            return False
+        now = time.time()
+        if meta.disconnect_streak > self._AUTO_RECOVERY_MAX_DISCONNECTS:
+            meta.auto_restart_suppressed = True
+            return False
+        if meta.last_recovery_action == "auto_restart" and meta.last_recovery_at is not None:
+            if now - meta.last_recovery_at < self._AUTO_RECOVERY_COOLDOWN_SECONDS:
+                meta.auto_restart_suppressed = True
+                return False
+        cwd = str(overview.get("cwd") or worker.working_dir)
+        persona_label = str(overview.get("persona_label") or worker.persona_label)
+        system_prompt = getattr(worker, "initial_prompt", None)
+        worker.restart_session(cwd=cwd, system_prompt=system_prompt, persona_label=persona_label)
+        meta.auto_restarts += 1
+        meta.note_recovery(action="auto_restart", now=now)
+        return True
+
     def _emit_health_alerts(self, rows: list[dict[str, object]]) -> None:
         for row in rows:
-            signature = (row["status"], row["failed_turns"], row["last_error"], row.get("cwd"))
+            signature = (row["status"], row["failed_turns"], row["last_error"], row.get("cwd"), row.get("failure_context"))
             previous = self._last_session_alerts.get(str(row["name"]))
             if signature == previous:
                 continue
@@ -625,6 +778,35 @@ class MultiShellController:
     def _default_persona_label(self, worker_name: str) -> str:
         archetype = WORKER_ARCHETYPES.get(worker_name)
         return archetype.persona_name if archetype is not None else worker_name
+
+    def _monitor_from_session(self, label: str, overview: dict[str, object]) -> dict[str, object]:
+        return {
+            "label": label,
+            "status": str(overview.get("status") or "stopped"),
+            "accent_color": int(overview.get("accent_color", 1)),
+            "pending_tasks": int(overview.get("pending_tasks", 0)),
+            "completed_turns": int(overview.get("completed_turns", 0)),
+            "failed_turns": int(overview.get("failed_turns", 0)),
+        }
+
+    def _monitor_from_reasoner(self, label: str, job: dict[str, object] | None, *, accent_color: int) -> dict[str, object]:
+        status = "idle"
+        pending = 0
+        completed = 0
+        failed = 0
+        if job is not None:
+            status = str(job.get("status") or "idle")
+            pending = 1 if status in {"queued", "running", "canceling"} else 0
+            completed = 1 if status == "completed" else 0
+            failed = 1 if status == "failed" else 0
+        return {
+            "label": label,
+            "status": status,
+            "accent_color": accent_color,
+            "pending_tasks": pending,
+            "completed_turns": completed,
+            "failed_turns": failed,
+        }
 
     def _fanout_guidance(self, text: str) -> str:
         normalized = text.lower()
@@ -704,14 +886,36 @@ class MultiShellController:
             spark.stop_session(clear_pending=True)
 
     def _handle_worker_event(self, event: SessionEvent) -> None:
+        if event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
+            self._record_session_failure(event)
+
+        auto_recovered_transport = False
         if event.kind == "assistant_message":
             self._push_message(event.agent, self._display_worker_message(event), level="info")
         elif event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
-            self._push_message("system", f"{event.agent}: {event.message}", level="error")
+            if event.kind == "transport_closed" and self._maybe_auto_recover_transport(event):
+                auto_recovered_transport = True
+                self._push_message(
+                    "system",
+                    f"{event.agent}: app-server disconnected; automatically restarted idle session",
+                    level="warn",
+                )
+            else:
+                detail = event.message
+                meta = self._lifecycle.get(event.agent)
+                if event.kind == "transport_closed" and meta is not None and meta.auto_restart_suppressed:
+                    detail = f"{detail} (manual restart recommended after repeated or in-flight disconnect)"
+                self._push_message("system", f"{event.agent}: {detail}", level="error")
         elif event.kind in {"session_started", "session_stopped"}:
+            if event.kind == "session_started":
+                self._mark_manual_recovery(event.agent, action="session_started")
+            else:
+                self._mark_session_stopped(event.agent)
             self._push_message("system", f"{event.agent}: {event.message}", level="info")
 
         if self._shutting_down:
+            return
+        if auto_recovered_transport:
             return
         prompt = self._build_worker_event_prompt(event)
         if prompt:

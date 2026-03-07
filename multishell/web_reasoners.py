@@ -12,9 +12,11 @@ from .autologin import (
     _click_first,
     _click_google_and_capture_page,
     _click_optional,
+    _complete_workspace_consent,
     _fill_first,
     _has_visible,
     _isolated_chrome,
+    _normalize_openai_login_entry,
     _page_title,
     _write_debug_artifacts,
 )
@@ -244,7 +246,7 @@ class WebReasonerManager:
         page = None
         try:
             with sync_playwright() as playwright:
-                profile_name = f"web-{job.provider}-{job.account_agent}-{job.id[:8]}"
+                profile_name = _web_profile_name(job.provider, job.account_agent)
                 with _isolated_chrome(playwright, profile_name, headed=False) as (_browser, _context, page):
                     _check_cancel(cancel_flag)
                     if job.provider == "chatgpt_pro":
@@ -398,6 +400,7 @@ def _ensure_chatgpt_logged_in(page: object, email: str, password: str, cancel_fl
     if _has_visible(page, ["button:has-text('Log in')", "a:has-text('Log in')"], timeout_ms=3000):
         _click_first(page, ["button:has-text('Log in')", "a:has-text('Log in')"])
         page.wait_for_timeout(1000)
+        _normalize_openai_login_entry(page)
 
     flow_page = page
     if _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=5000):
@@ -417,7 +420,7 @@ def _ensure_google_logged_in(page: object, email: str, password: str, cancel_fla
         title = _page_title(page)
         current_url = getattr(page, "url", "")
 
-        if email in body and ("Choose an account" in body or "Sign in with Google" in body):
+        if _is_google_account_picker(body) and email in body:
             try:
                 page.locator(f"text={email}").first.click(timeout=3000)
                 time.sleep(1)
@@ -473,7 +476,21 @@ def _ensure_google_logged_in(page: object, email: str, password: str, cancel_fla
             return
         time.sleep(1)
 
-    raise WebReasonerError(f"timed out completing Google sign-in at {getattr(page, 'url', '<unknown>')}")
+    raise WebReasonerError(
+        "timed out completing Google sign-in at "
+        f"{getattr(page, 'url', '<unknown>')}"
+        f" title={title!r} body={body[:240]!r}"
+    )
+
+
+def _web_profile_name(provider: str, account_agent: str) -> str:
+    return f"web-{provider}-{account_agent}"
+
+
+def _is_google_account_picker(body: str) -> bool:
+    if "Choose an account" in body:
+        return True
+    return "Use another account" in body and "Enter your password" not in body
 
 
 def _ensure_chatgpt_pro_workspace(page: object, cancel_flag: threading.Event) -> None:
@@ -481,6 +498,11 @@ def _ensure_chatgpt_pro_workspace(page: object, cancel_flag: threading.Event) ->
     while time.time() < deadline:
         _check_cancel(cancel_flag)
         body = _body_text(page)
+
+        if "Sign in to ChatGPT" in body or "Select a workspace" in body:
+            _complete_workspace_consent(page)
+            page.wait_for_timeout(1500)
+            continue
 
         if "Choose a workspace" in body:
             if _has_visible(page, ["text=Kuang2"], timeout_ms=2000):

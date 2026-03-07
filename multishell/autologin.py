@@ -641,6 +641,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool):
 
     process = subprocess.Popen(
         command,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

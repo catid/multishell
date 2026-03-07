@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import IO
 
 from .codex_session import SessionEvent, TranscriptEntry
+from .codex_session import _ignore_process_noise
 from .config import CLAUDE_MODEL, CLAUDE_REASONING_EFFORT, AgentSpec, workspace_root
 from .homes import ensure_claude_home
 from .runtime import child_env
@@ -371,6 +372,7 @@ class ClaudeSession:
         env = child_env(os.environ.copy(), role="claude-session", agent=self.spec.name)
         env.pop("ANTHROPIC_API_KEY", None)
         env["HOME"] = str(self.home)
+        env.setdefault("NODE_NO_WARNINGS", "1")
         command = [
             "claude",
             "-p",
@@ -391,6 +393,7 @@ class ClaudeSession:
         command.append(prompt)
         return subprocess.Popen(
             command,
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
@@ -420,6 +423,8 @@ class ClaudeSession:
         try:
             payload = json.loads(line)
         except json.JSONDecodeError:
+            if _ignore_process_noise(line):
+                return
             outcome.last_diagnostic = line
             if self._generation_matches(generation):
                 source = "error" if "error" in line.lower() else "event"

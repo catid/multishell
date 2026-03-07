@@ -363,3 +363,146 @@ def test_controller_start_skips_claude_workers_without_login(monkeypatch) -> Non
     assert controller.manager.start_count == 1
     assert all(worker.start_count == 1 for worker in controller.codex_workers.values())
     assert all(worker.start_count == 0 for worker in controller.claude_workers.values())
+
+
+def test_monitor_items_use_compact_swarm_labels(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    labels = [item["label"] for item in controller.monitor_items()]
+
+    assert labels[:6] == ["manager", "codex-1", "codex-2", "codex-3", "codex-4", "claude-1"]
+    assert "claude-5" in labels
+    assert "spark-1" in labels
+    assert "gptpro-1" in labels
+    assert "gptpro-2" in labels
+    assert "deepthink" in labels
+
+
+def test_session_rows_hide_last_error_for_intentional_stop(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    worker = controller.workers["worker-1"]
+    worker._overview["status"] = "stopped"
+    worker._overview["last_error"] = "stale transport failure"
+    controller._mark_session_stopped("worker-1")
+
+    row = next(item for item in controller.session_rows() if item["name"] == "worker-1")
+
+    assert row["status"] == "stopped"
+    assert row["last_error"] is None
+    assert "stopped intentionally" in str(row["failure_context"])
+
+
+def test_handle_transport_closed_worker_event_surfaces_error_and_supervision_prompt(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "keep the swarm healthy"
+
+    controller._handle_worker_event(
+        SessionEvent(
+            ts=0.0,
+            agent="worker-2",
+            kind="transport_closed",
+            message="app-server connection closed",
+        )
+    )
+
+    messages = controller.recent_messages(1)
+    assert messages[-1].source == "system"
+    assert messages[-1].level == "warn"
+    assert messages[-1].text == "worker-2: app-server disconnected; automatically restarted idle session"
+    assert controller.manager.enqueued == []
+
+
+def test_transport_closed_idle_codex_worker_auto_restarts_and_updates_failure_context(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    worker = controller.codex_workers["worker-1"]
+    worker._overview["status"] = "idle"
+    worker._overview["cwd"] = "/tmp/repo"
+    worker._overview["persona_label"] = "Grace Hopper"
+
+    controller._handle_worker_event(
+        SessionEvent(
+            ts=10.0,
+            agent="worker-1",
+            kind="transport_closed",
+            message="app-server connection closed",
+        )
+    )
+
+    assert worker.restarted_calls[-1] == ("/tmp/repo", worker.initial_prompt, "Grace Hopper")
+
+    message = controller.recent_messages(1)[-1]
+    assert message.source == "system"
+    assert message.level == "warn"
+    assert message.text == "worker-1: app-server disconnected; automatically restarted idle session"
+
+    row = next(row for row in controller.session_rows() if row["name"] == "worker-1")
+    assert row["auto_restarts"] == 1
+    assert row["disconnect_streak"] == 1
+    assert row["last_failure_kind"] == "transport_closed"
+    assert row["last_recovery_action"] == "auto_restart"
+    assert row["failure_context"] == "app-server connection closed; auto-restarted once"
+    assert row["last_error"] == "app-server connection closed; auto-restarted once"
+
+
+def test_repeated_transport_closed_suppresses_auto_restart_and_flags_manual_recovery(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    worker = controller.codex_workers["worker-1"]
+    worker._overview["status"] = "idle"
+    worker._overview["cwd"] = "/tmp/repo"
+    worker._overview["persona_label"] = "Grace Hopper"
+
+    first = SessionEvent(ts=10.0, agent="worker-1", kind="transport_closed", message="app-server connection closed")
+    second = SessionEvent(ts=11.0, agent="worker-1", kind="transport_closed", message="app-server connection closed")
+
+    controller._handle_worker_event(first)
+    controller._handle_worker_event(second)
+
+    assert len(worker.restarted_calls) == 1
+
+    message = controller.recent_messages(1)[-1]
+    assert message.source == "system"
+    assert message.level == "error"
+    assert message.text == (
+        "worker-1: app-server connection closed "
+        "(manual restart recommended after repeated or in-flight disconnect)"
+    )
+
+    row = next(row for row in controller.session_rows() if row["name"] == "worker-1")
+    assert row["auto_restarts"] == 1
+    assert row["disconnect_streak"] == 2
+    assert row["last_failure_kind"] == "transport_closed"
+    assert row["last_recovery_action"] == "auto_restart"
+    assert row["failure_context"] == (
+        "app-server disconnected 2 times; auto-restart suppressed; manual restart recommended"
+    )
+    assert row["last_error"] == row["failure_context"]

@@ -5,7 +5,13 @@ from threading import Event
 
 import pytest
 
-from multishell.web_reasoners import WebReasonerEvent, WebReasonerManager
+from multishell.web_reasoners import (
+    WebReasonerEvent,
+    WebReasonerManager,
+    _ensure_chatgpt_pro_workspace,
+    _ensure_google_logged_in,
+    _web_profile_name,
+)
 
 
 class _SuccessManager(WebReasonerManager):
@@ -89,3 +95,90 @@ def test_start_job_validates_required_fields() -> None:
 
     with pytest.raises(Exception, match="prompt is required"):
         manager.start_job("chatgpt_pro", "manager", "   ")
+
+
+def test_web_profile_name_is_stable_per_provider_and_account() -> None:
+    assert _web_profile_name("chatgpt_pro", "manager") == "web-chatgpt_pro-manager"
+    assert _web_profile_name("chatgpt_pro", "manager") == _web_profile_name("chatgpt_pro", "manager")
+
+
+class _FakeLocator:
+    def __init__(self, selector: str) -> None:
+        self.selector = selector
+        self.first = self
+
+    def click(self, timeout: int | None = None) -> None:
+        if self.selector.startswith("text="):
+            raise AssertionError("password screen should not click the account picker row")
+
+
+class _FakePage:
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def locator(self, selector: str) -> _FakeLocator:
+        return _FakeLocator(selector)
+
+
+def test_google_password_screen_prefers_password_input_over_account_picker(monkeypatch: pytest.MonkeyPatch) -> None:
+    recorded: list[tuple[str, tuple[str, ...]]] = []
+    page = _FakePage("https://accounts.google.com/v3/signin/challenge/pwd")
+
+    monkeypatch.setattr(
+        "multishell.web_reasoners._body_text",
+        lambda _: (
+            "Sign in with Google\n"
+            "Hi bot\n"
+            "bot@kuang2.ai\n"
+            "Enter your password\n"
+            "Next"
+        ),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._page_title", lambda _: "Hi bot")
+    monkeypatch.setattr(
+        "multishell.web_reasoners._has_visible",
+        lambda _page, selectors, timeout_ms: any("password" in selector or "Passwd" in selector for selector in selectors),
+    )
+
+    def fake_fill_first(_page: object, selectors: list[str], value: str) -> None:
+        recorded.append((value, tuple(selectors)))
+        raise RuntimeError("stop after password fill")
+
+    monkeypatch.setattr("multishell.web_reasoners._fill_first", fake_fill_first)
+    monkeypatch.setattr("multishell.web_reasoners._click_first", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("multishell.web_reasoners._click_optional", lambda *_args, **_kwargs: None)
+
+    with pytest.raises(RuntimeError, match="stop after password fill"):
+        _ensure_google_logged_in(page, "bot@kuang2.ai", "secret", Event())
+
+    assert recorded == [
+        (
+            "secret",
+            (
+                "input[type='password']:visible",
+                "input[name='Passwd']:visible",
+                "input[autocomplete='current-password']:visible",
+            ),
+        )
+    ]
+
+
+def test_chatgpt_workspace_reuses_openai_consent_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://auth.openai.com/authorize")
+    consent_calls: list[str] = []
+    body_state = {"value": "Sign in to ChatGPT with ChatGPT"}
+
+    monkeypatch.setattr("multishell.web_reasoners._body_text", lambda _page: body_state["value"])
+    monkeypatch.setattr("multishell.web_reasoners._has_visible", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        "multishell.web_reasoners._complete_workspace_consent",
+        lambda _page: consent_calls.append("consent") or body_state.__setitem__("value", "ChatGPT 5.4 Pro"),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._click_optional", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("multishell.web_reasoners._check_cancel", lambda _flag: None)
+    monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
+    page.wait_for_timeout = lambda *_args, **_kwargs: None
+
+    _ensure_chatgpt_pro_workspace(page, Event())
+
+    assert consent_calls == ["consent"]
