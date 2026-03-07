@@ -32,8 +32,6 @@ def test_workspace_root_uses_env_override(monkeypatch, tmp_path: Path) -> None:
 def test_dotenv_path_prefers_state_root(monkeypatch, tmp_path: Path) -> None:
     state = tmp_path / "state-root"
     config_file = state / ".env"
-    config_file.parent.mkdir(parents=True)
-    config_file.write_text("MULTISHELL_MANAGER_EMAIL=manager@example.com\n", encoding="utf-8")
     monkeypatch.setenv(config.STATE_ROOT_ENV_VAR, str(state))
     monkeypatch.delenv(config.ENV_FILE_ENV_VAR, raising=False)
 

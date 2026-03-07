@@ -56,10 +56,6 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def dotenv_template_path() -> Path:
-    return app_root() / ".env.example"
-
-
 def dotenv_template_text() -> str:
     return DEFAULT_DOTENV_TEMPLATE
 
@@ -82,13 +78,7 @@ def dotenv_path() -> Path:
     override = os.environ.get(ENV_FILE_ENV_VAR, "").strip()
     if override:
         return Path(override).expanduser()
-    configured = state_root() / ".env"
-    legacy = app_root() / ".env"
-    if configured.exists():
-        return configured
-    if legacy.exists():
-        return legacy
-    return configured
+    return state_root() / ".env"
 
 
 def _load_dotenv() -> None:

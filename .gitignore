@@ -1,4 +1,3 @@
-.env
 .multishell/
 __pycache__/
 *.pyc
