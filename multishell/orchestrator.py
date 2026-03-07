@@ -705,7 +705,7 @@ class MultiShellController:
 
     def _handle_worker_event(self, event: SessionEvent) -> None:
         if event.kind == "assistant_message":
-            self._push_message(event.agent, event.message, level="info")
+            self._push_message(event.agent, self._display_worker_message(event), level="info")
         elif event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
             self._push_message("system", f"{event.agent}: {event.message}", level="error")
         elif event.kind in {"session_started", "session_stopped"}:
@@ -775,7 +775,7 @@ class MultiShellController:
         message = event.message.strip()
         if event.kind == "assistant_message" and not message:
             return None
-        if message.lower().startswith("ready for assignments"):
+        if self._is_ready_message(message):
             return None
         signature = (event.agent, f"{event.kind}:{message[:160]}")
         now = time.time()
@@ -818,3 +818,13 @@ class MultiShellController:
                 ),
                 source="system",
             )
+
+    def _display_worker_message(self, event: SessionEvent) -> str:
+        message = event.message.strip()
+        if self._is_ready_message(message):
+            return "Ready for assignments."
+        return message
+
+    def _is_ready_message(self, message: str) -> bool:
+        normalized = " ".join(message.strip().lower().split())
+        return "ready for assignments" in normalized

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import curses
 import math
-import textwrap
 import time
+import unicodedata
 from dataclasses import dataclass, field
 
 from .control import format_timestamp
@@ -148,21 +148,24 @@ def _draw_too_small(stdscr: curses.window, height: int, width: int) -> None:
 
 
 def _draw_header(stdscr: curses.window, controller: MultiShellController, width: int) -> int:
-    worker_count = max(0, len(controller.session_rows()) - 1)
+    sessions = controller.session_rows()
+    worker_count = max(0, len(sessions) - 1)
     title = f" Multishell  manager + {worker_count} workers  Tab=debug  Ctrl+C=quit "
     _safe_fill_line(stdscr, 0, width, " ", curses.color_pair(7))
-    _safe_addnstr(stdscr, 0, 0, title, width - 1, curses.color_pair(7))
+    _safe_add_display_text(stdscr, 0, 0, title, width - 1, curses.color_pair(7))
 
     row = 1
     col = 0
-    for session in controller.session_rows():
+    _safe_fill_line(stdscr, row, width, " ")
+    for session in sessions:
         label = _session_chip(session)
-        if col and col + len(label) >= width:
+        if col and col + _display_width(label) >= width:
             row += 1
             col = 0
+            _safe_fill_line(stdscr, row, width, " ")
         attr = curses.color_pair(_status_color(session)) | curses.A_BOLD
-        _safe_addnstr(stdscr, row, col, label, max(0, width - col - 1), attr)
-        col += len(label)
+        _safe_add_display_text(stdscr, row, col, label, max(0, width - col - 1), attr)
+        col += _display_width(label)
 
     reasoners = controller.active_reasoner_counts()
     summary = (
@@ -171,7 +174,8 @@ def _draw_header(stdscr: curses.window, controller: MultiShellController, width:
         f"  web_q={reasoners['queued']}"
         f"  updated={format_timestamp(time.time())} "
     )
-    _safe_addnstr(stdscr, row + 1, 0, summary, width - 1, curses.color_pair(1))
+    _safe_fill_line(stdscr, row + 1, width, " ")
+    _safe_add_display_text(stdscr, row + 1, 0, summary, width - 1, curses.color_pair(1))
     return row + 2
 
 
@@ -184,25 +188,29 @@ def _draw_chat_view(
 ) -> None:
     available_rows = max(1, content_bottom - content_top + 1)
     messages = controller.recent_messages(160)
+    accent_by_source = {str(row["name"]): int(row.get("accent_color", 1)) for row in controller.session_rows()}
     rendered: list[tuple[str, int, int]] = []
 
     for message in messages:
         prefix = f"[{format_timestamp(message.ts)}] {message.source}: "
-        wrapped = textwrap.wrap(message.text, width=max(12, width - len(prefix) - 1)) or [""]
-        color = _message_color(message.source, message.level)
+        prefix_width = _display_width(prefix)
+        wrapped = _wrap_display_text(message.text, max(12, width - prefix_width - 1)) or [""]
+        color = _message_color(message.source, message.level, accent_by_source)
         rendered.append((prefix + wrapped[0], 0, color))
         for continuation in wrapped[1:]:
-            rendered.append((continuation, len(prefix), 0))
+            rendered.append((continuation, prefix_width, 0))
 
     if not rendered:
         rendered = [("No chat messages yet. Type a task for the manager below.", 0, curses.color_pair(3))]
 
     visible = rendered[-available_rows:]
     start_row = content_bottom - len(visible) + 1
+    for row in range(content_top, content_bottom + 1):
+        _safe_fill_line(stdscr, row, width, " ")
     for index, (line, indent, color) in enumerate(visible):
         row = start_row + index
         attr = color if isinstance(color, int) else 0
-        _safe_addnstr(stdscr, row, indent, line, max(0, width - indent - 1), attr)
+        _safe_add_display_text(stdscr, row, indent, line, max(0, width - indent - 1), attr)
 
 
 def _draw_debug_view(
@@ -305,27 +313,28 @@ def _panel_lines(overview: dict[str, object], entries: list, width: int) -> list
     engine = str(overview.get("engine") or "")
     model = str(overview.get("model") or "")
     if engine or model:
-        for wrapped in textwrap.wrap(f"{engine}: {model}".strip(": "), width=max(8, width))[:1]:
+        for wrapped in _wrap_display_text(f"{engine}: {model}".strip(": "), max(8, width))[:1]:
             lines.append((wrapped, curses.color_pair(2)))
     persona_label = str(overview.get("persona_label") or "")
     if persona_label:
-        for wrapped in textwrap.wrap(f"persona: {persona_label}", width=max(8, width))[:1]:
+        for wrapped in _wrap_display_text(f"persona: {persona_label}", max(8, width))[:1]:
             lines.append((wrapped, curses.color_pair(4)))
     cwd = str(overview.get("cwd") or "")
     if cwd:
-        for wrapped in textwrap.wrap(f"cwd: {cwd}", width=max(8, width))[:2]:
+        for wrapped in _wrap_display_text(f"cwd: {cwd}", max(8, width))[:2]:
             lines.append((wrapped, curses.color_pair(5)))
     last_error = str(overview.get("last_error") or "").strip()
     if last_error:
-        for wrapped in textwrap.wrap(f"error: {last_error}", width=max(8, width))[:2]:
+        for wrapped in _wrap_display_text(f"error: {last_error}", max(8, width))[:2]:
             lines.append((wrapped, curses.color_pair(6)))
 
     for entry in entries:
         prefix = f"{format_timestamp(entry.ts)} {entry.source[:4]} "
-        wrapped = textwrap.wrap(entry.text, width=max(8, width - len(prefix))) or [""]
+        prefix_width = _display_width(prefix)
+        wrapped = _wrap_display_text(entry.text, max(8, width - prefix_width)) or [""]
         lines.append((prefix + wrapped[0], _entry_color(entry.source)))
         for continuation in wrapped[1:]:
-            lines.append((" " * len(prefix) + continuation, 0))
+            lines.append((" " * prefix_width + continuation, 0))
     return lines or [("(no transcript)", curses.color_pair(3))]
 
 
@@ -362,11 +371,11 @@ def _draw_input(
 ) -> None:
     prompt = "chat(debug)> " if debug_mode else "chat> "
     _safe_hline(stdscr, height - 2, width, "-")
-    available = max(1, width - len(prompt) - 1)
+    available = max(1, width - _display_width(prompt) - 1)
     visible_input, cursor_column = _visible_input_window(input_state.text, input_state.cursor, available)
     _safe_fill_line(stdscr, height - 1, width, " ")
-    _safe_addnstr(stdscr, height - 1, 0, prompt + visible_input, width - 1)
-    cursor_x = min(width - 1, len(prompt) + cursor_column)
+    _safe_add_display_text(stdscr, height - 1, 0, prompt + visible_input, width - 1)
+    cursor_x = min(width - 1, _display_width(prompt) + cursor_column)
     try:
         stdscr.move(height - 1, cursor_x)
     except curses.error:
@@ -399,28 +408,33 @@ def _visible_input_window(text: str, cursor: int, available: int) -> tuple[str, 
     bounded_cursor = max(0, min(cursor, len(text)))
     if available <= 0:
         return "", 0
-    if len(text) <= available:
-        return text, bounded_cursor
+    if _display_width(text) <= available:
+        return text, _display_width(text[:bounded_cursor])
 
     if available == 1:
         return "<", 0
 
     body_width = max(1, available - 2)
-    start = max(0, min(bounded_cursor - body_width // 2, len(text) - body_width))
-    end = min(len(text), start + body_width)
-    if bounded_cursor < start:
-        start = bounded_cursor
-        end = min(len(text), start + body_width)
-    elif bounded_cursor > end:
-        end = bounded_cursor
-        start = max(0, end - body_width)
-
+    cursor_left = _display_width(text[:bounded_cursor])
+    start = 0
+    max_start = len(text)
+    while start < max_start and cursor_left - _display_width(text[:start]) > body_width // 2:
+        start += 1
+    visible_body = _truncate_display(text[start:], body_width)
+    visible_width = _display_width(visible_body)
+    while start > 0 and cursor_left - _display_width(text[:start]) < 0:
+        start -= 1
+        visible_body = _truncate_display(text[start:], body_width)
+        visible_width = _display_width(visible_body)
     prefix = "<" if start > 0 else ""
-    suffix = ">" if end < len(text) else ""
-    visible = prefix + text[start:end] + suffix
-    cursor_column = len(prefix) + max(0, bounded_cursor - start)
-    cursor_column = min(len(visible), cursor_column)
-    return visible[:available], cursor_column
+    suffix = ">" if start + len(visible_body) < len(text) else ""
+    cursor_column = len(prefix) + max(0, cursor_left - _display_width(text[:start]))
+    visible = prefix + visible_body
+    if suffix and visible_width < body_width:
+        visible += suffix
+    elif suffix:
+        visible = _truncate_display(visible, max(0, available - 1)) + suffix
+    return visible, min(_display_width(visible), cursor_column)
 
 
 def _handle_debug_key(key: object, debug_state: DebugState, session_names: list[str], columns: int) -> bool:
@@ -482,19 +496,13 @@ def _status_color(session: dict[str, object]) -> int:
     return 2
 
 
-def _message_color(source: str, level: str) -> int:
+def _message_color(source: str, level: str, accent_by_source: dict[str, int] | None = None) -> int:
     if level == "error":
         return curses.color_pair(6)
     if level == "warn":
         return curses.color_pair(3)
-    if source == "worker-1":
-        return curses.color_pair(2)
-    if source == "worker-2":
-        return curses.color_pair(3)
-    if source == "worker-3":
-        return curses.color_pair(4)
-    if source == "worker-4":
-        return curses.color_pair(5)
+    if accent_by_source is not None and source in accent_by_source:
+        return curses.color_pair(accent_by_source[source])
     if source == "manager":
         return curses.color_pair(1)
     if source == "user":
@@ -518,6 +526,66 @@ def _entry_color(source: str) -> int:
 
 def _debug_column_count(width: int) -> int:
     return 1 if width < 110 else 2
+
+
+def _cell_width(char: str) -> int:
+    if not char:
+        return 0
+    if unicodedata.combining(char):
+        return 0
+    if unicodedata.category(char).startswith("C"):
+        return 0
+    if unicodedata.east_asian_width(char) in {"W", "F"}:
+        return 2
+    return 1
+
+
+def _display_width(text: str) -> int:
+    return sum(_cell_width(char) for char in text)
+
+
+def _truncate_display(text: str, max_width: int) -> str:
+    if max_width <= 0:
+        return ""
+    width = 0
+    result: list[str] = []
+    for char in text:
+        cell_width = _cell_width(char)
+        if cell_width and width + cell_width > max_width:
+            break
+        result.append(char)
+        width += cell_width
+    return "".join(result)
+
+
+def _wrap_display_text(text: str, width: int) -> list[str]:
+    if width <= 0:
+        return [""]
+    paragraphs = text.splitlines() or [text]
+    lines: list[str] = []
+    for paragraph in paragraphs:
+        remaining = paragraph.strip()
+        if not remaining:
+            lines.append("")
+            continue
+        while remaining:
+            if _display_width(remaining) <= width:
+                lines.append(remaining)
+                break
+            candidate = _truncate_display(remaining, width)
+            split_at = candidate.rfind(" ")
+            if split_at > 0:
+                line = candidate[:split_at].rstrip()
+                remaining = remaining[split_at + 1 :].lstrip()
+            else:
+                line = candidate
+                remaining = remaining[len(candidate) :].lstrip()
+            lines.append(line or candidate)
+    return lines or [""]
+
+
+def _safe_add_display_text(stdscr: curses.window, row: int, col: int, text: str, max_cells: int, attr: int = 0) -> None:
+    _safe_addnstr(stdscr, row, col, _truncate_display(text, max_cells), max_cells, attr)
 
 
 def _safe_addnstr(stdscr: curses.window, row: int, col: int, text: str, max_chars: int, attr: int = 0) -> None:

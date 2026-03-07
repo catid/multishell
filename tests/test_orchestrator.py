@@ -235,6 +235,28 @@ def test_build_worker_event_prompt_ignores_ready_messages(monkeypatch) -> None:
     assert "worker-1 assistant_message: Checked the logs." in prompt
 
 
+def test_ready_messages_are_condensed_in_main_chat(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._handle_worker_event(
+        SessionEvent(
+            ts=0.0,
+            agent="claude-worker-3",
+            kind="assistant_message",
+            message="**Don Norman here — ready for assignments.** I will write a very long introduction.",
+        )
+    )
+
+    messages = controller.recent_messages(1)
+    assert messages[-1].source == "claude-worker-3"
+    assert messages[-1].text == "Ready for assignments."
+
+
 def test_fanout_guidance_for_top_k_requests(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
