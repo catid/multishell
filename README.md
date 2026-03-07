@@ -60,7 +60,6 @@ multishell uninstall --keep-state
 ## Notes
 
 - Runtime state lives under `~/.multishell` by default.
-- `multishell init-config` writes `~/.multishell/.env` by default.
 - Set `MULTISHELL_STATE_ROOT` to move the runtime state elsewhere.
 - Set `MULTISHELL_WORKSPACE_ROOT` if you want to override the default worker cwd instead of using the current directory.
 - The legacy repo-local `.env` file is still read as a fallback for older setups.
