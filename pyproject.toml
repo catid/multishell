@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "multishell"
+version = "0.1.0"
+description = "Terminal orchestrator for a manager Codex session supervising multiple worker Codex sessions."
+requires-python = ">=3.11"
+dependencies = ["playwright>=1.52.0", "pexpect>=4.9.0"]
+
+[project.scripts]
+multishell = "multishell.__main__:main"
+
+[tool.setuptools]
+packages = ["multishell"]

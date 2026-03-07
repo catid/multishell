@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import argparse
+import importlib.util
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+from .config import CLAUDE_WORKER_SPECS, MANAGER_SPEC, WORKER_SPECS, missing_email_env_vars, state_root
+from .homes import agent_home, all_agent_names, auth_path, claude_home, claude_logged_in, ensure_agent_home, ensure_claude_home
+from .runtime import cleanup_stale_runtime, ensure_runtime_environment
+
+
+def _bridge_command(role: str, agent: str) -> list[str]:
+    from .config import app_root, socket_path
+
+    launcher = (
+        "import sys; "
+        f"sys.path.insert(0, {str(app_root())!r}); "
+        "from multishell.mcp_bridge import main; "
+        "raise SystemExit(main())"
+    )
+    return [sys.executable, "-c", launcher, "--socket", str(socket_path()), "--role", role, "--agent", agent]
+
+
+def _venv_python() -> Path:
+    return Path(__file__).resolve().parent.parent / ".venv" / "bin" / "python"
+
+
+def _maybe_reexec_into_venv(module_name: str) -> bool:
+    venv_python = _venv_python()
+    if not importlib.util.find_spec(module_name) and venv_python.exists() and Path(sys.executable) != venv_python:
+        try:
+            result = subprocess.run([str(venv_python), "-m", "multishell", *sys.argv[1:]], check=False)
+        except KeyboardInterrupt:
+            raise SystemExit(130)
+        raise SystemExit(result.returncode)
+    return False
+
+
+def cmd_run(_: argparse.Namespace) -> int:
+    if _maybe_reexec_into_venv("websockets"):
+        return 0
+    from .orchestrator import MultiShellController
+    from .tui import run_tui
+
+    state_root().mkdir(parents=True, exist_ok=True)
+    ensure_runtime_environment(role="controller", agent=MANAGER_SPEC.name)
+    cleanup_messages = cleanup_stale_runtime()
+    ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
+    for spec in WORKER_SPECS:
+        ensure_agent_home(spec.name, mcp_bridge_command=_bridge_command("worker", spec.name))
+    for spec in CLAUDE_WORKER_SPECS:
+        ensure_claude_home(spec.name)
+
+    missing_codex = [name for name in [MANAGER_SPEC.name, *[spec.name for spec in WORKER_SPECS]] if not auth_path(name).exists()]
+    missing_claude = [spec.name for spec in CLAUDE_WORKER_SPECS if not claude_logged_in(spec.name)]
+    if missing_codex:
+        print("missing Codex login for:", ", ".join(missing_codex))
+        if missing_claude:
+            print("missing Claude login for:", ", ".join(missing_claude))
+        print("run `python3 -m multishell login <agent>` for each missing slot first")
+        return 1
+    if missing_claude:
+        print("warning: missing Claude login for:", ", ".join(missing_claude))
+        print("continuing with those Claude workers unavailable until login succeeds")
+
+    controller = MultiShellController()
+    try:
+        controller.start()
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
+    for message in cleanup_messages:
+        controller.add_notice(message, level="warn")
+    try:
+        run_tui(controller)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        controller.stop()
+    return 0
+
+
+def cmd_status(_: argparse.Namespace) -> int:
+    ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
+    print(f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} home={agent_home(MANAGER_SPEC.name)} auth={'yes' if auth_path(MANAGER_SPEC.name).exists() else 'no'}")
+    for spec in WORKER_SPECS:
+        ensure_agent_home(spec.name, mcp_bridge_command=_bridge_command("worker", spec.name))
+        print(f"{spec.name}: provider=codex email={spec.account_email} home={agent_home(spec.name)} auth={'yes' if auth_path(spec.name).exists() else 'no'}")
+    for spec in CLAUDE_WORKER_SPECS:
+        ensure_claude_home(spec.name)
+        print(f"{spec.name}: provider=claude email={spec.account_email} home={claude_home(spec.name)} auth={'yes' if claude_logged_in(spec.name) else 'no'}")
+    missing = missing_email_env_vars()
+    if missing:
+        print(f"warning: missing email env vars in .env: {', '.join(missing)}")
+    return 0
+
+
+def cmd_login(args: argparse.Namespace) -> int:
+    if args.agent not in all_agent_names():
+        raise SystemExit(f"unknown agent: {args.agent}")
+
+    if args.agent == MANAGER_SPEC.name:
+        ensure_agent_home(args.agent, mcp_bridge_command=_bridge_command("manager", args.agent))
+    elif args.agent in {spec.name for spec in WORKER_SPECS}:
+        ensure_agent_home(args.agent, mcp_bridge_command=_bridge_command("worker", args.agent))
+    else:
+        ensure_claude_home(args.agent)
+
+    env = os.environ.copy()
+    if args.agent in {spec.name for spec in CLAUDE_WORKER_SPECS}:
+        email_by_name = {spec.name: spec.account_email for spec in CLAUDE_WORKER_SPECS}
+        env.pop("ANTHROPIC_API_KEY", None)
+        env["HOME"] = str(claude_home(args.agent))
+        cmd = ["claude", "auth", "login", "--email", email_by_name[args.agent]]
+    else:
+        env["HOME"] = str(agent_home(args.agent))
+        cmd = ["codex", "login", "--device-auth"]
+    subprocess.run(cmd, check=True, env=env)
+    return 0
+
+
+def cmd_auto_login(args: argparse.Namespace) -> int:
+    if _maybe_reexec_into_venv("playwright"):
+        return 0
+
+    from .autologin import resolve_credentials, run_auto_login
+
+    if args.all:
+        target_agents = all_agent_names()
+    else:
+        if not args.agent:
+            raise SystemExit("provide an agent name or pass --all")
+        target_agents = [args.agent]
+        if args.agent not in all_agent_names():
+            raise SystemExit(f"unknown agent: {args.agent}")
+
+    missing_emails = missing_email_env_vars(target_agents)
+    if missing_emails:
+        raise SystemExit(f"missing emails in .env: {', '.join(missing_emails)}")
+
+    credentials = resolve_credentials(target_agents)
+    run_auto_login(credentials, headed=args.headed, timeout_seconds=args.timeout)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="multishell")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    run_parser = subparsers.add_parser("run")
+    run_parser.set_defaults(func=cmd_run)
+
+    status_parser = subparsers.add_parser("status")
+    status_parser.set_defaults(func=cmd_status)
+
+    login_parser = subparsers.add_parser("login")
+    login_parser.add_argument("agent")
+    login_parser.set_defaults(func=cmd_login)
+
+    auto_login_parser = subparsers.add_parser("auto-login")
+    auto_login_parser.add_argument("agent", nargs="?")
+    auto_login_parser.add_argument("--all", action="store_true")
+    auto_login_parser.add_argument("--headed", action="store_true")
+    auto_login_parser.add_argument("--timeout", type=int, default=180)
+    auto_login_parser.set_defaults(func=cmd_auto_login)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

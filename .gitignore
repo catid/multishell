@@ -1,0 +1,14 @@
+.env
+.multishell/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.coverage
+/auth-page.png
+/callback-final-inspect.png
+/consent-buttons.png
+/login-states.png
+/openai-google-error.png
+/post-login-click.png
+/wait-challenge.png

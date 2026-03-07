@@ -1,0 +1,2 @@
+"""Multishell package."""
+
