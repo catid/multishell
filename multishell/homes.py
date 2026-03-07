@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 from .config import MODEL, MODEL_REASONING_EFFORT, all_agent_specs, credential_source_agent, state_root
+from .runtime import suppress_node_warnings
 
 
 def agent_home(agent_name: str) -> Path:
@@ -52,7 +53,7 @@ def has_claude_auth(agent_name: str) -> bool:
 def claude_logged_in(agent_name: str) -> bool:
     if not has_claude_auth(agent_name):
         return False
-    env = os.environ.copy()
+    env = suppress_node_warnings(os.environ.copy())
     env.pop("ANTHROPIC_API_KEY", None)
     env["HOME"] = str(claude_home(agent_name))
     result = subprocess.run(

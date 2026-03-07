@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .envfile import parse_env_value
+
 
 MODEL = "gpt-5.4"
 MODEL_REASONING_EFFORT = "medium"
@@ -14,6 +16,30 @@ CLAUDE_MODEL = "claude-opus-4-6"
 # `high` is the maximum effort level currently exposed by `claude --help`.
 CLAUDE_REASONING_EFFORT = "high"
 MISSING_ENV_PREFIX = "<missing:"
+ENV_FILE_ENV_VAR = "MULTISHELL_ENV_FILE"
+STATE_ROOT_ENV_VAR = "MULTISHELL_STATE_ROOT"
+WORKSPACE_ROOT_ENV_VAR = "MULTISHELL_WORKSPACE_ROOT"
+DEFAULT_DOTENV_TEMPLATE = """MULTISHELL_MANAGER_EMAIL=manager@example.com
+MULTISHELL_MANAGER_PASSWORD="replace-me"
+# The manager lane is reused by the Codex manager and `claude-worker-5`.
+
+MULTISHELL_WORKER_1_EMAIL=worker1@example.com
+MULTISHELL_WORKER_1_PASSWORD="replace-me"
+
+MULTISHELL_WORKER_2_EMAIL=worker2@example.com
+MULTISHELL_WORKER_2_PASSWORD="replace-me"
+
+MULTISHELL_WORKER_3_EMAIL=worker3@example.com
+MULTISHELL_WORKER_3_PASSWORD="replace-me"
+
+MULTISHELL_WORKER_4_EMAIL=worker4@example.com
+MULTISHELL_WORKER_4_PASSWORD="replace-me"
+
+# Gemini Deep Think uses a separate Google OAuth mapping.
+# The current implementation uses the manager/bot account only.
+MULTISHELL_GEMINI_EMAIL=bot@example.com
+MULTISHELL_GEMINI_PASSWORD="replace-me"
+"""
 
 
 @dataclass(frozen=True)
@@ -30,20 +56,52 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def dotenv_template_path() -> Path:
+    return app_root() / ".env.example"
+
+
+def dotenv_template_text() -> str:
+    return DEFAULT_DOTENV_TEMPLATE
+
+
+def state_root() -> Path:
+    override = os.environ.get(STATE_ROOT_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser()
+    return Path.home() / ".multishell"
+
+
+def workspace_root() -> Path:
+    override = os.environ.get(WORKSPACE_ROOT_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def dotenv_path() -> Path:
+    override = os.environ.get(ENV_FILE_ENV_VAR, "").strip()
+    if override:
+        return Path(override).expanduser()
+    configured = state_root() / ".env"
+    legacy = app_root() / ".env"
+    if configured.exists():
+        return configured
+    if legacy.exists():
+        return legacy
+    return configured
+
+
 def _load_dotenv() -> None:
-    dotenv_path = app_root() / ".env"
-    if not dotenv_path.exists():
+    target = dotenv_path()
+    if not target.exists():
         return
-    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+    for raw_line in target.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
-        value = value.strip()
-        if value.startswith(("'", '"')) and value.endswith(("'", '"')) and len(value) >= 2:
-            value = value[1:-1]
-        os.environ.setdefault(key, value)
+        os.environ.setdefault(key, parse_env_value(value))
 
 
 def required_env(name: str) -> str:
@@ -165,15 +223,6 @@ CLAUDE_WORKER_SPECS = [
         engine="claude",
     ),
 ]
-
-
-def state_root() -> Path:
-    return app_root() / ".multishell"
-
-
-def workspace_root() -> Path:
-    return app_root()
-
 
 def manager_workspace_root() -> Path:
     path = state_root() / "workspaces" / "manager"

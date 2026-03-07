@@ -7,7 +7,7 @@ name = "multishell"
 version = "0.1.0"
 description = "Terminal orchestrator for a manager Codex session supervising multiple worker Codex sessions."
 requires-python = ">=3.11"
-dependencies = ["playwright>=1.52.0", "pexpect>=4.9.0"]
+dependencies = ["playwright>=1.52.0", "pexpect>=4.9.0", "websockets>=12.0"]
 
 [project.scripts]
 multishell = "multishell.__main__:main"

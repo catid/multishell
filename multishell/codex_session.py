@@ -356,7 +356,6 @@ class CodexSession:
         port = _reserve_port()
         env = child_env(os.environ.copy(), role="codex-session", agent=self.spec.name)
         env["HOME"] = str(self.home)
-        env.setdefault("NODE_NO_WARNINGS", "1")
         process = subprocess.Popen(
             ["codex", "app-server", "--listen", f"ws://127.0.0.1:{port}"],
             stdin=subprocess.DEVNULL,

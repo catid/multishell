@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
-from multishell.__main__ import build_parser
+from multishell.__main__ import build_parser, main
 
 
 def test_auto_login_requires_agent_or_all() -> None:
@@ -10,3 +13,113 @@ def test_auto_login_requires_agent_or_all() -> None:
     args = parser.parse_args(["auto-login"])
     with pytest.raises(SystemExit, match="provide an agent name or pass --all"):
         args.func(args)
+
+
+def test_login_opens_account_editor(monkeypatch) -> None:
+    parser = build_parser()
+    called: dict[str, bool] = {"writer": False, "editor": False}
+
+    monkeypatch.setattr("multishell.__main__._write_default_config", lambda path, force: called.__setitem__("writer", True))
+    monkeypatch.setattr("multishell.__main__.dotenv_path", lambda: Path("/tmp/multishell.env"))
+    monkeypatch.setattr("multishell.account_login.run_login_editor", lambda: called.__setitem__("editor", True) or 0)
+
+    args = parser.parse_args(["login"])
+
+    assert args.func(args) == 0
+    assert called == {"writer": True, "editor": True}
+
+
+def test_auth_login_for_codex_agent_suppresses_node_warnings(monkeypatch, tmp_path) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["worker-1"])
+    monkeypatch.setattr("multishell.__main__.WORKER_SPECS", (SimpleNamespace(name="worker-1"),))
+    monkeypatch.setattr("multishell.__main__.CLAUDE_WORKER_SPECS", ())
+    monkeypatch.setattr("multishell.__main__.ensure_agent_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.agent_home", lambda _agent: tmp_path / "worker-1")
+    monkeypatch.setenv("NODE_NO_WARNINGS", "0")
+
+    def fake_run(cmd, check, env):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("multishell.__main__.subprocess.run", fake_run)
+
+    args = parser.parse_args(["auth-login", "worker-1"])
+
+    assert args.func(args) == 0
+    assert captured["cmd"] == ["codex", "login", "--device-auth"]
+    assert captured["env"]["HOME"] == str(tmp_path / "worker-1")
+    assert captured["env"]["NODE_NO_WARNINGS"] == "1"
+
+
+def test_auth_login_for_claude_agent_suppresses_node_warnings(monkeypatch, tmp_path) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["claude-worker-1"])
+    monkeypatch.setattr("multishell.__main__.WORKER_SPECS", ())
+    monkeypatch.setattr(
+        "multishell.__main__.CLAUDE_WORKER_SPECS",
+        (SimpleNamespace(name="claude-worker-1", account_email="worker@example.com"),),
+    )
+    monkeypatch.setattr("multishell.__main__.ensure_claude_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.claude_home", lambda _agent: tmp_path / "claude-worker-1")
+    monkeypatch.setenv("NODE_NO_WARNINGS", "0")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
+
+    def fake_run(cmd, check, env):
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("multishell.__main__.subprocess.run", fake_run)
+
+    args = parser.parse_args(["auth-login", "claude-worker-1"])
+
+    assert args.func(args) == 0
+    assert captured["cmd"] == ["claude", "auth", "login", "--email", "worker@example.com"]
+    assert captured["env"]["HOME"] == str(tmp_path / "claude-worker-1")
+    assert captured["env"]["NODE_NO_WARNINGS"] == "1"
+    assert "ANTHROPIC_API_KEY" not in captured["env"]
+
+
+def test_init_config_writes_template(monkeypatch, tmp_path: Path) -> None:
+    parser = build_parser()
+    target = tmp_path / ".multishell" / ".env"
+
+    monkeypatch.setattr("multishell.__main__.dotenv_path", lambda: target)
+    monkeypatch.setattr("multishell.__main__.dotenv_template_text", lambda: "MULTISHELL_MANAGER_EMAIL=manager@example.com\n")
+
+    args = parser.parse_args(["init-config"])
+
+    assert args.func(args) == 0
+    assert target.read_text(encoding="utf-8") == "MULTISHELL_MANAGER_EMAIL=manager@example.com\n"
+
+
+def test_install_browser_runs_playwright_install(monkeypatch) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+
+    def fake_run(cmd, check):
+        captured["cmd"] = cmd
+        captured["check"] = check
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("multishell.__main__.subprocess.run", fake_run)
+
+    args = parser.parse_args(["install-browser"])
+
+    assert args.func(args) == 0
+    assert captured["cmd"][1:] == ["-m", "playwright", "install", "chromium"]
+    assert captured["check"] is True
+
+
+def test_main_defaults_to_run_when_no_subcommand(monkeypatch) -> None:
+    monkeypatch.setattr("multishell.__main__.cmd_run", lambda _args: 7)
+
+    assert main([]) == 7

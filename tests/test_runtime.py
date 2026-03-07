@@ -6,11 +6,13 @@ from multishell.config import state_root
 from multishell.runtime import (
     ENV_AGENT,
     ENV_INSTANCE_ID,
+    ENV_NODE_NO_WARNINGS,
     ENV_ROLE,
     ENV_STATE_ROOT,
     ObservedProcess,
     _discover_stale_processes,
     child_env,
+    suppress_node_warnings,
 )
 
 
@@ -24,6 +26,14 @@ def test_child_env_inherits_runtime_markers(monkeypatch, tmp_path: Path) -> None
     assert env[ENV_INSTANCE_ID] == "instance-1"
     assert env[ENV_ROLE] == "codex-session"
     assert env[ENV_AGENT] == "worker-1"
+    assert env[ENV_NODE_NO_WARNINGS] == "1"
+    assert env["PATH"] == "/usr/bin"
+
+
+def test_suppress_node_warnings_overrides_inherited_setting() -> None:
+    env = suppress_node_warnings({"PATH": "/usr/bin", ENV_NODE_NO_WARNINGS: "0"})
+
+    assert env[ENV_NODE_NO_WARNINGS] == "1"
     assert env["PATH"] == "/usr/bin"
 
 

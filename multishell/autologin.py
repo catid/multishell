@@ -17,7 +17,7 @@ import pexpect
 
 from .config import AgentSpec, all_agent_specs, credential_source_agent, password_env_var, state_root
 from .homes import agent_home, auth_path, claude_home, ensure_agent_home, ensure_claude_home, has_claude_auth
-from .runtime import child_env
+from .runtime import child_env, suppress_node_warnings
 
 
 DEVICE_URL = "https://auth.openai.com/codex/device"
@@ -78,10 +78,12 @@ def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_s
         if auth_path(credential.spec.name).exists():
             return
 
+        env = suppress_node_warnings(os.environ.copy())
+        env["HOME"] = str(agent_home(credential.spec.name))
         child = pexpect.spawn(
             "codex",
             ["login", "--device-auth"],
-            env={**os.environ, "HOME": str(agent_home(credential.spec.name))},
+            env=env,
             encoding="utf-8",
             timeout=30,
         )
@@ -123,7 +125,7 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
         if _claude_logged_in(credential.spec.name):
             return
 
-        env = os.environ.copy()
+        env = suppress_node_warnings(os.environ.copy())
         env.pop("ANTHROPIC_API_KEY", None)
         env["HOME"] = str(claude_home(credential.spec.name))
         child = pexpect.spawn(
@@ -843,7 +845,7 @@ def _wait_for_claude_auth(child: pexpect.spawn, agent_name: str, timeout_seconds
 def _claude_logged_in(agent_name: str) -> bool:
     if not has_claude_auth(agent_name):
         return False
-    env = os.environ.copy()
+    env = suppress_node_warnings(os.environ.copy())
     env.pop("ANTHROPIC_API_KEY", None)
     env["HOME"] = str(claude_home(agent_name))
     result = subprocess.run(

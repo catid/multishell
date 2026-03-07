@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import signal
 
 import multishell.tui as tui
 
@@ -83,3 +84,71 @@ def test_monitor_chip_formats_compact_status() -> None:
 
     assert "codex-2" in chip
     assert "RUN1" in chip
+
+
+class _RedrawWindow:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def redrawwin(self) -> None:
+        self.calls.append("redrawwin")
+
+    def clearok(self, flag: bool) -> None:
+        self.calls.append(("clearok", flag))
+
+
+def test_maybe_force_full_redraw_repaints_when_due() -> None:
+    window = _RedrawWindow()
+
+    next_due = tui._maybe_force_full_redraw(window, next_redraw_at=5.0, now=5.0)
+
+    assert window.calls == ["redrawwin", ("clearok", True)]
+    assert next_due == 5.0 + tui.FULL_REDRAW_INTERVAL_SECONDS
+
+
+def test_maybe_force_full_redraw_skips_when_not_due() -> None:
+    window = _RedrawWindow()
+
+    next_due = tui._maybe_force_full_redraw(window, next_redraw_at=5.0, now=4.5)
+
+    assert window.calls == []
+    assert next_due == 5.0
+
+
+def test_capture_sigint_sets_flag_and_restores_previous_handler() -> None:
+    previous = signal.getsignal(signal.SIGINT)
+
+    with tui._capture_sigint() as interrupt_state:
+        handler = signal.getsignal(signal.SIGINT)
+        assert handler is not previous
+        handler(signal.SIGINT, None)
+        assert interrupt_state.requested is True
+
+    assert signal.getsignal(signal.SIGINT) is previous
+
+
+class _TerminalWindow:
+    def __init__(self) -> None:
+        self.calls: list[object] = []
+
+    def keypad(self, enabled: bool) -> None:
+        self.calls.append(("keypad", enabled))
+
+    def timeout(self, value: int) -> None:
+        self.calls.append(("timeout", value))
+
+
+def test_restore_terminal_resets_modes(monkeypatch) -> None:
+    window = _TerminalWindow()
+    calls: list[str] = []
+
+    monkeypatch.setattr(tui.curses, "echo", lambda: calls.append("echo"))
+    monkeypatch.setattr(tui.curses, "nocbreak", lambda: calls.append("nocbreak"))
+    monkeypatch.setattr(tui.curses, "nl", lambda: calls.append("nl"))
+    monkeypatch.setattr(tui.curses, "qiflush", lambda: calls.append("qiflush"))
+    monkeypatch.setattr(tui.curses, "endwin", lambda: calls.append("endwin"))
+
+    tui._restore_terminal(window)
+
+    assert window.calls == [("keypad", False), ("timeout", -1)]
+    assert calls == ["echo", "nocbreak", "nl", "qiflush", "endwin"]

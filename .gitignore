@@ -6,6 +6,8 @@ __pycache__/
 .pytest_cache/
 .coverage
 *.egg-info/
+*.tmp
+*.swp
 uv.lock
 /auth-page.png
 /callback-final-inspect.png

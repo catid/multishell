@@ -372,7 +372,6 @@ class ClaudeSession:
         env = child_env(os.environ.copy(), role="claude-session", agent=self.spec.name)
         env.pop("ANTHROPIC_API_KEY", None)
         env["HOME"] = str(self.home)
-        env.setdefault("NODE_NO_WARNINGS", "1")
         command = [
             "claude",
             "-p",

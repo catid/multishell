@@ -14,6 +14,7 @@ ENV_STATE_ROOT = "MULTISHELL_STATE_ROOT"
 ENV_INSTANCE_ID = "MULTISHELL_INSTANCE_ID"
 ENV_ROLE = "MULTISHELL_ROLE"
 ENV_AGENT = "MULTISHELL_AGENT"
+ENV_NODE_NO_WARNINGS = "NODE_NO_WARNINGS"
 
 
 @dataclass(frozen=True)
@@ -55,13 +56,19 @@ def child_env(
     agent: str | None = None,
 ) -> dict[str, str]:
     ensure_runtime_environment()
-    env = dict(base_env if base_env is not None else os.environ)
+    env = suppress_node_warnings(base_env)
     env[ENV_STATE_ROOT] = os.environ[ENV_STATE_ROOT]
     env[ENV_INSTANCE_ID] = os.environ[ENV_INSTANCE_ID]
     if role is not None:
         env[ENV_ROLE] = role
     if agent is not None:
         env[ENV_AGENT] = agent
+    return env
+
+
+def suppress_node_warnings(base_env: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(base_env if base_env is not None else os.environ)
+    env[ENV_NODE_NO_WARNINGS] = "1"
     return env
 
 

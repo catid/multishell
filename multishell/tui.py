@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import curses
 import math
+import signal
 import time
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from types import FrameType
 
 from .control import format_timestamp
 from .orchestrator import MultiShellController
@@ -12,6 +15,7 @@ from .orchestrator import MultiShellController
 
 MIN_HEIGHT = 12
 MIN_WIDTH = 48
+FULL_REDRAW_INTERVAL_SECONDS = 1.0
 
 
 @dataclass
@@ -49,104 +53,172 @@ class ComposerLayout:
     cursor_x: int
 
 
+@dataclass
+class InterruptState:
+    requested: bool = False
+
+
 def run_tui(controller: MultiShellController) -> None:
-    curses.wrapper(lambda stdscr: _main(stdscr, controller))
+    with _capture_sigint() as interrupt_state:
+        curses.wrapper(lambda stdscr: _main(stdscr, controller, interrupt_state))
 
 
-def _main(stdscr: curses.window, controller: MultiShellController) -> None:
+def _main(stdscr: curses.window, controller: MultiShellController, interrupt_state: InterruptState) -> None:
     try:
-        curses.noecho()
-        curses.cbreak()
-        curses.nonl()
-    except curses.error:
-        pass
-    try:
-        curses.curs_set(1)
-    except curses.error:
-        pass
-    stdscr.timeout(100)
-    stdscr.keypad(True)
-    _init_colors()
+        try:
+            curses.noecho()
+            curses.cbreak()
+            curses.nonl()
+            curses.noqiflush()
+        except curses.error:
+            pass
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        stdscr.timeout(100)
+        stdscr.keypad(True)
+        _init_colors()
 
-    debug_mode = False
-    debug_state = DebugState()
-    input_state = InputState()
+        debug_mode = False
+        debug_state = DebugState()
+        input_state = InputState()
+        next_full_redraw_at = time.monotonic()
 
-    while True:
-        stdscr.erase()
-        height, width = stdscr.getmaxyx()
-        session_names = [row["name"] for row in controller.session_rows()]
-        composer = _layout_composer(input_state, height, width, debug_mode)
+        while True:
+            if interrupt_state.requested:
+                return
+            next_full_redraw_at = _maybe_force_full_redraw(stdscr, next_full_redraw_at)
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+            session_names = [row["name"] for row in controller.session_rows()]
+            composer = _layout_composer(input_state, height, width, debug_mode)
 
-        if height < MIN_HEIGHT or width < MIN_WIDTH:
-            _draw_too_small(stdscr, height, width)
-        else:
-            content_top = _draw_header(stdscr, controller, width)
-            footer_row = max(content_top, composer.box_top - 1)
-            content_bottom = max(content_top, footer_row - 1)
-            if debug_mode:
-                _draw_debug_view(stdscr, controller, debug_state, content_top, content_bottom, width)
+            if height < MIN_HEIGHT or width < MIN_WIDTH:
+                _draw_too_small(stdscr, height, width)
             else:
-                _draw_chat_view(stdscr, controller, content_top, content_bottom, width)
-            _draw_footer(stdscr, controller, debug_mode, debug_state, footer_row, width)
-            _draw_composer(stdscr, input_state, composer, width)
+                content_top = _draw_header(stdscr, controller, width)
+                footer_row = max(content_top, composer.box_top - 1)
+                content_bottom = max(content_top, footer_row - 1)
+                if debug_mode:
+                    _draw_debug_view(stdscr, controller, debug_state, content_top, content_bottom, width)
+                else:
+                    _draw_chat_view(stdscr, controller, content_top, content_bottom, width)
+                _draw_footer(stdscr, controller, debug_mode, debug_state, footer_row, width)
+                _draw_composer(stdscr, input_state, composer, width)
 
+            try:
+                stdscr.refresh()
+            except curses.error:
+                continue
+
+            try:
+                key = stdscr.get_wch()
+            except KeyboardInterrupt:
+                interrupt_state.requested = True
+                continue
+            except curses.error:
+                continue
+
+            if interrupt_state.requested or key == "\x03":
+                return
+            if key == "\t":
+                debug_mode = not debug_mode
+                continue
+            if key == curses.KEY_RESIZE:
+                next_full_redraw_at = time.monotonic()
+                continue
+
+            if debug_mode and _handle_debug_key(key, debug_state, session_names, _debug_column_count(width)):
+                continue
+
+            if key in ("\n", "\r"):
+                text = input_state.text.strip()
+                if text:
+                    controller.send_user_message(text)
+                input_state.clear()
+                continue
+            if key == "\x0e":
+                _insert_text(input_state, "\n")
+                continue
+            if key in ("\x08", "\x7f") or key == curses.KEY_BACKSPACE:
+                _delete_backwards(input_state)
+                continue
+            if key == curses.KEY_DC:
+                _delete_forwards(input_state)
+                continue
+            if not debug_mode and key == curses.KEY_LEFT:
+                input_state.cursor = max(0, input_state.cursor - 1)
+                continue
+            if not debug_mode and key == curses.KEY_RIGHT:
+                input_state.cursor = min(len(input_state.text), input_state.cursor + 1)
+                continue
+            if not debug_mode and key == curses.KEY_HOME:
+                input_state.cursor = 0
+                continue
+            if not debug_mode and key == curses.KEY_END:
+                input_state.cursor = len(input_state.text)
+                continue
+            if key == "\x01":
+                input_state.cursor = 0
+                continue
+            if key == "\x05":
+                input_state.cursor = len(input_state.text)
+                continue
+            if isinstance(key, str) and key.isprintable():
+                _insert_text(input_state, key)
+    finally:
+        _restore_terminal(stdscr)
+
+
+@contextmanager
+def _capture_sigint():
+    interrupt_state = InterruptState()
+    previous = signal.getsignal(signal.SIGINT)
+
+    def _handle_sigint(_signum: int, _frame: FrameType | None) -> None:
+        interrupt_state.requested = True
+
+    signal.signal(signal.SIGINT, _handle_sigint)
+    try:
+        yield interrupt_state
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
+def _restore_terminal(stdscr: curses.window) -> None:
+    try:
+        stdscr.keypad(False)
+    except (AttributeError, curses.error):
+        pass
+    try:
+        stdscr.timeout(-1)
+    except (AttributeError, curses.error):
+        pass
+    for reset in (curses.echo, curses.nocbreak, curses.nl, curses.qiflush):
         try:
-            stdscr.refresh()
+            reset()
         except curses.error:
-            continue
+            pass
+    try:
+        curses.endwin()
+    except curses.error:
+        pass
 
-        try:
-            key = stdscr.get_wch()
-        except curses.error:
-            continue
 
-        if key == "\x03":
-            return
-        if key == "\t":
-            debug_mode = not debug_mode
-            continue
-        if key == curses.KEY_RESIZE:
-            continue
-
-        if debug_mode and _handle_debug_key(key, debug_state, session_names, _debug_column_count(width)):
-            continue
-
-        if key in ("\n", "\r"):
-            text = input_state.text.strip()
-            if text:
-                controller.send_user_message(text)
-            input_state.clear()
-            continue
-        if key == "\x0e":
-            _insert_text(input_state, "\n")
-            continue
-        if key in ("\x08", "\x7f") or key == curses.KEY_BACKSPACE:
-            _delete_backwards(input_state)
-            continue
-        if key == curses.KEY_DC:
-            _delete_forwards(input_state)
-            continue
-        if not debug_mode and key == curses.KEY_LEFT:
-            input_state.cursor = max(0, input_state.cursor - 1)
-            continue
-        if not debug_mode and key == curses.KEY_RIGHT:
-            input_state.cursor = min(len(input_state.text), input_state.cursor + 1)
-            continue
-        if not debug_mode and key == curses.KEY_HOME:
-            input_state.cursor = 0
-            continue
-        if not debug_mode and key == curses.KEY_END:
-            input_state.cursor = len(input_state.text)
-            continue
-        if key == "\x01":
-            input_state.cursor = 0
-            continue
-        if key == "\x05":
-            input_state.cursor = len(input_state.text)
-            continue
-        if isinstance(key, str) and key.isprintable():
-            _insert_text(input_state, key)
+def _maybe_force_full_redraw(stdscr: curses.window, next_redraw_at: float, now: float | None = None) -> float:
+    current = time.monotonic() if now is None else now
+    if current < next_redraw_at:
+        return next_redraw_at
+    try:
+        stdscr.redrawwin()
+    except (AttributeError, curses.error):
+        pass
+    try:
+        stdscr.clearok(True)
+    except (AttributeError, curses.error):
+        pass
+    return current + FULL_REDRAW_INTERVAL_SECONDS
 
 
 def _init_colors() -> None:

@@ -7,9 +7,17 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .config import CLAUDE_WORKER_SPECS, MANAGER_SPEC, WORKER_SPECS, missing_email_env_vars, state_root
+from .config import (
+    CLAUDE_WORKER_SPECS,
+    MANAGER_SPEC,
+    WORKER_SPECS,
+    dotenv_path,
+    dotenv_template_text,
+    missing_email_env_vars,
+    state_root,
+)
 from .homes import agent_home, all_agent_names, auth_path, claude_home, claude_logged_in, ensure_agent_home, ensure_claude_home
-from .runtime import cleanup_stale_runtime, ensure_runtime_environment
+from .runtime import cleanup_stale_runtime, ensure_runtime_environment, suppress_node_warnings
 
 
 def _bridge_command(role: str, agent: str) -> list[str]:
@@ -39,6 +47,13 @@ def _maybe_reexec_into_venv(module_name: str) -> bool:
     return False
 
 
+def _write_default_config(target: Path, *, force: bool) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists() and not force:
+        return
+    target.write_text(dotenv_template_text().rstrip("\n") + "\n", encoding="utf-8")
+
+
 def cmd_run(_: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("websockets"):
         return 0
@@ -60,7 +75,8 @@ def cmd_run(_: argparse.Namespace) -> int:
         print("missing Codex login for:", ", ".join(missing_codex))
         if missing_claude:
             print("missing Claude login for:", ", ".join(missing_claude))
-        print("run `python3 -m multishell login <agent>` for each missing slot first")
+        print("run `multishell auto-login --all` (or add `--headed` when DISPLAY is available) first")
+        print("for a single lane, use `multishell auth-login <agent>`")
         return 1
     if missing_claude:
         print("warning: missing Claude login for:", ", ".join(missing_claude))
@@ -83,6 +99,23 @@ def cmd_run(_: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_init_config(args: argparse.Namespace) -> int:
+    target = Path(args.path).expanduser() if args.path else dotenv_path()
+    if target.exists() and not args.force:
+        print(f"config already exists: {target}")
+        return 0
+    _write_default_config(target, force=True)
+    print(f"wrote config template: {target}")
+    return 0
+
+
+def cmd_install_browser(_: argparse.Namespace) -> int:
+    if _maybe_reexec_into_venv("playwright"):
+        return 0
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    return 0
+
+
 def cmd_status(_: argparse.Namespace) -> int:
     ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
     print(f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} home={agent_home(MANAGER_SPEC.name)} auth={'yes' if auth_path(MANAGER_SPEC.name).exists() else 'no'}")
@@ -98,7 +131,14 @@ def cmd_status(_: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_login(args: argparse.Namespace) -> int:
+def cmd_login(_: argparse.Namespace) -> int:
+    from .account_login import run_login_editor
+
+    _write_default_config(dotenv_path(), force=False)
+    return run_login_editor()
+
+
+def cmd_auth_login(args: argparse.Namespace) -> int:
     if args.agent not in all_agent_names():
         raise SystemExit(f"unknown agent: {args.agent}")
 
@@ -109,7 +149,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     else:
         ensure_claude_home(args.agent)
 
-    env = os.environ.copy()
+    env = suppress_node_warnings(os.environ.copy())
     if args.agent in {spec.name for spec in CLAUDE_WORKER_SPECS}:
         email_by_name = {spec.name: spec.account_email for spec in CLAUDE_WORKER_SPECS}
         env.pop("ANTHROPIC_API_KEY", None)
@@ -148,7 +188,16 @@ def cmd_auto_login(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="multishell")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers = parser.add_subparsers(dest="command")
+    parser.set_defaults(func=cmd_run)
+
+    init_parser = subparsers.add_parser("init-config")
+    init_parser.add_argument("--path")
+    init_parser.add_argument("--force", action="store_true")
+    init_parser.set_defaults(func=cmd_init_config)
+
+    browser_parser = subparsers.add_parser("install-browser")
+    browser_parser.set_defaults(func=cmd_install_browser)
 
     run_parser = subparsers.add_parser("run")
     run_parser.set_defaults(func=cmd_run)
@@ -157,8 +206,11 @@ def build_parser() -> argparse.ArgumentParser:
     status_parser.set_defaults(func=cmd_status)
 
     login_parser = subparsers.add_parser("login")
-    login_parser.add_argument("agent")
     login_parser.set_defaults(func=cmd_login)
+
+    auth_login_parser = subparsers.add_parser("auth-login")
+    auth_login_parser.add_argument("agent")
+    auth_login_parser.set_defaults(func=cmd_auth_login)
 
     auto_login_parser = subparsers.add_parser("auto-login")
     auto_login_parser.add_argument("agent", nargs="?")

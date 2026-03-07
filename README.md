@@ -2,45 +2,71 @@
 
 `multishell` runs one Codex manager behind a terminal TUI and fans work out to persistent Codex and Claude workers.
 
-## Quick start
+## Install
 
-1. Copy the env template and fill in the Google OAuth accounts locally:
+Prerequisites:
+
+- Python 3.11+
+- `google-chrome`
+- `xvfb-run` when installing over SSH or any shell without `DISPLAY`
+
+One-command install and first-time setup:
 
 ```bash
-cp .env.example .env
+curl -fsSL https://raw.githubusercontent.com/catid/multishell/main/scripts/install.sh | bash
 ```
 
-2. Install the project and browser automation dependencies:
+The installer:
+
+- creates a dedicated Python venv under `~/.local/share/multishell`
+- installs a `multishell` wrapper into `~/.local/bin`
+- launches `multishell login` so you can enter the Google account emails and passwords in a curses TUI
+- runs `multishell install-browser`
+- runs `multishell auto-login --all` and uses `--headed` automatically when `DISPLAY` is available
+
+## Run
+
+After install, start `multishell` from the repository or project directory you want the workers to use:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
-.venv/bin/python -m pip install playwright pexpect
-.venv/bin/python -m playwright install chromium
+cd /path/to/project
+multishell
 ```
 
-3. If you want headed browser automation over SSH, make sure `google-chrome` and `xvfb` are installed on the machine.
+The worker sessions default to the directory where you launch `multishell`, so you can use one install across different repos.
 
-4. Log in all lanes automatically:
+## Setup Commands
+
+Edit the account list again later:
 
 ```bash
-python3 -m multishell auto-login --all --headed
+multishell login
 ```
 
-5. Start multishell:
+Run the browser auth automation again:
 
 ```bash
-python3 -m multishell run
+multishell auto-login --all --headed
+```
+
+Do a single agent auth login without the automation flow:
+
+```bash
+multishell auth-login worker-1
 ```
 
 ## Notes
 
-- `.env` is ignored by git. Do not commit real credentials.
-- On startup, `multishell` cleans up stale old sessions from the same `.multishell` state root before starting the fresh controller.
+- Runtime state lives under `~/.multishell` by default.
+- `multishell init-config` writes `~/.multishell/.env` by default.
+- Set `MULTISHELL_STATE_ROOT` to move the runtime state elsewhere.
+- Set `MULTISHELL_WORKSPACE_ROOT` if you want to override the default worker cwd instead of using the current directory.
+- The legacy repo-local `.env` file is still read as a fallback for older setups.
+- On startup, `multishell` cleans up stale old sessions from the same state root before starting the fresh controller.
 - `Tab` toggles the debug view and `Ctrl+C` exits.
 
 For everything else, use:
 
 ```bash
-python3 -m multishell --help
+multishell --help
 ```

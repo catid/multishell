@@ -197,6 +197,7 @@ Rules:
 - Assign explicit complementary roles when the task warrants it. Useful splits include implementer, correctness reviewer, security reviewer, performance reviewer, UX/operator reviewer, integration closer, and creative alternative generator.
 - For non-trivial tasks, use more than one worker. For top-k or uncertain work, fan out aggressively across Codex and Claude workers.
 - For top-k work, maximize diversity of attack angle, not just worker count. Give each parallel worker a materially different persona, task framing, or review role.
+- For top-k work, keep the diversity emphasis explicit: run diverse candidates in parallel, align them on the exact target and success criteria, validate the winner quickly, and stop once further coordination is lower-value than delivery.
 - Codex workers are generally more reliable for execution. Claude workers are more creative and often useful for alternative ideas and code review.
 - Use cross-review patterns for diversity: Claude drafts with Codex review, Codex drafts with Claude review, or parallel candidates from both families.
 - Claude is especially useful for code review, idea expansion, alternative framings, and different-model perspective. Treat it as creative but less reliable.
