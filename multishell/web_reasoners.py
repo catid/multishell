@@ -24,6 +24,7 @@ from .config import email_env_var, gemini_email_env_var, gemini_password_env_var
 
 
 SUPPORTED_PROVIDERS = frozenset({"chatgpt_pro", "gemini_deepthink"})
+CHATGPT_LOGIN_URL = "https://auth.openai.com/log-in?redirect_url=https%3A%2F%2Fchatgpt.com%2F"
 
 
 def _now() -> float:
@@ -246,7 +247,7 @@ class WebReasonerManager:
         page = None
         try:
             with sync_playwright() as playwright:
-                profile_name = _web_profile_name(job.provider, job.account_agent)
+                profile_name = _web_profile_name(job.provider, job.account_agent, job.id)
                 with _isolated_chrome(playwright, profile_name, headed=False) as (_browser, _context, page):
                     _check_cancel(cancel_flag)
                     if job.provider == "chatgpt_pro":
@@ -324,6 +325,9 @@ class WebReasonerManager:
         page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(2000)
         _ensure_chatgpt_logged_in(page, email, password, cancel_flag)
+        _check_cancel(cancel_flag)
+        page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(3000)
         _ensure_chatgpt_pro_workspace(page, cancel_flag)
         baseline = _extract_last_assistant_message(page)
         _submit_prompt(page, job.prompt, cancel_flag)
@@ -400,29 +404,42 @@ def _ensure_chatgpt_logged_in(page: object, email: str, password: str, cancel_fl
     if _has_visible(page, ["button:has-text('Log in')", "a:has-text('Log in')"], timeout_ms=3000):
         _click_first(page, ["button:has-text('Log in')", "a:has-text('Log in')"])
         page.wait_for_timeout(1000)
-        _normalize_openai_login_entry(page)
 
     flow_page = page
-    if _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=5000):
-        flow_page = _click_google_and_capture_page(page)
+    if not _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=5000):
+        page.goto(CHATGPT_LOGIN_URL, wait_until="domcontentloaded", timeout=120000)
+        page.wait_for_timeout(1000)
+        _normalize_openai_login_entry(page)
+        flow_page = page
+
+    if _has_visible(flow_page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=5000):
+        flow_page = _click_google_and_capture_page(flow_page)
         try:
             flow_page.wait_for_load_state("domcontentloaded", timeout=15000)
         except Exception:
             pass
     _ensure_google_logged_in(flow_page, email, password, cancel_flag)
+    _wait_for_chatgpt_login_completion(flow_page, cancel_flag)
 
 
 def _ensure_google_logged_in(page: object, email: str, password: str, cancel_flag: threading.Event) -> None:
     deadline = time.time() + 180
     while time.time() < deadline:
+        _dismiss_managed_profile_notice_in_context(page)
+        page = _preferred_openai_flow_page(page)
         _check_cancel(cancel_flag)
         body = _body_text(page)
         title = _page_title(page)
         current_url = getattr(page, "url", "")
 
+        if _is_managed_profile_notice(current_url, title, body):
+            if _dismiss_managed_profile_notice(page):
+                time.sleep(1)
+                continue
+
         if _is_google_account_picker(body) and email in body:
             try:
-                page.locator(f"text={email}").first.click(timeout=3000)
+                _click_first(page, [f"text={email}"])
                 time.sleep(1)
                 continue
             except Exception:
@@ -483,8 +500,45 @@ def _ensure_google_logged_in(page: object, email: str, password: str, cancel_fla
     )
 
 
-def _web_profile_name(provider: str, account_agent: str) -> str:
-    return f"web-{provider}-{account_agent}"
+def _web_profile_name(provider: str, account_agent: str, job_id: str | None = None) -> str:
+    base = f"web-{provider}-{account_agent}"
+    if not job_id:
+        return base
+    return f"{base}-{job_id[:8]}"
+
+
+def _preferred_openai_flow_page(page: object) -> object:
+    context = getattr(page, "context", None)
+    if context is None:
+        return page
+
+    google_page = None
+    auth_page = None
+    chatgpt_page = None
+    notice_page = None
+    fallback = page
+    for candidate in getattr(context, "pages", []):
+        try:
+            if candidate.is_closed():
+                continue
+            url = candidate.url
+        except Exception:
+            continue
+        if url.startswith("chrome://managed-user-profile-notice/"):
+            notice_page = candidate
+            continue
+        if "accounts.google.com" in url:
+            google_page = candidate
+            continue
+        if "auth.openai.com" in url:
+            auth_page = candidate
+            continue
+        if "chatgpt.com" in url:
+            chatgpt_page = candidate
+            continue
+        if url and url != "about:blank":
+            fallback = candidate
+    return google_page or auth_page or chatgpt_page or notice_page or fallback
 
 
 def _is_google_account_picker(body: str) -> bool:
@@ -493,11 +547,74 @@ def _is_google_account_picker(body: str) -> bool:
     return "Use another account" in body and "Enter your password" not in body
 
 
-def _ensure_chatgpt_pro_workspace(page: object, cancel_flag: threading.Event) -> None:
+def _is_managed_profile_notice(url: str, title: str, body: str) -> bool:
+    if url.startswith("chrome://managed-user-profile-notice/"):
+        return True
+    notice_text = "Your organization will manage this profile"
+    return notice_text in title or notice_text in body
+
+
+def _dismiss_managed_profile_notice(page: object) -> bool:
+    for selector in (
+        "[role='button']:has-text('Continue as')",
+        "text=/^Continue as /",
+        "text=Continue as bot",
+    ):
+        locator = page.locator(selector).first
+        try:
+            locator.wait_for(state="visible", timeout=2000)
+            try:
+                locator.click(timeout=3000)
+            except Exception:
+                locator.evaluate("(el) => el.click()")
+            page.wait_for_timeout(1500)
+            return True
+        except Exception:
+            continue
+
+    try:
+        page.keyboard.press("Tab")
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1500)
+        return True
+    except Exception:
+        return False
+
+
+def _dismiss_managed_profile_notice_in_context(page: object) -> bool:
+    context = getattr(page, "context", None)
+    if context is None:
+        return False
+    dismissed = False
+    for candidate in getattr(context, "pages", []):
+        try:
+            if candidate.is_closed():
+                continue
+            url = candidate.url
+            title = _page_title(candidate)
+            body = _body_text(candidate)
+        except Exception:
+            continue
+        if _is_managed_profile_notice(url, title, body):
+            dismissed = _dismiss_managed_profile_notice(candidate) or dismissed
+    return dismissed
+
+
+def _wait_for_chatgpt_login_completion(page: object, cancel_flag: threading.Event) -> None:
     deadline = time.time() + 180
+    retry_to_auth = False
     while time.time() < deadline:
+        _dismiss_managed_profile_notice_in_context(page)
+        page = _preferred_openai_flow_page(page)
         _check_cancel(cancel_flag)
         body = _body_text(page)
+        title = _page_title(page)
+        current_url = getattr(page, "url", "")
+
+        if _is_managed_profile_notice(current_url, title, body):
+            if _dismiss_managed_profile_notice(page):
+                time.sleep(1)
+                continue
 
         if "Sign in to ChatGPT" in body or "Select a workspace" in body:
             _complete_workspace_consent(page)
@@ -506,7 +623,55 @@ def _ensure_chatgpt_pro_workspace(page: object, cancel_flag: threading.Event) ->
 
         if "Choose a workspace" in body:
             if _has_visible(page, ["text=Kuang2"], timeout_ms=2000):
-                page.locator("text=Kuang2").first.click()
+                _click_first(page, ["text=Kuang2"])
+                page.wait_for_timeout(3000)
+                continue
+
+        if "chatgpt.com" in current_url:
+            if "Log in" not in body and _has_visible(
+                page,
+                ["textarea", "[contenteditable='true']", "[role='textbox']"],
+                timeout_ms=1000,
+            ):
+                return
+            if "Log in" in body and not retry_to_auth:
+                retry_to_auth = True
+                page.goto(CHATGPT_LOGIN_URL, wait_until="domcontentloaded", timeout=120000)
+                page.wait_for_timeout(1000)
+                _normalize_openai_login_entry(page)
+                continue
+
+        time.sleep(1)
+
+    raise WebReasonerError(
+        "timed out waiting for ChatGPT login completion at "
+        f"{getattr(page, 'url', '<unknown>')} title={_page_title(page)!r} body={_body_text(page)[:240]!r}"
+    )
+
+
+def _ensure_chatgpt_pro_workspace(page: object, cancel_flag: threading.Event) -> None:
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        _dismiss_managed_profile_notice_in_context(page)
+        page = _preferred_openai_flow_page(page)
+        _check_cancel(cancel_flag)
+        body = _body_text(page)
+        title = _page_title(page)
+        current_url = getattr(page, "url", "")
+
+        if _is_managed_profile_notice(current_url, title, body):
+            if _dismiss_managed_profile_notice(page):
+                time.sleep(1)
+                continue
+
+        if "Sign in to ChatGPT" in body or "Select a workspace" in body:
+            _complete_workspace_consent(page)
+            page.wait_for_timeout(1500)
+            continue
+
+        if "Choose a workspace" in body:
+            if _has_visible(page, ["text=Kuang2"], timeout_ms=2000):
+                _click_first(page, ["text=Kuang2"])
                 page.wait_for_timeout(4000)
                 continue
             raise WebReasonerError("ChatGPT workspace chooser did not offer the Kuang2 workspace")

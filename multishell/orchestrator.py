@@ -193,7 +193,10 @@ Rules:
 - Start slow web reasoners early on hard tasks, continue delegating while they run, then incorporate useful revisions after they complete.
 - Restart workers for unrelated tasks so stale memory does not leak across problems.
 - When starting or restarting a worker, craft a fresh session persona using `persona_name`, `task_context`, and `extra_instructions`.
+- Worker personalities are intentionally narrow. Do not assume one strong worker will also cover security, performance, UX, operability, and integration concerns automatically.
+- Assign explicit complementary roles when the task warrants it. Useful splits include implementer, correctness reviewer, security reviewer, performance reviewer, UX/operator reviewer, integration closer, and creative alternative generator.
 - For non-trivial tasks, use more than one worker. For top-k or uncertain work, fan out aggressively across Codex and Claude workers.
+- For top-k work, maximize diversity of attack angle, not just worker count. Give each parallel worker a materially different persona, task framing, or review role.
 - Codex workers are generally more reliable for execution. Claude workers are more creative and often useful for alternative ideas and code review.
 - Use cross-review patterns for diversity: Claude drafts with Codex review, Codex drafts with Claude review, or parallel candidates from both families.
 - Claude is especially useful for code review, idea expansion, alternative framings, and different-model perspective. Treat it as creative but less reliable.
@@ -240,6 +243,9 @@ def _worker_prompt(
         f"Session objective: {resolved_task_context}",
         f"Additional instructions: {resolved_extra}",
         "",
+        "Stay within this session's angle instead of pretending to cover every concern at once.",
+        "If the task clearly needs complementary review from another angle such as security, performance, UX, or integration, say so explicitly.",
+        "",
     ]
     if engine == "claude":
         base.extend(
@@ -249,6 +255,7 @@ def _worker_prompt(
                 "Good uses: creative exploration, generating candidate implementations, code review for Codex output, and broader idea search.",
                 "When asked for top-k or comparison work, generate materially different options instead of converging too early.",
                 "Be explicit about uncertainty and things that need Codex or the manager to verify.",
+                "Do not silently claim coverage outside your assigned angle. Ask for complementary peer review when other concerns matter.",
                 "If you have no task yet, reply once that you are ready for assignments.",
             ]
         )
@@ -263,6 +270,7 @@ def _worker_prompt(
                 "Spark may create new scratch files only when explicitly asked; it should not be trusted to edit existing files directly.",
                 "Be concrete, state what you changed, and note blockers quickly.",
                 "If you are part of a top-k exploration, lean into your assigned angle instead of averaging toward the other workers.",
+                "Do not silently claim coverage outside your assigned angle. Ask for complementary peer review when security, performance, UX, or integration risk matters.",
                 "If you have no task yet, reply once that you are ready for assignments.",
             ]
         )
@@ -601,8 +609,10 @@ class MultiShellController:
             f"{self._overview_text()}\n\n"
             "Respond using tools only. If the task is unrelated to ongoing worker memory, restart or stop the relevant worker "
             "sessions first. Use Codex workers for reliable implementation and Claude workers for diversity, review, and cross-model "
-            "perspective. Start slow web reasoners early when long-horizon planning, outside knowledge, or heavy reasoning may help later. "
-            "For substantial work, split it into distinct parallel assignments. Choose worker working directories intentionally and notify the user."
+            "perspective. Agents stay narrow to their prompted roles, so explicitly assign complementary jobs instead of assuming one worker covers "
+            "everything. Use role splits like implementer, reviewer, performance checker, security skeptic, UX/operator critic, and integration closer "
+            "when appropriate. Start slow web reasoners early when long-horizon planning, outside knowledge, or heavy reasoning may help later. "
+            "For substantial work, split it into distinct parallel assignments with materially different angles. Choose worker working directories intentionally and notify the user."
             f"{fanout_guidance}"
         )
         self._user_message_count += 1
@@ -830,10 +840,15 @@ class MultiShellController:
         if any(keyword in normalized for keyword in top_k_keywords):
             return (
                 "\n\nThis request matches top-k exploration. Use multiple Codex and Claude workers in parallel with fresh personas and "
-                "different attack angles. Start one or both slow web reasoners early if long-horizon planning or outside knowledge may revise the path later."
+                "materially different attack angles. Do not assign near-duplicate roles. Split across complementary jobs such as implementation, "
+                "correctness review, performance review, security scrutiny, UX/operator critique, integration validation, and creative alternatives "
+                "as appropriate. Start one or both slow web reasoners early if long-horizon planning or outside knowledge may revise the path later."
             )
         if len(text.split()) >= 18:
-            return "\n\nThis is not a trivial request. Prefer parallel delegation across several Codex and Claude workers rather than serial execution."
+            return (
+                "\n\nThis is not a trivial request. Prefer parallel delegation across several Codex and Claude workers rather than serial execution. "
+                "Use explicit complementary roles instead of assuming one worker persona will notice security, performance, UX, and integration issues automatically."
+            )
         return ""
 
     def _resolve_worker_session_prompt(self, worker_name: str, arguments: dict[str, object]) -> tuple[str, str]:

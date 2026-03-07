@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import socket
 import socketserver
+import sys
 import threading
 import time
 from pathlib import Path
@@ -24,13 +26,24 @@ class ControlHandler(socketserver.StreamRequestHandler):
                     response = self.server.controller.handle_control_request(request)  # type: ignore[attr-defined]
                 except Exception as exc:  # pragma: no cover - defensive
                     response = {"ok": False, "error": f"control handler crashed: {exc}"}
-            self.wfile.write((json.dumps(response) + "\n").encode("utf-8"))
-            self.wfile.flush()
+            try:
+                self.wfile.write((json.dumps(response) + "\n").encode("utf-8"))
+                self.wfile.flush()
+            except OSError as exc:
+                if _is_disconnect_error(exc):
+                    return
+                raise
 
 
 class ThreadedUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
+
+    def handle_error(self, request: object, client_address: object) -> None:  # pragma: no cover - defensive
+        _, exc, _ = sys.exc_info()
+        if isinstance(exc, OSError) and _is_disconnect_error(exc):
+            return
+        super().handle_error(request, client_address)
 
 
 class ControlServer:
@@ -88,6 +101,15 @@ def send_control_request(socket_path: Path, payload: dict[str, object]) -> dict[
 
 def format_timestamp(ts: float) -> str:
     return time.strftime("%H:%M:%S", time.localtime(ts))
+
+
+def _is_disconnect_error(exc: OSError) -> bool:
+    return exc.errno in {
+        errno.EPIPE,
+        errno.ECONNRESET,
+        errno.ENOTCONN,
+        errno.EBADF,
+    }
 
 
 def _socket_is_live(socket_path: Path) -> bool:

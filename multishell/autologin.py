@@ -391,16 +391,38 @@ def _click_claude_organization_option(page: object) -> bool:
 def _click_google_and_capture_page(page: object) -> object:
     from playwright.sync_api import TimeoutError
 
+    original_url = page.url
     try:
         with page.expect_popup(timeout=5000) as popup_info:
             _click_first(page, ["button:has-text('Continue with Google')", "text=Continue with Google"])
         return popup_info.value
     except TimeoutError:
-        if "accounts.google.com" not in page.url:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            current_url = page.url
+            if "accounts.google.com" in current_url or current_url != original_url:
+                break
+            if _has_visible(
+                page,
+                [
+                    "input[type='email']:visible",
+                    "input[name='identifier']:visible",
+                    "input[autocomplete='username']:visible",
+                    "input[type='password']:visible",
+                    "input[name='Passwd']:visible",
+                    "text=Choose an account",
+                ],
+                timeout_ms=500,
+            ):
+                break
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                page.wait_for_timeout(250)
             except Exception:
-                pass
+                break
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=10000)
+        except Exception:
+            pass
         return page
 
 
@@ -621,6 +643,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool):
 
     profile_dir = state_root() / "browser-profiles" / agent_name
     profile_dir.mkdir(parents=True, exist_ok=True)
+    _cleanup_stale_chrome_profile(profile_dir)
     port = _reserve_port()
 
     command = [
@@ -672,6 +695,67 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool):
                 os.killpg(process.pid, signal.SIGKILL)
             except Exception:
                 pass
+
+
+def _cleanup_stale_chrome_profile(profile_dir: Path) -> None:
+    token = f"--user-data-dir={profile_dir}"
+    try:
+        output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        output = ""
+
+    stale_pids: list[int] = []
+    for line in output.splitlines():
+        if token not in line:
+            continue
+        pid_text, _, _args = line.strip().partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid != os.getpid():
+            stale_pids.append(pid)
+
+    _terminate_pids(stale_pids, signal.SIGTERM, timeout_seconds=3.0)
+    _terminate_pids(stale_pids, signal.SIGKILL, timeout_seconds=1.0)
+
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        try:
+            (profile_dir / name).unlink()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+
+def _terminate_pids(pids: list[int], sig: signal.Signals, timeout_seconds: float) -> None:
+    pending: list[int] = []
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+            pending.append(pid)
+        except ProcessLookupError:
+            continue
+        except Exception:
+            continue
+
+    if not pending:
+        return
+
+    deadline = time.time() + max(0.1, timeout_seconds)
+    while pending and time.time() < deadline:
+        remaining: list[int] = []
+        for pid in pending:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                continue
+            except Exception:
+                continue
+            remaining.append(pid)
+        pending = remaining
+        if pending:
+            time.sleep(0.2)
 
 
 def _wait_for_cdp_endpoint(port: int, timeout_seconds: int) -> str:
@@ -785,13 +869,19 @@ def _selector(raw: str) -> str:
 
 def _fill_first(page: object, selectors: list[str], value: str) -> None:
     for selector in selectors:
-        locator = page.locator(selector).first
+        locator = page.locator(selector)
         try:
-            locator.wait_for(state="visible", timeout=7000)
-            locator.fill(value)
-            return
+            count = locator.count()
         except Exception:
-            continue
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=7000)
+                candidate.fill(value)
+                return
+            except Exception:
+                continue
     raise RuntimeError(
         f"unable to fill any selector from {selectors}; title={_page_title(page)!r}; url={page.url!r}; body={_body_text(page)[:240]!r}"
     )
@@ -799,13 +889,19 @@ def _fill_first(page: object, selectors: list[str], value: str) -> None:
 
 def _click_first(page: object, selectors: list[str]) -> None:
     for selector in selectors:
-        locator = page.locator(selector).first
+        locator = page.locator(selector)
         try:
-            locator.wait_for(state="visible", timeout=7000)
-            locator.click()
-            return
+            count = locator.count()
         except Exception:
-            continue
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=7000)
+                candidate.click()
+                return
+            except Exception:
+                continue
     raise RuntimeError(
         f"unable to click any selector from {selectors}; title={_page_title(page)!r}; url={page.url!r}; body={_body_text(page)[:240]!r}"
     )
@@ -813,24 +909,36 @@ def _click_first(page: object, selectors: list[str]) -> None:
 
 def _click_optional(page: object, selectors: list[str]) -> None:
     for selector in selectors:
-        locator = page.locator(selector).first
+        locator = page.locator(selector)
         try:
-            locator.wait_for(state="visible", timeout=2000)
-            locator.click()
-            return
+            count = locator.count()
         except Exception:
-            continue
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=2000)
+                candidate.click()
+                return
+            except Exception:
+                continue
 
 
 def _has_visible(page: object, selectors: list[str], timeout_ms: int) -> bool:
     slice_timeout = max(250, timeout_ms // max(1, len(selectors)))
     for selector in selectors:
-        locator = page.locator(selector).first
+        locator = page.locator(selector)
         try:
-            locator.wait_for(state="visible", timeout=slice_timeout)
-            return True
+            count = locator.count()
         except Exception:
-            continue
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=slice_timeout)
+                return True
+            except Exception:
+                continue
     return False
 
 

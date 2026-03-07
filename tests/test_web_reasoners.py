@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import time
 from threading import Event
+from types import SimpleNamespace
 
 import pytest
 
 from multishell.web_reasoners import (
+    CHATGPT_LOGIN_URL,
     WebReasonerEvent,
     WebReasonerManager,
     _ensure_chatgpt_pro_workspace,
+    _ensure_chatgpt_logged_in,
     _ensure_google_logged_in,
+    _preferred_openai_flow_page,
+    _wait_for_chatgpt_login_completion,
     _web_profile_name,
 )
 
@@ -100,6 +105,7 @@ def test_start_job_validates_required_fields() -> None:
 def test_web_profile_name_is_stable_per_provider_and_account() -> None:
     assert _web_profile_name("chatgpt_pro", "manager") == "web-chatgpt_pro-manager"
     assert _web_profile_name("chatgpt_pro", "manager") == _web_profile_name("chatgpt_pro", "manager")
+    assert _web_profile_name("chatgpt_pro", "manager", "12345678-aaaa-bbbb-cccc-ddddeeeeffff") == "web-chatgpt_pro-manager-12345678"
 
 
 class _FakeLocator:
@@ -115,9 +121,21 @@ class _FakeLocator:
 class _FakePage:
     def __init__(self, url: str) -> None:
         self.url = url
+        self.gotos: list[str] = []
+        self.context = SimpleNamespace(pages=[self])
 
     def locator(self, selector: str) -> _FakeLocator:
         return _FakeLocator(selector)
+
+    def goto(self, url: str, wait_until: str | None = None, timeout: int | None = None) -> None:
+        self.url = url
+        self.gotos.append(url)
+
+    def wait_for_timeout(self, _timeout_ms: int) -> None:
+        return None
+
+    def is_closed(self) -> bool:
+        return False
 
 
 def test_google_password_screen_prefers_password_input_over_account_picker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -182,3 +200,113 @@ def test_chatgpt_workspace_reuses_openai_consent_flow(monkeypatch: pytest.Monkey
     _ensure_chatgpt_pro_workspace(page, Event())
 
     assert consent_calls == ["consent"]
+
+
+def test_chatgpt_login_starts_from_direct_openai_auth_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://chatgpt.com/")
+    normalize_calls: list[str] = []
+    google_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(
+        "multishell.web_reasoners._body_text",
+        lambda _page: "Log in to get answers based on saved chats, plus create images and upload files.",
+    )
+    monkeypatch.setattr("multishell.web_reasoners._has_visible", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        "multishell.web_reasoners._normalize_openai_login_entry",
+        lambda _page: normalize_calls.append(_page.url),
+    )
+    monkeypatch.setattr(
+        "multishell.web_reasoners._ensure_google_logged_in",
+        lambda _page, email, password, _cancel: google_calls.append((email, password)),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._wait_for_chatgpt_login_completion", lambda *_args, **_kwargs: None)
+
+    _ensure_chatgpt_logged_in(page, "bot@kuang2.ai", "secret", Event())
+
+    assert page.gotos == [CHATGPT_LOGIN_URL]
+    assert normalize_calls == [CHATGPT_LOGIN_URL]
+    assert google_calls == [("bot@kuang2.ai", "secret")]
+
+
+def test_chatgpt_login_prefers_homepage_google_modal_when_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://chatgpt.com/")
+    clicks: list[tuple[str, ...]] = []
+    google_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr("multishell.web_reasoners._body_text", lambda _page: "Log in")
+
+    def fake_has_visible(_page: object, selectors: list[str], timeout_ms: int) -> bool:
+        joined = " ".join(selectors)
+        if "Continue with Google" in joined:
+            return True
+        if "button:has-text('Log in')" in joined or "a:has-text('Log in')" in joined:
+            return True
+        return False
+
+    monkeypatch.setattr("multishell.web_reasoners._has_visible", fake_has_visible)
+    monkeypatch.setattr(
+        "multishell.web_reasoners._click_first",
+        lambda _page, selectors: clicks.append(tuple(selectors)),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._click_google_and_capture_page", lambda page_obj: page_obj)
+    monkeypatch.setattr(
+        "multishell.web_reasoners._ensure_google_logged_in",
+        lambda _page, email, password, _cancel: google_calls.append((email, password)),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._wait_for_chatgpt_login_completion", lambda *_args, **_kwargs: None)
+
+    _ensure_chatgpt_logged_in(page, "bot@kuang2.ai", "secret", Event())
+
+    assert page.gotos == []
+    assert clicks == [("button:has-text('Log in')", "a:has-text('Log in')")]
+    assert google_calls == [("bot@kuang2.ai", "secret")]
+
+
+def test_preferred_openai_flow_page_prioritizes_auth_pages_over_managed_notice() -> None:
+    current = _FakePage("about:blank")
+    chatgpt = _FakePage("https://chatgpt.com/")
+    notice = _FakePage("chrome://managed-user-profile-notice/")
+    google = _FakePage("https://accounts.google.com/v3/signin/challenge/pwd")
+    auth = _FakePage("https://auth.openai.com/workspace")
+    pages = [current, chatgpt, notice, google, auth]
+    for page in pages:
+        page.context = SimpleNamespace(pages=pages)
+
+    assert _preferred_openai_flow_page(current) is google
+
+    google.url = "about:blank"
+    assert _preferred_openai_flow_page(current) is auth
+
+    auth.url = "about:blank"
+    assert _preferred_openai_flow_page(current) is chatgpt
+
+
+def test_wait_for_chatgpt_login_completion_retries_auth_from_public_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://chatgpt.com/")
+    state = {"body": "Log in to get answers based on saved chats."}
+    normalized_urls: list[str] = []
+
+    monkeypatch.setattr("multishell.web_reasoners._body_text", lambda _page: state["body"])
+    monkeypatch.setattr("multishell.web_reasoners._page_title", lambda _page: "ChatGPT")
+    monkeypatch.setattr("multishell.web_reasoners._check_cancel", lambda _flag: None)
+    monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
+
+    def fake_has_visible(_page: object, selectors: list[str], timeout_ms: int) -> bool:
+        if any("textarea" in selector or "textbox" in selector or "contenteditable" in selector for selector in selectors):
+            return "Log in" not in state["body"]
+        return False
+
+    monkeypatch.setattr("multishell.web_reasoners._has_visible", fake_has_visible)
+
+    def fake_normalize(_page: object) -> None:
+        normalized_urls.append(_page.url)
+        _page.url = "https://chatgpt.com/"
+        state["body"] = "ChatGPT 5.4 Pro"
+
+    monkeypatch.setattr("multishell.web_reasoners._normalize_openai_login_entry", fake_normalize)
+
+    _wait_for_chatgpt_login_completion(page, Event())
+
+    assert page.gotos == [CHATGPT_LOGIN_URL]
+    assert normalized_urls == [CHATGPT_LOGIN_URL]

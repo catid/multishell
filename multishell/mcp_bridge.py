@@ -52,7 +52,7 @@ MANAGER_TOOLS = [
     ),
     ToolDef(
         name="delegate_to_worker",
-        description="Queue a new task or nudge for a named worker session.",
+        description="Queue a new task or nudge for a named worker session. Prefer task-specific complementary roles instead of near-duplicate assignments.",
         input_schema={
             "type": "object",
             "properties": {
@@ -66,7 +66,7 @@ MANAGER_TOOLS = [
     ),
     ToolDef(
         name="start_worker_session",
-        description="Start a stopped worker session, optionally in a specific working directory.",
+        description="Start a stopped worker session, optionally in a specific working directory and with a task-specific persona.",
         input_schema={
             "type": "object",
             "properties": {
@@ -95,7 +95,7 @@ MANAGER_TOOLS = [
     ),
     ToolDef(
         name="restart_worker_session",
-        description="Restart a worker session to clear memory, optionally changing its working directory.",
+        description="Restart a worker session to clear memory, optionally changing its working directory and resetting it to a task-specific persona.",
         input_schema={
             "type": "object",
             "properties": {
