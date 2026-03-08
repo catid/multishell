@@ -1,11 +1,16 @@
+from types import SimpleNamespace
+
 from playwright.sync_api import TimeoutError
 
 from multishell.autologin import (
+    AgentCredentials,
+    run_auto_login,
     _build_claude_local_callback_url,
     _click_first,
     _click_google_and_capture_page,
     _extract_claude_listen_port,
 )
+from multishell.config import AgentSpec
 
 
 def test_extract_claude_listen_port_from_ss_output() -> None:
@@ -115,3 +120,34 @@ def test_click_first_skips_hidden_match_and_uses_visible_one() -> None:
     _click_first(page, ["button:has-text('Log in')"])
 
     assert clicked == [1]
+
+
+class _FakePlaywrightContext:
+    def __enter__(self):
+        return SimpleNamespace()
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_run_auto_login_emits_progress_lines(monkeypatch, capsys) -> None:
+    credential = AgentCredentials(
+        spec=AgentSpec(
+            name="worker-1",
+            account_email="worker@example.com",
+            role="worker",
+            personality="Test worker.",
+            accent_color=2,
+            account_key="account-1",
+        ),
+        password="secret",
+    )
+
+    monkeypatch.setattr("multishell.autologin.apply_node_warning_suppression", lambda: None)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _FakePlaywrightContext())
+    monkeypatch.setattr("multishell.autologin._login_codex_one", lambda *_args, **_kwargs: None)
+
+    run_auto_login([credential])
+
+    out = capsys.readouterr().out
+    assert "auto-login 1/1: worker-1 (codex, worker@example.com)" in out

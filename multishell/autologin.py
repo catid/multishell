@@ -29,6 +29,18 @@ class AgentCredentials:
     password: str
 
 
+def _log_progress(agent_name: str, message: str) -> None:
+    print(f"[{agent_name}] {message}", flush=True)
+
+
+def _periodic_progress(agent_name: str, last_logged_at: float, message: str, *, interval_seconds: float = 10.0) -> float:
+    now = time.time()
+    if now - last_logged_at >= interval_seconds:
+        _log_progress(agent_name, message)
+        return now
+    return last_logged_at
+
+
 def specs_by_name() -> dict[str, AgentSpec]:
     return {spec.name: spec for spec in all_agent_specs()}
 
@@ -79,15 +91,19 @@ def run_auto_login(credentials: list[AgentCredentials], headed: bool = False, ti
 
 
 def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
+    agent_name = credential.spec.name
     page = None
     child = None
     try:
+        _log_progress(agent_name, "preparing Codex login state")
         _ensure_home(credential.spec.name)
         if auth_path(credential.spec.name).exists():
+            _log_progress(agent_name, "already logged in; skipping")
             return
 
         env = suppress_node_warnings(os.environ.copy())
         env["HOME"] = str(agent_home(credential.spec.name))
+        _log_progress(agent_name, "starting `codex login --device-auth`")
         child = pexpect.spawn(
             "codex",
             ["login", "--device-auth"],
@@ -101,9 +117,13 @@ def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_s
             output = ""
 
         url, device_code = _extract_device_flow(output)
-        with _isolated_chrome(playwright, credential.spec.name, headed=headed) as (browser, context, page):
-            _complete_openai_google_sign_in(page, url, device_code, credential)
-            _wait_for_codex_auth(child, credential.spec.name, timeout_seconds)
+        _log_progress(agent_name, f"received device code {device_code}; launching browser")
+        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=agent_name) as (browser, context, page):
+            _log_progress(agent_name, "browser ready; completing Google/OpenAI sign-in")
+            _complete_openai_google_sign_in(page, url, device_code, credential, progress_label=agent_name)
+            _log_progress(agent_name, "waiting for Codex auth.json to be created")
+            _wait_for_codex_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+        _log_progress(agent_name, "Codex login complete")
     except Exception:
         if page is not None:
             _write_debug_artifacts(page, credential.spec.name)
@@ -126,16 +146,20 @@ def _ensure_home(agent_name: str) -> None:
 
 
 def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
+    agent_name = credential.spec.name
     page = None
     child = None
     try:
+        _log_progress(agent_name, "preparing Claude login state")
         ensure_claude_home(credential.spec.name)
         if _claude_logged_in(credential.spec.name):
+            _log_progress(agent_name, "already logged in; skipping")
             return
 
         env = suppress_node_warnings(os.environ.copy())
         env.pop("ANTHROPIC_API_KEY", None)
         env["HOME"] = str(claude_home(credential.spec.name))
+        _log_progress(agent_name, f"starting `claude auth login --email {credential.spec.account_email}`")
         child = pexpect.spawn(
             "claude",
             ["auth", "login", "--email", credential.spec.account_email],
@@ -145,12 +169,18 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
         )
         output = _collect_child_output(child, seconds=5)
         manual_url = _extract_claude_login_url(output)
-        auth_url = _wait_for_claude_local_callback_url(child.pid, manual_url, timeout_seconds=10) or manual_url
-        with _isolated_chrome(playwright, credential_source_agent(credential.spec.name), headed=headed) as (browser, context, page):
-            callback_code = _complete_claude_google_sign_in(page, auth_url, credential)
+        _log_progress(agent_name, "waiting for Claude local callback URL")
+        auth_url = _wait_for_claude_local_callback_url(child.pid, manual_url, timeout_seconds=10, progress_label=agent_name) or manual_url
+        _log_progress(agent_name, "launching browser for Claude/Google sign-in")
+        with _isolated_chrome(playwright, credential_source_agent(credential.spec.name), headed=headed, progress_label=agent_name) as (browser, context, page):
+            _log_progress(agent_name, "browser ready; completing Claude/Google sign-in")
+            callback_code = _complete_claude_google_sign_in(page, auth_url, credential, progress_label=agent_name)
             if callback_code:
+                _log_progress(agent_name, "received Claude callback code; sending it back to the CLI")
                 child.sendline(callback_code)
-            _wait_for_claude_auth(child, credential.spec.name, timeout_seconds)
+            _log_progress(agent_name, "waiting for Claude auth status to become logged in")
+            _wait_for_claude_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+        _log_progress(agent_name, "Claude login complete")
     except Exception:
         if page is not None:
             _write_debug_artifacts(page, credential.spec.name)
@@ -190,12 +220,21 @@ def _collect_child_output(child: pexpect.spawn, seconds: int) -> str:
     return "".join(chunks)
 
 
-def _wait_for_claude_local_callback_url(child_pid: int, manual_url: str, timeout_seconds: int) -> str | None:
+def _wait_for_claude_local_callback_url(
+    child_pid: int,
+    manual_url: str,
+    timeout_seconds: int,
+    *,
+    progress_label: str | None = None,
+) -> str | None:
     deadline = time.time() + max(1, timeout_seconds)
+    last_progress = 0.0
     while time.time() < deadline:
         port = _claude_listen_port(child_pid)
         if port is not None:
             return _build_claude_local_callback_url(manual_url, port)
+        if progress_label is not None:
+            last_progress = _periodic_progress(progress_label, last_progress, "still waiting for Claude local callback server")
         time.sleep(0.25)
     return None
 
@@ -234,17 +273,30 @@ def _build_claude_local_callback_url(manual_url: str, port: int) -> str:
     return urlunparse(parsed._replace(query=urlencode(updated)))
 
 
-def _complete_openai_google_sign_in(page: object, url: str, device_code: str, credential: AgentCredentials) -> None:
+def _complete_openai_google_sign_in(
+    page: object,
+    url: str,
+    device_code: str,
+    credential: AgentCredentials,
+    *,
+    progress_label: str | None = None,
+) -> None:
     page.goto(url, wait_until="domcontentloaded")
     _normalize_openai_login_entry(page)
     flow_page = page
     if _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=5000):
         flow_page = _click_google_and_capture_page(page)
 
-    _advance_auth_flow(flow_page, credential, device_code)
+    _advance_auth_flow(flow_page, credential, device_code, progress_label=progress_label)
 
 
-def _complete_claude_google_sign_in(page: object, url: str, credential: AgentCredentials) -> str | None:
+def _complete_claude_google_sign_in(
+    page: object,
+    url: str,
+    credential: AgentCredentials,
+    *,
+    progress_label: str | None = None,
+) -> str | None:
     page.goto(url, wait_until="domcontentloaded")
     flow_page = _preferred_claude_auth_page(page)
     if _has_visible(flow_page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=5000):
@@ -255,10 +307,17 @@ def _complete_claude_google_sign_in(page: object, url: str, credential: AgentCre
             pass
 
     deadline = time.time() + 180
+    last_progress = 0.0
     while time.time() < deadline:
         flow_page = _preferred_claude_auth_page(flow_page)
         body = _body_text(flow_page)
         title = _page_title(flow_page)
+        if progress_label is not None:
+            last_progress = _periodic_progress(
+                progress_label,
+                last_progress,
+                f"waiting for Claude/Google auth flow at {flow_page.url}",
+            )
 
         if _claude_logged_in(credential.spec.name):
             return None
@@ -447,11 +506,24 @@ def _normalize_openai_login_entry(page: object) -> None:
         _wait_for_live_login_surface(page, timeout_seconds=30)
 
 
-def _advance_auth_flow(page: object, credential: AgentCredentials, device_code: str) -> None:
+def _advance_auth_flow(
+    page: object,
+    credential: AgentCredentials,
+    device_code: str,
+    *,
+    progress_label: str | None = None,
+) -> None:
     deadline = time.time() + 180
+    last_progress = 0.0
     while time.time() < deadline:
         body = _body_text(page)
         title = _page_title(page)
+        if progress_label is not None:
+            last_progress = _periodic_progress(
+                progress_label,
+                last_progress,
+                f"waiting for OpenAI/Google auth flow at {page.url}",
+            )
 
         if not body and not title:
             time.sleep(0.5)
@@ -646,7 +718,7 @@ def _continue_enabled(page: object) -> bool:
 
 
 @contextmanager
-def _isolated_chrome(playwright: object, agent_name: str, headed: bool):
+def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress_label: str | None = None):
     chrome_binary = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
     if chrome_binary is None:
         raise RuntimeError("google-chrome is not installed")
@@ -684,7 +756,9 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool):
     )
 
     try:
-        endpoint = _wait_for_cdp_endpoint(port, timeout_seconds=30)
+        if progress_label is not None:
+            _log_progress(progress_label, f"waiting for Chrome DevTools endpoint on port {port}")
+        endpoint = _wait_for_cdp_endpoint(port, timeout_seconds=30, progress_label=progress_label)
         browser = playwright.chromium.connect_over_cdp(endpoint)
         context = browser.contexts[0]
         page = context.new_page()
@@ -768,13 +842,14 @@ def _terminate_pids(pids: list[int], sig: signal.Signals, timeout_seconds: float
             time.sleep(0.2)
 
 
-def _wait_for_cdp_endpoint(port: int, timeout_seconds: int) -> str:
+def _wait_for_cdp_endpoint(port: int, timeout_seconds: int, progress_label: str | None = None) -> str:
     import json
     import urllib.request
 
     deadline = time.time() + timeout_seconds
     url = f"http://127.0.0.1:{port}/json/version"
     last_error = None
+    last_progress = 0.0
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=2) as response:
@@ -784,6 +859,12 @@ def _wait_for_cdp_endpoint(port: int, timeout_seconds: int) -> str:
                 return f"http://127.0.0.1:{port}"
         except Exception as exc:
             last_error = exc
+            if progress_label is not None:
+                last_progress = _periodic_progress(
+                    progress_label,
+                    last_progress,
+                    f"still waiting for Chrome DevTools endpoint on port {port}",
+                )
         time.sleep(0.5)
     raise RuntimeError(f"timed out waiting for Chrome DevTools endpoint on port {port}: {last_error}")
 
@@ -820,8 +901,15 @@ def _wait_for_live_login_surface(page: object, timeout_seconds: int) -> None:
     raise RuntimeError(f"timed out waiting for auth challenge to clear at {getattr(page, 'url', '<unknown>')}")
 
 
-def _wait_for_codex_auth(child: pexpect.spawn, agent_name: str, timeout_seconds: int) -> None:
+def _wait_for_codex_auth(
+    child: pexpect.spawn,
+    agent_name: str,
+    timeout_seconds: int,
+    *,
+    progress_label: str | None = None,
+) -> None:
     deadline = time.time() + timeout_seconds
+    last_progress = 0.0
     while time.time() < deadline:
         if auth_path(agent_name).exists():
             child.terminate(force=True)
@@ -830,13 +918,22 @@ def _wait_for_codex_auth(child: pexpect.spawn, agent_name: str, timeout_seconds:
             if auth_path(agent_name).exists():
                 return
             raise RuntimeError(f"codex login exited before auth.json was created for {agent_name}")
+        if progress_label is not None:
+            last_progress = _periodic_progress(progress_label, last_progress, "still waiting for Codex auth.json")
         time.sleep(1)
     child.terminate(force=True)
     raise RuntimeError(f"timed out waiting for codex login to finish for {agent_name}")
 
 
-def _wait_for_claude_auth(child: pexpect.spawn, agent_name: str, timeout_seconds: int) -> None:
+def _wait_for_claude_auth(
+    child: pexpect.spawn,
+    agent_name: str,
+    timeout_seconds: int,
+    *,
+    progress_label: str | None = None,
+) -> None:
     deadline = time.time() + timeout_seconds
+    last_progress = 0.0
     while time.time() < deadline:
         if _claude_logged_in(agent_name):
             child.terminate(force=True)
@@ -845,6 +942,8 @@ def _wait_for_claude_auth(child: pexpect.spawn, agent_name: str, timeout_seconds
             if _claude_logged_in(agent_name):
                 return
             raise RuntimeError(f"claude auth login exited before auth completed for {agent_name}")
+        if progress_label is not None:
+            last_progress = _periodic_progress(progress_label, last_progress, "still waiting for Claude auth status")
         time.sleep(1)
     child.terminate(force=True)
     raise RuntimeError(f"timed out waiting for Claude auth to finish for {agent_name}")
