@@ -455,20 +455,28 @@ def drive_google_auth_with_model(
                 logger(f"auth model transitioned out of Google auth after step {step - 1}")
             return True
 
-        decision = request_auth_model_decision(
-            settings,
-            flow_label=flow_label,
-            snapshot=snapshot,
-            history=history,
-            carry_forward=carry_forward,
-            logger=logger,
-        )
-        action = decision.action
-        carry_forward = list(decision.carry_forward[:6])
-        if logger is not None:
-            logger(f"auth model step {step}: {summarize_action(action)}")
-            if carry_forward:
-                logger(f"auth model carry-forward: {json.dumps(carry_forward, ensure_ascii=True)}")
+        shortcut_action = _shortcut_auth_action(snapshot, device_code=device_code)
+        if shortcut_action is not None:
+            action = shortcut_action
+            carry_forward = []
+            if logger is not None:
+                logger(f"auth model shortcut: {summarize_action(action)}")
+                logger(f"auth model step {step}: {summarize_action(action)}")
+        else:
+            decision = request_auth_model_decision(
+                settings,
+                flow_label=flow_label,
+                snapshot=snapshot,
+                history=history,
+                carry_forward=carry_forward,
+                logger=logger,
+            )
+            action = decision.action
+            carry_forward = list(decision.carry_forward[:6])
+            if logger is not None:
+                logger(f"auth model step {step}: {summarize_action(action)}")
+                if carry_forward:
+                    logger(f"auth model carry-forward: {json.dumps(carry_forward, ensure_ascii=True)}")
 
         if action.action == "done":
             return True
@@ -579,14 +587,38 @@ def _capture_snapshot_with_recovery(
     try:
         return page, capture_auth_snapshot(page)
     except Exception as exc:
+        wait_fn = getattr(page, "wait_for_timeout", None)
+        last_exc = exc
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            if callable(wait_fn):
+                try:
+                    wait_fn(250)
+                except Exception:
+                    time.sleep(0.25)
+            else:
+                time.sleep(0.25)
+            try:
+                return page, capture_auth_snapshot(page)
+            except Exception as retry_exc:
+                last_exc = retry_exc
+            recovered = _recover_alternate_auth_page(page)
+            if recovered is not None:
+                recovered_page, snapshot = recovered
+                if logger is not None:
+                    logger(
+                        "auth model switched to a replacement auth page "
+                        f"{summarize_snapshot(snapshot)} after {recovery_label} ({last_exc})"
+                    )
+                return recovered_page, snapshot
         recovered = _recover_alternate_auth_page(page)
         if recovered is None:
-            raise exc
+            raise last_exc
         recovered_page, snapshot = recovered
         if logger is not None:
             logger(
                 "auth model switched to a replacement auth page "
-                f"{summarize_snapshot(snapshot)} after {recovery_label} ({exc})"
+                f"{summarize_snapshot(snapshot)} after {recovery_label} ({last_exc})"
             )
         return recovered_page, snapshot
 
@@ -612,9 +644,17 @@ def _recover_alternate_auth_page(page: object) -> tuple[object, dict[str, object
             continue
         if snapshot_requires_model(snapshot):
             return candidate, snapshot
-        if fallback is None:
+        if fallback is None and not _is_blank_snapshot(snapshot):
             fallback = (candidate, snapshot)
     return fallback
+
+
+def _is_blank_snapshot(snapshot: dict[str, object]) -> bool:
+    url = str(snapshot.get("url") or "").strip().lower()
+    body = str(snapshot.get("body_text") or "").strip()
+    elements = snapshot.get("elements")
+    has_elements = isinstance(elements, list) and any(isinstance(element, dict) for element in elements)
+    return url in {"", "about:blank"} and not body and not has_elements
 
 
 def _wait_for_auth_surface_exit(
@@ -1188,6 +1228,110 @@ def _is_device_code_surface(snapshot: dict[str, object]) -> bool:
     if "device code" in title and "codex" in body:
         return True
     return False
+
+
+def _shortcut_auth_action(snapshot: dict[str, object], *, device_code: str) -> AuthModelAction | None:
+    recovery_action = _openai_recovery_action(snapshot)
+    if recovery_action is not None:
+        return recovery_action
+
+    if not device_code or not _is_device_code_surface(snapshot):
+        return None
+    inputs = _device_code_input_elements(snapshot)
+    if not inputs:
+        return None
+
+    if not all(bool(element.get("filled")) for element in inputs):
+        target = str(inputs[0].get("id") or "").strip()
+        if not target:
+            return None
+        return AuthModelAction(
+            action="fill",
+            target=target,
+            value_key="device_code",
+            message="filling the Codex device code directly",
+        )
+
+    submit_target = _device_code_submit_target(snapshot)
+    if submit_target:
+        return AuthModelAction(
+            action="click",
+            target=submit_target,
+            message="submitting the filled Codex device code directly",
+        )
+
+    return AuthModelAction(
+        action="wait",
+        seconds=0.5,
+        message="waiting for the Codex device code form to enable Continue",
+    )
+
+
+def _device_code_submit_target(snapshot: dict[str, object]) -> str:
+    raw_elements = snapshot.get("elements")
+    if not isinstance(raw_elements, list):
+        return ""
+    for element in raw_elements:
+        if not isinstance(element, dict):
+            continue
+        if bool(element.get("disabled")):
+            continue
+        tag = str(element.get("tag") or "").lower()
+        if tag != "button":
+            continue
+        text = " ".join(str(element.get("text") or "").split()).lower()
+        if any(label in text for label in ("continue", "submit", "authorize")):
+            target = str(element.get("id") or "").strip()
+            if target:
+                return target
+    return ""
+
+
+def _openai_recovery_action(snapshot: dict[str, object]) -> AuthModelAction | None:
+    url = str(snapshot.get("url") or "")
+    title = str(snapshot.get("title") or "")
+    body = str(snapshot.get("body_text") or "")
+    if "auth.openai.com" not in url:
+        return None
+
+    if "Your session has ended" in title or "Your session has ended" in body:
+        target = _find_enabled_element_by_text(snapshot, "log in")
+        if target:
+            return AuthModelAction(
+                action="click",
+                target=target,
+                message="restarting the OpenAI sign-in flow directly",
+            )
+
+    if "Oops, an error occurred!" in title or "Oops, an error occurred!" in body:
+        target = _find_enabled_element_by_text(snapshot, "try again")
+        if target:
+            return AuthModelAction(
+                action="click",
+                target=target,
+                message="retrying the OpenAI sign-in flow directly",
+            )
+
+    return None
+
+
+def _find_enabled_element_by_text(snapshot: dict[str, object], text_fragment: str) -> str:
+    raw_elements = snapshot.get("elements")
+    if not isinstance(raw_elements, list):
+        return ""
+    needle = " ".join(text_fragment.split()).lower()
+    for element in raw_elements:
+        if not isinstance(element, dict):
+            continue
+        if bool(element.get("disabled")):
+            continue
+        target = str(element.get("id") or "").strip()
+        if not target:
+            continue
+        text = " ".join(str(element.get("text") or "").split()).lower()
+        if needle and needle in text:
+            return target
+    return ""
 
 
 def _auth_system_prompt(*, flow_label: str, snapshot: dict[str, object]) -> str:

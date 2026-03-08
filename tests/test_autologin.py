@@ -20,6 +20,7 @@ from multishell.autologin import (
     _normalize_openai_login_entry,
     _build_chrome_command,
     _build_claude_local_callback_url,
+    _wait_for_codex_auth,
     _click_first,
     _click_google_and_capture_page,
     _enrich_login_error,
@@ -704,6 +705,32 @@ def test_start_codex_device_auth_surfaces_final_rate_limit(monkeypatch) -> None:
 
     with pytest.raises(RetryableLoginError, match="codex device-auth hit OpenAI rate limits after 2 attempts"):
         _start_codex_device_auth("worker-4", {"HOME": "/tmp/home"}, max_attempts=2)
+
+
+def test_wait_for_codex_auth_accepts_codex_status_without_auth_json(monkeypatch, tmp_path) -> None:
+    child = _FakeCodexChild("")
+
+    monkeypatch.setattr("multishell.autologin.auth_path", lambda _name: tmp_path / "missing-auth.json")
+    monkeypatch.setattr("multishell.autologin._codex_logged_in", lambda _name: True)
+
+    _wait_for_codex_auth(child, "worker-1", timeout_seconds=30)
+
+    assert child.terminated is True
+
+
+def test_wait_for_codex_auth_includes_child_output_tail_on_timeout(monkeypatch, tmp_path) -> None:
+    child = _FakeCodexChild("Authentication complete, finalizing login")
+    times = iter([0.0, 0.0, 2.0, 2.0])
+
+    monkeypatch.setattr("multishell.autologin.auth_path", lambda _name: tmp_path / "missing-auth.json")
+    monkeypatch.setattr("multishell.autologin._codex_logged_in", lambda _name: False)
+    monkeypatch.setattr("multishell.autologin.time.time", lambda: next(times))
+    monkeypatch.setattr("multishell.autologin.time.sleep", lambda _seconds: None)
+
+    with pytest.raises(RetryableLoginError, match="codex output tail: Authentication complete, finalizing login"):
+        _wait_for_codex_auth(child, "worker-1", timeout_seconds=1)
+
+    assert child.terminated is True
 
 
 

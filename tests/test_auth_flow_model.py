@@ -643,10 +643,9 @@ def test_drive_google_auth_with_model_recovers_to_replacement_page(monkeypatch) 
     assert any("switched to a replacement auth page" in line for line in logs)
 
 
-def test_drive_google_auth_with_model_relays_model_carry_forward_between_steps(monkeypatch) -> None:
+def test_drive_google_auth_with_model_shortcuts_codex_device_code_surface(monkeypatch) -> None:
     logs: list[str] = []
     actions: list[AuthModelAction] = []
-    memories_seen: list[list[str]] = []
     snapshots = iter(
         [
             {
@@ -699,20 +698,10 @@ def test_drive_google_auth_with_model_relays_model_carry_forward_between_steps(m
     )
 
     monkeypatch.setattr("multishell.auth_flow_model.capture_auth_snapshot", lambda _page: next(snapshots))
-
-    def fake_request(_settings, *, carry_forward, **_kwargs):
-        memories_seen.append(list(carry_forward))
-        if not carry_forward:
-            return AuthModelDecision(
-                action=AuthModelAction(action="fill", target="ms-auth-code-1", value_key="device_code", message="fill code"),
-                carry_forward=("device code already entered; click Continue if it becomes enabled",),
-            )
-        return AuthModelDecision(
-            action=AuthModelAction(action="click", target="ms-auth-continue", message="submit code"),
-            carry_forward=("waiting for OpenAI redirect after device code submit",),
-        )
-
-    monkeypatch.setattr("multishell.auth_flow_model.request_auth_model_decision", fake_request)
+    monkeypatch.setattr(
+        "multishell.auth_flow_model.request_auth_model_decision",
+        lambda *_args, **_kwargs: pytest.fail("device-code shortcut should not invoke the auth model"),
+    )
     monkeypatch.setattr(
         "multishell.auth_flow_model._apply_auth_action",
         lambda _page, action, **_kwargs: actions.append(action),
@@ -730,8 +719,61 @@ def test_drive_google_auth_with_model_relays_model_carry_forward_between_steps(m
     assert [action.action for action in actions] == ["fill", "click"]
     assert actions[0].value_key == "device_code"
     assert actions[1].target == "ms-auth-continue"
-    assert memories_seen == [[], ["device code already entered; click Continue if it becomes enabled"]]
-    assert any("auth model carry-forward:" in line for line in logs)
+    assert any("auth model shortcut:" in line for line in logs)
+
+
+def test_drive_google_auth_with_model_shortcuts_openai_session_restart(monkeypatch) -> None:
+    logs: list[str] = []
+    actions: list[AuthModelAction] = []
+    snapshots = iter(
+        [
+            {
+                "url": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "title": "Your session has ended - OpenAI",
+                "body_text": "Your session has ended Continue by logging in.",
+                "elements": [
+                    {"id": "ms-auth-log-in", "tag": "a", "text": "Log in", "disabled": False},
+                ],
+            },
+            {
+                "url": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                "title": "Your session has ended - OpenAI",
+                "body_text": "Your session has ended Continue by logging in.",
+                "elements": [
+                    {"id": "ms-auth-log-in", "tag": "a", "text": "Log in", "disabled": False},
+                ],
+            },
+            {
+                "url": "https://accounts.google.com/v3/signin/identifier",
+                "title": "Sign in - Google Accounts",
+                "body_text": "Sign in with Google",
+                "elements": [],
+            },
+        ]
+    )
+
+    monkeypatch.setattr("multishell.auth_flow_model.capture_auth_snapshot", lambda _page: next(snapshots))
+    monkeypatch.setattr(
+        "multishell.auth_flow_model.request_auth_model_decision",
+        lambda *_args, **_kwargs: pytest.fail("OpenAI recovery shortcut should not invoke the auth model"),
+    )
+    monkeypatch.setattr(
+        "multishell.auth_flow_model._apply_auth_action",
+        lambda _page, action, **_kwargs: actions.append(action),
+    )
+    monkeypatch.setattr("multishell.auth_flow_model._wait_for_surface_change", lambda *_args, **_kwargs: None)
+
+    assert drive_google_auth_with_model(
+        object(),
+        flow_label="codex/google",
+        account_email="worker@example.com",
+        password="secret",
+        device_code="ABCD-EFGHI",
+        logger=logs.append,
+    ) is True
+    assert [action.action for action in actions] == ["click"]
+    assert actions[0].target == "ms-auth-log-in"
+    assert any("auth model shortcut:" in line for line in logs)
 
 
 def test_apply_auth_action_uses_visible_device_code_helper(monkeypatch) -> None:
