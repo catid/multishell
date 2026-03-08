@@ -688,6 +688,53 @@ class _ClosingChromeContext:
         return False
 
 
+class _SuccessfulChromeContext:
+    def __init__(self, page: _LiveDebugPage) -> None:
+        self.page = page
+
+    def __enter__(self):
+        return None, None, self.page
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+
+def test_login_codex_one_emits_coarse_progress_when_active(monkeypatch, tmp_path) -> None:
+    credential = AgentCredentials(
+        spec=AgentSpec(
+            name="worker-1",
+            account_email="worker@example.com",
+            role="worker",
+            personality="Test worker.",
+            accent_color=2,
+            account_key="account-1",
+        ),
+        password="secret",
+    )
+    logs: list[tuple[str, str]] = []
+    page = _LiveDebugPage()
+
+    monkeypatch.setattr("multishell.autologin.state_root", lambda: tmp_path)
+    monkeypatch.setattr("multishell.autologin._log_progress", lambda agent, message: logs.append((agent, message)))
+    monkeypatch.setattr("multishell.autologin._ensure_home", lambda _name: None)
+    monkeypatch.setattr("multishell.autologin.auth_path", lambda _name: tmp_path / "missing-auth.json")
+    monkeypatch.setattr(
+        "multishell.autologin._start_codex_device_auth",
+        lambda _agent_name, _env: (_FakeCodexChild(), "https://auth.openai.com/codex/device", "K8OE-9GJ2U"),
+    )
+    monkeypatch.setattr(
+        "multishell.autologin._isolated_chrome",
+        lambda *_args, **_kwargs: _SuccessfulChromeContext(page),
+    )
+    monkeypatch.setattr("multishell.autologin._complete_openai_google_sign_in", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr("multishell.autologin._wait_for_codex_auth", lambda *_args, **_kwargs: None)
+
+    _login_codex_one(SimpleNamespace(), credential, timeout_seconds=30, headed=False)
+
+    assert ("worker-1", "running headless browser auth") in logs
+    assert ("worker-1", "Codex login complete") in logs
+
+
 def test_login_codex_one_captures_debug_before_browser_context_closes(monkeypatch, tmp_path) -> None:
     credential = AgentCredentials(
         spec=AgentSpec(

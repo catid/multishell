@@ -116,6 +116,11 @@ def _log_verbose(agent_name: str, message: str) -> None:
         _log_progress(agent_name, message)
 
 
+def _log_coarse_progress(agent_name: str, message: str) -> None:
+    if not _auto_login_verbose():
+        _log_progress(agent_name, message)
+
+
 def _log_stage_once(agent_name: str | None, seen: set[str], stage: str, message: str) -> None:
     if agent_name is None or stage in seen:
         return
@@ -365,6 +370,7 @@ def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_s
         if auth_path(credential.spec.name).exists():
             _log_progress(agent_name, "already logged in; skipping")
             return
+        _log_coarse_progress(agent_name, "running headless browser auth")
 
         env = suppress_node_warnings(os.environ.copy())
         env["HOME"] = str(agent_home(credential.spec.name))
@@ -446,6 +452,7 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
         if _claude_logged_in(credential.spec.name):
             _log_progress(agent_name, "already logged in; skipping")
             return
+        _log_coarse_progress(agent_name, "running headless browser auth")
 
         env = suppress_node_warnings(os.environ.copy())
         env.pop("ANTHROPIC_API_KEY", None)
