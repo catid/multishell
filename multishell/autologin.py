@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import socket
@@ -10,6 +11,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections import deque
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -1091,6 +1093,48 @@ def _browser_product_version(chrome_binary: str) -> str:
     return output
 
 
+class _ProcessOutputTail:
+    def __init__(self, stream: object, *, progress_label: str | None = None) -> None:
+        self._stream = stream
+        self._progress_label = progress_label
+        self._lines: deque[str] = deque(maxlen=40)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        if stream is not None:
+            self._thread = threading.Thread(target=self._drain_stream, name="multishell-browser-log", daemon=True)
+            self._thread.start()
+
+    def _drain_stream(self) -> None:
+        try:
+            while True:
+                raw_line = self._stream.readline()
+                if not raw_line:
+                    break
+                line = _truncate_output(str(raw_line).strip(), limit=400)
+                if not line:
+                    continue
+                with self._lock:
+                    self._lines.append(line)
+                if self._progress_label is not None:
+                    _log_progress(self._progress_label, f"browser output: {line}")
+        except Exception as exc:
+            line = f"<browser output reader error: {exc}>"
+            with self._lock:
+                self._lines.append(line)
+            if self._progress_label is not None:
+                _log_progress(self._progress_label, f"browser output: {line}")
+
+    def tail(self, *, limit: int = 8) -> str:
+        with self._lock:
+            lines = list(self._lines)[-limit:]
+        return " | ".join(lines)
+
+    def join(self, timeout_seconds: float = 1.0) -> None:
+        if self._thread is None:
+            return
+        self._thread.join(timeout=max(0.0, timeout_seconds))
+
+
 @contextmanager
 def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress_label: str | None = None):
     chrome_binary = _resolve_browser_binary(playwright)
@@ -1113,18 +1157,34 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
         env=child_env(os.environ.copy(), role="browser", agent=agent_name),
         start_new_session=True,
     )
+    output_tail = _ProcessOutputTail(process.stdout, progress_label=progress_label)
+    browser = None
 
     try:
         if progress_label is not None:
+            _log_progress(
+                progress_label,
+                f"browser launch: pid={process.pid} port={port} headed={'yes' if headed else 'no'} profile={profile_dir}",
+            )
+            _log_progress(progress_label, f"browser command: {' '.join(shlex.quote(part) for part in command)}")
             _log_progress(progress_label, f"waiting for Chrome DevTools endpoint on port {port}")
-        endpoint = _wait_for_cdp_endpoint(port, timeout_seconds=30, progress_label=progress_label)
+        endpoint = _wait_for_cdp_endpoint(
+            port,
+            timeout_seconds=30,
+            progress_label=progress_label,
+            process=process,
+            output_tail=output_tail,
+        )
+        if progress_label is not None:
+            _log_progress(progress_label, f"Chrome DevTools endpoint ready on port {port}")
         browser = playwright.chromium.connect_over_cdp(endpoint)
         context = browser.contexts[0]
         page = context.new_page()
         yield browser, context, page
     finally:
         try:
-            browser.close()
+            if browser is not None:
+                browser.close()
         except Exception:
             pass
         try:
@@ -1138,6 +1198,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
                 os.killpg(process.pid, signal.SIGKILL)
             except Exception:
                 pass
+        output_tail.join()
 
 
 def _resolve_browser_binary(playwright: object) -> str:
@@ -1221,7 +1282,14 @@ def _terminate_pids(pids: list[int], sig: signal.Signals, timeout_seconds: float
             time.sleep(0.2)
 
 
-def _wait_for_cdp_endpoint(port: int, timeout_seconds: int, progress_label: str | None = None) -> str:
+def _wait_for_cdp_endpoint(
+    port: int,
+    timeout_seconds: int,
+    progress_label: str | None = None,
+    *,
+    process: subprocess.Popen[str] | None = None,
+    output_tail: _ProcessOutputTail | None = None,
+) -> str:
     import json
     import urllib.request
 
@@ -1238,14 +1306,35 @@ def _wait_for_cdp_endpoint(port: int, timeout_seconds: int, progress_label: str 
                 return f"http://127.0.0.1:{port}"
         except Exception as exc:
             last_error = exc
+            if process is not None:
+                return_code = process.poll()
+                if return_code is not None:
+                    detail = f"browser exited before opening DevTools endpoint on port {port} with exit code {return_code}"
+                    tail_text = output_tail.tail() if output_tail is not None else ""
+                    if tail_text:
+                        detail = f"{detail}; browser output tail: {tail_text}"
+                    raise RuntimeError(detail) from exc
             if progress_label is not None:
+                process_state = ""
+                if process is not None:
+                    status = "alive" if process.poll() is None else f"exit_code={process.poll()}"
+                    process_state = f" pid={process.pid} status={status}"
                 last_progress = _periodic_progress(
                     progress_label,
                     last_progress,
-                    f"still waiting for Chrome DevTools endpoint on port {port}",
+                    f"still waiting for Chrome DevTools endpoint on port {port}{process_state}",
                 )
         time.sleep(0.5)
-    raise RuntimeError(f"timed out waiting for Chrome DevTools endpoint on port {port}: {last_error}")
+    detail = f"timed out waiting for Chrome DevTools endpoint on port {port}"
+    if process is not None:
+        status = "alive" if process.poll() is None else f"exit_code={process.poll()}"
+        detail = f"{detail} pid={process.pid} status={status}"
+    if last_error is not None:
+        detail = f"{detail}: {last_error}"
+    tail_text = output_tail.tail() if output_tail is not None else ""
+    if tail_text:
+        detail = f"{detail}; browser output tail: {tail_text}"
+    raise RuntimeError(detail)
 
 
 def _reserve_port() -> int:

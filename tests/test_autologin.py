@@ -1,5 +1,6 @@
 import threading
 import time
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -27,6 +28,7 @@ from multishell.autologin import (
     _login_codex_one,
     _resolve_browser_binary,
     _start_codex_device_auth,
+    _wait_for_cdp_endpoint,
 )
 from multishell.config import AgentSpec
 
@@ -726,6 +728,35 @@ def test_resolve_browser_binary_uses_override_when_configured(monkeypatch, tmp_p
     monkeypatch.setenv("MULTISHELL_BROWSER_BINARY", str(override))
 
     assert _resolve_browser_binary(playwright) == str(override)
+
+
+class _ExitedBrowserProcess:
+    pid = 43210
+
+    def poll(self) -> int:
+        return 127
+
+
+class _OutputTailStub:
+    def tail(self, *, limit: int = 8) -> str:
+        return "chrome: error while loading shared libraries: libgtk-3.so.0"
+
+
+def test_wait_for_cdp_endpoint_reports_browser_exit_details(monkeypatch) -> None:
+    def fake_urlopen(url: str, timeout: int):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    with pytest.raises(RuntimeError, match="browser exited before opening DevTools endpoint on port 9222 with exit code 127") as excinfo:
+        _wait_for_cdp_endpoint(
+            9222,
+            timeout_seconds=30,
+            progress_label="worker-1",
+            process=_ExitedBrowserProcess(),
+            output_tail=_OutputTailStub(),
+        )
+    assert "libgtk-3.so.0" in str(excinfo.value)
 
 
 def test_advance_auth_flow_prefers_model_controller(monkeypatch) -> None:
