@@ -211,6 +211,10 @@ def run_auto_login(
     try:
         def run_one(credential: AgentCredentials) -> None:
             for attempt in range(1, LOGIN_ERROR_RETRY_ATTEMPTS + 1):
+                _log_progress(
+                    credential.spec.name,
+                    f"starting login round {attempt}/{LOGIN_ERROR_RETRY_ATTEMPTS}",
+                )
                 try:
                     with sync_playwright() as playwright:
                         if credential.spec.role == "claude-worker":

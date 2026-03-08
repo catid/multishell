@@ -173,6 +173,7 @@ def test_run_auto_login_emits_progress_lines(monkeypatch, capsys) -> None:
 
     out = capsys.readouterr().out
     assert "auto-login 1/1: worker-1 (codex, worker@example.com)" in out
+    assert "[worker-1] starting login round 1/10" in out
 
 
 def test_run_auto_login_defaults_to_terse_mode(monkeypatch) -> None:
@@ -313,6 +314,9 @@ def test_run_auto_login_retries_retryable_failures(monkeypatch, capsys) -> None:
     assert attempts["count"] == 3
     assert sleeps == [15, 15]
     assert resets == ["worker-1", "worker-1"]
+    assert "[worker-1] starting login round 1/3" in out
+    assert "[worker-1] starting login round 2/3" in out
+    assert "[worker-1] starting login round 3/3" in out
     assert "retryable login error; retrying in 15s (attempt 2/3): temporary browser error" in out
     assert "retryable login error; retrying in 15s (attempt 3/3): temporary browser error" in out
     assert "[worker-1] login failed [error]: temporary browser error" in out
