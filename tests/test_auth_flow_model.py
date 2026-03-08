@@ -134,6 +134,10 @@ def test_request_auth_model_decision_compacts_snapshot_payload(monkeypatch) -> N
             "url": "https://accounts.google.com/v3/signin/identifier?foo=bar&baz=qux",
             "title": "Sign in",
             "body_text": "x" * 5000,
+            "headings": ["Sign in"],
+            "labels": ["Email"],
+            "alerts": [],
+            "supporting": ["Use your Google Account"],
             "elements": [
                 {
                     "id": "ms-auth-email",
@@ -160,23 +164,27 @@ def test_request_auth_model_decision_compacts_snapshot_payload(monkeypatch) -> N
     messages = captured["payload"]["messages"]
     user_message = json.loads(messages[1]["content"])
     assert user_message["snapshot"]["url"] == "https://accounts.google.com/v3/signin/identifier"
-    assert len(user_message["snapshot"]["body_text"]) == 900
+    assert user_message["snapshot"]["digest"] == {
+        "headings": ["Sign in"],
+        "alerts": [],
+        "labels": ["Email"],
+        "supporting": ["Use your Google Account"],
+    }
     assert len(user_message["snapshot"]["elements"]) == 20
     assert user_message["snapshot"]["elements"][0]["htmlId"] == "identifierId"
     assert user_message["snapshot"]["elements"][0]["inputMode"] == "email"
     assert user_message["snapshot"]["elements"][0]["maxLength"] == "120"
-    assert user_message["snapshot"]["elements"][0]["valueLength"] == 0
-    assert user_message["snapshot"]["elements"][0]["selected"] is False
-    assert user_message["history"] == [
-        {"page": "older-2", "action": "click"},
-        {"page": "older-3", "action": "wait"},
-    ]
-    assert user_message["carry_forward"] == ["remember device_code for later", "workspace not chosen yet"]
-    assert user_message["surface_summary"]["interactive_count"] == 30
-    assert user_message["surface_summary"]["enabled_count"] == 30
-    assert user_message["surface_summary"]["input_count"] == 30
-    assert user_message["surface_summary"]["short_input_count"] == 0
-    assert user_message["surface_summary"]["all_short_inputs_filled"] is False
+    assert "valueLength" not in user_message["snapshot"]["elements"][0]
+    assert "selected" not in user_message["snapshot"]["elements"][0]
+    assert user_message["last"] == "action=wait"
+    assert user_message["memory"] == ["remember device_code for later", "workspace not chosen yet"]
+    assert user_message["surface"]["interactive_count"] == 30
+    assert user_message["surface"]["enabled_count"] == 30
+    assert user_message["surface"]["input_count"] == 30
+    assert user_message["surface"]["short_input_count"] == 0
+    assert user_message["surface"]["all_short_inputs_filled"] is False
+    assert user_message["keys"] == ["account_email", "password", "device_code"]
+    assert user_message["reply"].startswith("JSON only:")
 
 
 def test_request_auth_model_decision_logs_snapshot_and_raw_output(monkeypatch) -> None:
@@ -273,14 +281,14 @@ def test_request_auth_model_decision_includes_step_scoped_guidance(monkeypatch) 
     messages = captured["payload"]["messages"]
     system_message = messages[0]["content"]
     user_message = json.loads(messages[1]["content"])
-    assert "You start from a fresh context every step" in system_message
+    assert "Fresh context every step" in system_message
     assert "segmented token entry" in system_message
-    assert "appropriate value_key" in system_message
-    assert "Do not treat opaque query parameters" in system_message
-    assert "Only the strings you put into carry_forward survive to the next request" in user_message["carry_forward_contract"]["description"]
-    assert user_message["carry_forward"] == ["If the code form appears, use value_key=device_code on the first visible code input."]
-    assert user_message["surface_summary"]["short_input_count"] == 2
-    assert user_message["surface_summary"]["all_short_inputs_filled"] is False
+    assert "device_code handle" in system_message
+    assert "URL tokens or callback codes" in system_message
+    assert user_message["memory"] == ["If the code form appears, use value_key=device_code on the first visible code input."]
+    assert user_message["last"] == ""
+    assert user_message["surface"]["short_input_count"] == 2
+    assert user_message["surface"]["all_short_inputs_filled"] is False
 
 
 def test_strip_thinking_markup_removes_think_blocks() -> None:

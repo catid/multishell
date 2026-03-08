@@ -24,7 +24,7 @@ The installer:
 - launches `multishell login` so you can add Google accounts in a curses TUI, mask/edit passwords, and toggle OpenAI, Anthropic, and Gemini AI Ultra access per account
 - runs `multishell install-browser --with-deps` on Ubuntu, otherwise `multishell install-browser`
 - runs `multishell install-auth-model`
-- runs `multishell auto-login --all` in headless mode
+- runs `multishell auto-login --all` in headless mode using a local Qwen 3.5 auth model to drive the Google sign-in flow
 
 ## Run
 
@@ -55,7 +55,7 @@ The login TUI starts with an empty account list. Add as many Google accounts as 
 
 `multishell auto-login` now uses a headless Playwright-managed Chromium by default, even on machines with `DISPLAY` set. Pass `--headed` only when you explicitly want visible browser windows for debugging.
 
-`multishell auto-login` now manages the local auth-model server for you. If the local model runtime is installed, it starts the `llama.cpp` server on demand, uses a text-only auth controller first for the brittle Google sign-in steps, then falls back to the older selector flow if the model returns unusable actions.
+`multishell auto-login` manages the local auth-model server for you. If the local model runtime is installed, it starts `llama.cpp` on demand and uses a locally hosted Qwen 3.5 model to read the live auth page text, decide the next browser action, and automatically log into the configured Google accounts in headless Chromium.
 
 If Google returns a hard error like wrong password, account not found, browser not secure, or a manual verification challenge, `multishell` now fails that lane immediately with a specific message instead of sitting on the page until timeout.
 

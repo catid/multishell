@@ -165,6 +165,23 @@ _MODEL_SNAPSHOT_JS = r"""
 
   const attr = (element, name) => (element.getAttribute(name) || '').trim().slice(0, 160);
 
+  const collectTexts = (selectors, limit) => {
+    const values = [];
+    const seen = new Set();
+    const nodes = Array.from(document.querySelectorAll(selectors.join(',')));
+    for (const node of nodes) {
+      if (!visible(node)) continue;
+      const text = textOf(node);
+      if (!text) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      values.push(text);
+      if (values.length >= limit) break;
+    }
+    return values;
+  };
+
   const slugify = (value) => {
     const slug = String(value || '')
       .toLowerCase()
@@ -259,6 +276,10 @@ _MODEL_SNAPSHOT_JS = r"""
     url: window.location.href,
     title,
     body_text: bodyText,
+    headings: collectTexts(['h1', 'h2', 'h3', 'h4', '[role="heading"]'], 4),
+    labels: collectTexts(['label', 'legend'], 6),
+    alerts: collectTexts(['[role="alert"]', '[aria-live="assertive"]', '[aria-live="polite"]'], 4),
+    supporting: collectTexts(['p', '[role="note"]', '[role="status"]'], 6),
     elements,
   };
 }
@@ -754,44 +775,12 @@ def _auth_messages(
     system = _auth_system_prompt(flow_label=flow_label, snapshot=snapshot)
     user_payload = {
         "flow": flow_label,
-        "allowed_value_keys": ["account_email", "password", "device_code"],
-        "carry_forward_contract": {
-            "description": (
-                "You start fresh on every step. Only the strings you put into carry_forward survive to the next request. "
-                "Use carry_forward for short non-secret working notes, references to secret handles, or page-derived facts "
-                "that future steps should remember."
-            ),
-            "rules": [
-                "Do not include chain-of-thought.",
-                "Do not copy literal passwords or other literal secrets.",
-                "Do use handles like account_email, password, and device_code when you want future steps to use those values.",
-                "Keep each note under 160 characters and keep at most 6 notes total.",
-                "If you want the next step to remember a device code or a pending action, write that into carry_forward explicitly.",
-            ],
-            "examples": [
-                "A segmented token entry is visible; use the right value_key on the first box, then preserve whether the token entry is complete.",
-                "A choice already appears selected; reuse that state and advance only when needed.",
-                "A click did not materially change the page, so choose a different action on the next step.",
-                "A callback page has no controls and mostly script/bootstrap text; wait for the next visible auth surface instead of returning done.",
-                "surface_summary says all_short_inputs_filled=true, so advance instead of filling again even if older carry_forward says more input is needed.",
-                "Do not copy opaque query parameters or OAuth callback codes into carry_forward as the terminal device code; use the device_code handle instead.",
-            ],
-        },
-        "carry_forward": carry_forward[-6:],
-        "history": history[-2:],
+        "keys": ["account_email", "password", "device_code"],
+        "memory": carry_forward[-6:],
+        "last": _compact_last_step(history),
         "snapshot": model_snapshot,
-        "surface_summary": _surface_summary(snapshot),
-        "response_schema": {
-            "action": "click|fill|press|wait|done|fail",
-            "target": "element id for click/fill, else empty string",
-            "value_key": "account_email|password|device_code|''",
-            "text": "only for non-secret literal text when necessary, else empty string",
-            "key": "keyboard key such as Enter, else empty string",
-            "seconds": "wait duration for wait, else 0 or omitted",
-            "message": "short status or failure reason",
-            "failure_kind": "for fail only: no_auth|error|''",
-            "carry_forward": ["full replacement list of short notes for the next step"],
-        },
+        "surface": _surface_summary(snapshot),
+        "reply": "JSON only: action,target,value_key,text,key,seconds,message,failure_kind,carry_forward",
     }
     return [
         {"role": "system", "content": system},
@@ -806,34 +795,101 @@ def _compact_snapshot_for_model(snapshot: dict[str, object]) -> dict[str, object
         for element in raw_elements[:20]:
             if not isinstance(element, dict):
                 continue
-            compact_elements.append(
-                {
-                    "id": str(element.get("id") or "")[:64],
-                    "tag": str(element.get("tag") or "")[:16],
-                    "htmlId": str(element.get("htmlId") or "")[:48],
-                    "type": str(element.get("type") or "")[:24],
-                    "role": str(element.get("role") or "")[:24],
-                    "name": str(element.get("name") or "")[:40],
-                    "autocomplete": str(element.get("autocomplete") or "")[:40],
-                    "inputMode": str(element.get("inputMode") or "")[:24],
-                    "maxLength": str(element.get("maxLength") or "")[:12],
-                    "placeholder": str(element.get("placeholder") or "")[:80],
-                    "ariaLabel": str(element.get("ariaLabel") or "")[:80],
-                    "text": str(element.get("text") or "")[:80],
-                    "filled": bool(element.get("filled")),
-                    "valueLength": int(element.get("valueLength") or 0),
-                    "checked": bool(element.get("checked")),
-                    "selected": bool(element.get("selected")),
-                    "focused": bool(element.get("focused")),
-                    "disabled": bool(element.get("disabled")),
-                }
-            )
+            compact = {
+                "id": str(element.get("id") or "")[:64],
+                "tag": str(element.get("tag") or "")[:16],
+            }
+            for src, dst, limit in (
+                ("htmlId", "htmlId", 48),
+                ("type", "type", 24),
+                ("role", "role", 24),
+                ("name", "name", 40),
+                ("autocomplete", "autocomplete", 40),
+                ("inputMode", "inputMode", 24),
+                ("maxLength", "maxLength", 12),
+                ("placeholder", "placeholder", 80),
+                ("ariaLabel", "ariaLabel", 80),
+                ("text", "text", 80),
+            ):
+                value = str(element.get(src) or "")[:limit]
+                if value:
+                    compact[dst] = value
+            value_length = int(element.get("valueLength") or 0)
+            if value_length > 0:
+                compact["valueLength"] = value_length
+            for key in ("filled", "checked", "selected", "focused", "disabled"):
+                if bool(element.get(key)):
+                    compact[key] = True
+            compact_elements.append(compact)
     return {
         "url": _compact_url_for_model(snapshot.get("url")),
         "title": str(snapshot.get("title") or "")[:120],
-        "body_text": str(snapshot.get("body_text") or "")[:900],
+        "digest": _structural_digest_for_model(snapshot),
         "elements": compact_elements,
     }
+
+
+def _compact_last_step(history: list[dict[str, str]]) -> str:
+    if not history:
+        return ""
+    last = history[-1]
+    parts: list[str] = []
+    action = str(last.get("action") or "").strip()
+    if action:
+        parts.append(f"action={action[:96]}")
+    changed = str(last.get("changed") or "").strip()
+    if changed:
+        parts.append(f"changed={changed[:8]}")
+    post_page = str(last.get("post_page") or "").strip()
+    if post_page:
+        parts.append(f"post={post_page[:160]}")
+    carry = str(last.get("carry_forward") or "").strip()
+    if carry:
+        parts.append(f"mem={carry[:120]}")
+    return " ".join(parts)
+
+
+def _structural_digest_for_model(snapshot: dict[str, object]) -> dict[str, list[str]]:
+    return {
+        "headings": _compact_text_list(snapshot.get("headings"), limit=4, width=120),
+        "alerts": _compact_text_list(snapshot.get("alerts"), limit=4, width=160),
+        "labels": _compact_text_list(snapshot.get("labels"), limit=6, width=80),
+        "supporting": _compact_supporting_text(snapshot),
+    }
+
+
+def _compact_text_list(raw: object, *, limit: int, width: int) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    values: list[str] = []
+    seen: set[str] = set()
+    for item in raw[:limit]:
+        text = " ".join(str(item or "").split())[:width]
+        if not text:
+            continue
+        key = text.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        values.append(text)
+    return values
+
+
+def _compact_supporting_text(snapshot: dict[str, object]) -> list[str]:
+    collected = _compact_text_list(snapshot.get("supporting"), limit=6, width=140)
+    if collected:
+        return collected[:4]
+    body_text = " ".join(str(snapshot.get("body_text") or "").split())
+    if not body_text:
+        return []
+    chunks: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+", body_text):
+        text = sentence.strip()[:140]
+        if text:
+            chunks.append(text)
+        if len(chunks) >= 3:
+            break
+    return chunks
 
 
 def _compact_url_for_model(raw_url: object) -> str:
@@ -1109,31 +1165,21 @@ def _auth_system_prompt(*, flow_label: str, snapshot: dict[str, object]) -> str:
     flow_detail = "OpenAI/Codex sign-in" if flow_label.startswith("codex/") else "Claude sign-in"
     base = (
         f"You control a headless browser for {flow_detail}. "
-        "Return a single JSON object only. "
-        "Do not output chain-of-thought, explanations, markdown, or prose outside the JSON object. "
-        "You start from a fresh context every step. If you want future steps to remember something, put it into carry_forward. "
-        "Allowed actions are click, fill, press, wait, done, fail. "
-        "For fill, prefer value_key account_email, password, or device_code instead of literal secrets. "
-        "Never reveal or request the literal password. "
-        "Use the provided element ids exactly as shown. "
-        "Those ids are temporary harness handles for the current step only, not site-stable ids. "
-        "Use text, ariaLabel, placeholder, autocomplete, inputMode, maxLength, selected, valueLength, filled, checked, focused, and disabled to infer the form state. "
-        "Trust the current snapshot and surface_summary over older carry_forward notes when they disagree. "
-        "Never click a disabled element. "
-        "If a relevant field is already filled, prefer advancing instead of filling again. "
-        "If surface_summary.all_short_inputs_filled is true, treat the segmented token entry as complete and prefer click or press to advance instead of fill. "
-        "If the previous action did not materially change the page, do not repeat it blindly; choose a different strategy. "
-        "If the page text says choose or select and actionable options are present, make the required selection before advancing with Continue or Next. "
-        "Do not claim an account, workspace, or option is selected unless the current snapshot shows selected state or the page clearly advanced after your action. "
-        "Do not treat opaque query parameters, OAuth callback codes, or long URL tokens as the human-entered device code. "
-        "When a device-code surface appears, use the provided device_code handle instead of inferring a code from the URL. "
-        "Do not return done merely because a callback or redirect page has no visible controls. "
-        "If the page has zero interactive elements and the body looks like bootstrap or script text, prefer wait for the next auth surface. "
-        "If a page is still redirecting or running a security check and there is no clear interactive control, prefer wait. "
-        "If credentials are clearly wrong, the account does not exist, or access is denied because the sign-in details are invalid, return fail with failure_kind no_auth and a short reason. "
-        "If the page shows a transient site problem, expired session, retry-later situation, security interstitial you cannot get through, browser error, or any other non-credential failure, return fail with failure_kind error and a short reason. "
-        "If the page asks for captcha, phone verification, recovery email, 2-step verification, or any unknown manual challenge, return fail with failure_kind error and a short reason. "
-        "If the login flow is complete or the page is no longer asking for auth input, return done."
+        "Reply with one JSON object only. No prose or chain-of-thought. "
+        "Fresh context every step: only carry_forward survives. Keep carry_forward short, non-secret, at most 6 items. "
+        "Actions: click, fill, press, wait, done, fail. "
+        "Use current snapshot over old memory. Element ids are per-step handles only. "
+        "For secrets use value_key account_email, password, or device_code; never output literal passwords. "
+        "Never click disabled controls. If a field is already filled, advance instead of refilling. "
+        "If all short inputs are filled, treat token entry as complete and advance. "
+        "If the last action did not change the page, try something else. "
+        "If a page asks you to choose or select and enabled options are present, make the needed selection before Continue or Next. "
+        "Do not claim selection unless the snapshot shows it or the page clearly advanced. "
+        "Do not treat URL tokens or callback codes as the device code. Use the device_code handle on device-code pages. "
+        "If there are no useful controls and the page looks like redirect/bootstrap/security-check text, wait. "
+        "If credentials are wrong, return fail with failure_kind no_auth. "
+        "If there is captcha, MFA, recovery, security interstitial, transient site/browser/session trouble, or another non-credential blocker, return fail with failure_kind error. "
+        "If auth is complete or no auth input is needed anymore, return done."
     )
     if hint_text:
         base = f"{base} Surface guidance: {hint_text}"
@@ -1285,11 +1331,12 @@ def _wait_for_surface_change(page: object, previous_fingerprint: str, *, timeout
 
 
 def summarize_snapshot(snapshot: dict[str, object]) -> str:
-    url = str(snapshot.get("url") or "")
+    url = _compact_url_for_model(snapshot.get("url"))
     title = str(snapshot.get("title") or "")
-    body = str(snapshot.get("body_text") or "")
-    compact = " ".join(body.split())[:120]
-    return f"url={url} title={title!r} body={compact!r}"
+    digest = _structural_digest_for_model(snapshot)
+    summary_parts = digest.get("headings", [])[:1] + digest.get("alerts", [])[:1] + digest.get("supporting", [])[:1]
+    compact = " | ".join(summary_parts)[:120]
+    return f"url={url} title={title!r} digest={compact!r}"
 
 
 def summarize_action(action: AuthModelAction) -> str:
