@@ -170,7 +170,7 @@ def run_auto_login(
     headed: bool = False,
     timeout_seconds: int = 180,
     *,
-    max_parallel: int = 4,
+    max_parallel: int = 1,
 ) -> None:
     apply_node_warning_suppression()
     apply_playwright_browser_path()

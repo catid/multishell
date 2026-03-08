@@ -388,7 +388,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_login_parser.add_argument("--all", action="store_true")
     auto_login_parser.add_argument("--headed", action="store_true")
     auto_login_parser.add_argument("--timeout", type=int, default=180)
-    auto_login_parser.add_argument("--parallel", type=int, default=4)
+    auto_login_parser.add_argument("--parallel", type=int, default=1)
     auto_login_parser.set_defaults(func=cmd_auto_login)
 
     auth_model_smoke_parser = subparsers.add_parser("auth-model-smoke-test")

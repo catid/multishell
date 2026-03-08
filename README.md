@@ -57,9 +57,11 @@ The login TUI starts with an empty account list. Add as many Google accounts as 
 
 `multishell auto-login` manages the local auth-model server for you. If the local model runtime is installed, it starts `llama.cpp` on demand and uses a locally hosted Qwen 3.5 model to read the live auth page text, decide the next browser action, and automatically log into the configured Google accounts in headless Chromium.
 
+Accounts are processed one at a time by default during `multishell auto-login`. Pass `--parallel N` if you explicitly want concurrent login flows.
+
 If Google returns a hard error like wrong password, account not found, browser not secure, or a manual verification challenge, `multishell` now fails that lane immediately with a specific message instead of sitting on the page until timeout.
 
-If one account fails during `multishell auto-login`, the remaining accounts still run. The command prints a per-lane failure line as it goes and raises one summary at the end listing every failed account, including the debug artifact directory when a browser page dump was captured.
+If one account fails during `multishell auto-login`, the remaining accounts still run afterward. The command prints a per-account failure line as it goes and raises one summary at the end listing every failed account, including the debug artifact directory when a browser page dump was captured.
 
 The default local model settings target a `llama.cpp`-style server:
 

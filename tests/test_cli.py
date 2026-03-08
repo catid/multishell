@@ -272,7 +272,7 @@ def test_auto_login_manages_local_auth_model_server(monkeypatch) -> None:
 
     assert args.func(args) == 0
     assert captured["entered"] is True
-    assert captured["credentials"] == (["cred"], False, 180, 4)
+    assert captured["credentials"] == (["cred"], False, 180, 1)
 
 
 def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

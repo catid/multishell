@@ -297,6 +297,46 @@ def test_run_auto_login_does_not_retry_no_auth_failures(monkeypatch, capsys) -> 
     assert "[worker-1] login failed [no_auth]: Wrong password" in out
 
 
+def test_run_auto_login_defaults_to_sequential_processing(monkeypatch) -> None:
+    credentials = [
+        AgentCredentials(
+            spec=AgentSpec(
+                name=f"claude-worker-{index}",
+                account_email=f"worker{index}@example.com",
+                role="claude-worker",
+                personality="Claude worker.",
+                accent_color=index,
+                engine="claude",
+                account_key=f"account-{index}",
+            ),
+            password=f"secret-{index}",
+        )
+        for index in range(1, 4)
+    ]
+    active = 0
+    max_active = 0
+    lock = threading.Lock()
+
+    monkeypatch.setattr("multishell.autologin.apply_node_warning_suppression", lambda: None)
+    monkeypatch.setattr("multishell.autologin.apply_playwright_browser_path", lambda: None)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _FakePlaywrightContext())
+
+    def fake_login(_playwright, _credential, _timeout_seconds, headed):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        time.sleep(0.05)
+        with lock:
+            active -= 1
+
+    monkeypatch.setattr("multishell.autologin._login_claude_one", fake_login)
+
+    run_auto_login(credentials)
+
+    assert max_active == 1
+
+
 def test_run_auto_login_limits_parallelism(monkeypatch) -> None:
     credentials = [
         AgentCredentials(
