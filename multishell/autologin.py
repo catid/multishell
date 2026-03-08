@@ -1094,12 +1094,24 @@ def _browser_product_version(chrome_binary: str) -> str:
 
 
 class _ProcessOutputTail:
-    def __init__(self, stream: object, *, progress_label: str | None = None) -> None:
+    def __init__(
+        self,
+        stream: object,
+        *,
+        progress_label: str | None = None,
+        log_path: Path | None = None,
+    ) -> None:
         self._stream = stream
         self._progress_label = progress_label
+        self._log_path = log_path
+        self._head_lines: list[str] = []
         self._lines: deque[str] = deque(maxlen=40)
+        self._signal_lines: deque[str] = deque(maxlen=12)
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
+        if self._log_path is not None:
+            self._log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._log_path.write_text("", encoding="utf-8")
         if stream is not None:
             self._thread = threading.Thread(target=self._drain_stream, name="multishell-browser-log", daemon=True)
             self._thread.start()
@@ -1114,13 +1126,23 @@ class _ProcessOutputTail:
                 if not line:
                     continue
                 with self._lock:
+                    if len(self._head_lines) < 12:
+                        self._head_lines.append(line)
                     self._lines.append(line)
+                    if _is_browser_signal_line(line):
+                        self._signal_lines.append(line)
+                    if self._log_path is not None:
+                        with self._log_path.open("a", encoding="utf-8") as handle:
+                            handle.write(f"{line}\n")
                 if self._progress_label is not None:
                     _log_progress(self._progress_label, f"browser output: {line}")
         except Exception as exc:
             line = f"<browser output reader error: {exc}>"
             with self._lock:
                 self._lines.append(line)
+                if self._log_path is not None:
+                    with self._log_path.open("a", encoding="utf-8") as handle:
+                        handle.write(f"{line}\n")
             if self._progress_label is not None:
                 _log_progress(self._progress_label, f"browser output: {line}")
 
@@ -1129,10 +1151,41 @@ class _ProcessOutputTail:
             lines = list(self._lines)[-limit:]
         return " | ".join(lines)
 
+    def summary(self) -> str:
+        with self._lock:
+            parts: list[str] = []
+            if self._head_lines:
+                parts.append(f"browser output head: {' | '.join(self._head_lines[:6])}")
+            if self._signal_lines:
+                parts.append(f"browser fatal lines: {' | '.join(list(self._signal_lines)[-6:])}")
+            if self._lines:
+                parts.append(f"browser output tail: {' | '.join(list(self._lines)[-8:])}")
+            if self._log_path is not None:
+                parts.append(f"browser log: {self._log_path}")
+        return "; ".join(parts)
+
     def join(self, timeout_seconds: float = 1.0) -> None:
         if self._thread is None:
             return
         self._thread.join(timeout=max(0.0, timeout_seconds))
+
+
+def _is_browser_signal_line(line: str) -> bool:
+    lowered = line.lower()
+    return any(
+        token in lowered
+        for token in (
+            "fatal:",
+            "error:",
+            "check failed",
+            "received signal",
+            "no usable sandbox",
+            "trace/breakpoint trap",
+            "illegal instruction",
+            "segmentation fault",
+            "stack trace",
+        )
+    )
 
 
 @contextmanager
@@ -1146,6 +1199,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
     _cleanup_stale_chrome_profile(profile_dir)
     port = _reserve_port()
     command = _build_chrome_command(chrome_binary, profile_dir, port, headed=headed)
+    browser_log_path = _browser_log_path(agent_name)
 
     process = subprocess.Popen(
         command,
@@ -1157,7 +1211,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
         env=child_env(os.environ.copy(), role="browser", agent=agent_name),
         start_new_session=True,
     )
-    output_tail = _ProcessOutputTail(process.stdout, progress_label=progress_label)
+    output_tail = _ProcessOutputTail(process.stdout, progress_label=progress_label, log_path=browser_log_path)
     browser = None
 
     try:
@@ -1167,6 +1221,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
                 f"browser launch: pid={process.pid} port={port} headed={'yes' if headed else 'no'} profile={profile_dir}",
             )
             _log_progress(progress_label, f"browser command: {' '.join(shlex.quote(part) for part in command)}")
+            _log_progress(progress_label, f"browser log file: {browser_log_path}")
             _log_progress(progress_label, f"waiting for Chrome DevTools endpoint on port {port}")
         endpoint = _wait_for_cdp_endpoint(
             port,
@@ -1199,6 +1254,13 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
             except Exception:
                 pass
         output_tail.join()
+
+
+def _browser_log_path(agent_name: str) -> Path:
+    debug_dir = state_root() / "debug" / agent_name
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time())
+    return debug_dir / f"{timestamp}-browser.log"
 
 
 def _resolve_browser_binary(playwright: object) -> str:
@@ -1310,9 +1372,9 @@ def _wait_for_cdp_endpoint(
                 return_code = process.poll()
                 if return_code is not None:
                     detail = f"browser exited before opening DevTools endpoint on port {port} with exit code {return_code}"
-                    tail_text = output_tail.tail() if output_tail is not None else ""
-                    if tail_text:
-                        detail = f"{detail}; browser output tail: {tail_text}"
+                    summary = output_tail.summary() if output_tail is not None else ""
+                    if summary:
+                        detail = f"{detail}; {summary}"
                     raise RuntimeError(detail) from exc
             if progress_label is not None:
                 process_state = ""
@@ -1331,9 +1393,9 @@ def _wait_for_cdp_endpoint(
         detail = f"{detail} pid={process.pid} status={status}"
     if last_error is not None:
         detail = f"{detail}: {last_error}"
-    tail_text = output_tail.tail() if output_tail is not None else ""
-    if tail_text:
-        detail = f"{detail}; browser output tail: {tail_text}"
+    summary = output_tail.summary() if output_tail is not None else ""
+    if summary:
+        detail = f"{detail}; {summary}"
     raise RuntimeError(detail)
 
 

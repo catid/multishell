@@ -738,8 +738,8 @@ class _ExitedBrowserProcess:
 
 
 class _OutputTailStub:
-    def tail(self, *, limit: int = 8) -> str:
-        return "chrome: error while loading shared libraries: libgtk-3.so.0"
+    def summary(self) -> str:
+        return "browser output head: chrome: error while loading shared libraries: libgtk-3.so.0"
 
 
 def test_wait_for_cdp_endpoint_reports_browser_exit_details(monkeypatch) -> None:
