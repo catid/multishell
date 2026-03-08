@@ -200,10 +200,6 @@ def _restore_terminal(stdscr: curses.window) -> None:
             reset()
         except curses.error:
             pass
-    try:
-        curses.endwin()
-    except curses.error:
-        pass
 
 
 def _maybe_force_full_redraw(stdscr: curses.window, next_redraw_at: float, now: float | None = None) -> float:

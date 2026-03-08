@@ -151,4 +151,4 @@ def test_restore_terminal_resets_modes(monkeypatch) -> None:
     tui._restore_terminal(window)
 
     assert window.calls == [("keypad", False), ("timeout", -1)]
-    assert calls == ["echo", "nocbreak", "nl", "qiflush", "endwin"]
+    assert calls == ["echo", "nocbreak", "nl", "qiflush"]

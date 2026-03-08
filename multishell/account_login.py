@@ -22,11 +22,11 @@ from .envfile import DotenvFile
 
 MIN_HEIGHT = 16
 MIN_WIDTH = 92
-EDITABLE_COLUMNS = ("openai", "anthropic", "gemini", "email", "password")
+EDITABLE_COLUMNS = ("email", "password", "openai", "anthropic", "gemini")
 CHECKBOX_PROVIDERS = {
-    0: PROVIDER_OPENAI,
-    1: PROVIDER_ANTHROPIC,
-    2: PROVIDER_GEMINI,
+    2: PROVIDER_OPENAI,
+    3: PROVIDER_ANTHROPIC,
+    4: PROVIDER_GEMINI,
 }
 
 
@@ -117,7 +117,7 @@ def _main(stdscr: curses.window, state: AccountState, interrupt_state: Interrupt
                 state.selected_row = min(max(0, len(state.accounts) - 1), state.selected_row + 1)
                 continue
             if key in ("a", "A"):
-                _add_account(state)
+                _add_account(stdscr, state)
                 continue
             if key in ("x", "X", curses.KEY_DC):
                 _remove_selected(state)
@@ -177,7 +177,7 @@ def _draw_screen(stdscr: curses.window, state: AccountState, width: int) -> None
     _draw_row(
         stdscr,
         header_row + 1,
-        ["Account", "OpenAI", "Anthropic", "Gemini", "Email", "Password"],
+        ["Account", "Email", "Password", "OpenAI", "Anthropic", "Gemini"],
         column_widths,
         header=True,
     )
@@ -188,11 +188,11 @@ def _draw_screen(stdscr: curses.window, state: AccountState, width: int) -> None
             row = header_row + 3 + index
             values = [
                 f"#{index + 1}",
+                account.email or "(missing)",
+                mask_secret(account.password),
                 _checkbox(account.uses(PROVIDER_OPENAI)),
                 _checkbox(account.uses(PROVIDER_ANTHROPIC)),
                 _checkbox(account.uses(PROVIDER_GEMINI)),
-                account.email or "(missing)",
-                mask_secret(account.password),
             ]
             _draw_row(stdscr, row, values, column_widths, selected_row=index == state.selected_row, selected_col=state.selected_col)
     else:
@@ -234,7 +234,7 @@ def _column_widths(width: int) -> list[int]:
     checkbox = 10
     password = 14
     email = max(22, usable - account - checkbox - checkbox - checkbox - password)
-    return [account, checkbox, checkbox, checkbox, email, password]
+    return [account, email, password, checkbox, checkbox, checkbox]
 
 
 def _checkbox(enabled: bool) -> str:
@@ -281,12 +281,30 @@ def _fit_cell(value: str, width: int) -> str:
     return value[: width - 3] + "..."
 
 
-def _add_account(state: AccountState) -> None:
+def _add_account(stdscr: curses.window, state: AccountState) -> None:
+    previous_row = state.selected_row
+    previous_col = state.selected_col
     state.accounts.append(AccountRecord(key=next_account_key(state.accounts), email="", password="", providers=()))
     state.selected_row = len(state.accounts) - 1
-    state.selected_col = 3
+    state.selected_col = 0
+    label = f"account #{state.selected_row + 1} email"
+    updated = _edit_value(stdscr, label, "", secret=False)
+    if updated is None or not updated.strip():
+        state.accounts.pop()
+        state.selected_row = min(previous_row, max(0, len(state.accounts) - 1))
+        state.selected_col = previous_col
+        state.status = "aborted add account"
+        return
+    account = state.accounts[state.selected_row]
+    state.accounts[state.selected_row] = AccountRecord(
+        key=account.key,
+        email=updated.strip(),
+        password=account.password,
+        providers=account.providers,
+    )
+    state.selected_col = 1
     _save_accounts(state)
-    state.status = f"added account #{len(state.accounts)}"
+    state.status = f"added account #{state.selected_row + 1}"
 
 
 def _remove_selected(state: AccountState) -> None:
@@ -307,7 +325,7 @@ def _clear_selected(state: AccountState) -> None:
     if state.selected_col in CHECKBOX_PROVIDERS:
         state.status = "use Space to toggle provider checkboxes"
         return
-    if state.selected_col == 3:
+    if state.selected_col == 0:
         updated = AccountRecord(key=account.key, email="", password=account.password, providers=account.providers)
         state.accounts[state.selected_row] = updated
         _save_accounts(state)
@@ -345,13 +363,13 @@ def _toggle_selected_checkbox(state: AccountState) -> None:
 
 def _activate_selected(stdscr: curses.window, state: AccountState) -> None:
     if not state.accounts:
-        _add_account(state)
+        _add_account(stdscr, state)
         return
     if state.selected_col in CHECKBOX_PROVIDERS:
         _toggle_selected_checkbox(state)
         return
     account = state.accounts[state.selected_row]
-    is_password = state.selected_col == 4
+    is_password = state.selected_col == 1
     label = f"account #{state.selected_row + 1} {'password' if is_password else 'email'}"
     initial = account.password if is_password else account.email
     updated = _edit_value(stdscr, label, initial, secret=is_password)
@@ -489,7 +507,3 @@ def _restore_terminal(stdscr: curses.window) -> None:
             reset()
         except curses.error:
             pass
-    try:
-        curses.endwin()
-    except curses.error:
-        pass
