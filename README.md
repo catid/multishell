@@ -7,8 +7,8 @@
 Prerequisites:
 
 - Python 3.11+
-- `google-chrome`
-- `xvfb-run` when installing over SSH or any shell without `DISPLAY`
+- On Ubuntu, the installer uses `sudo` to install `google-chrome`, `xvfb`, and `python3-venv` if they are missing.
+- On other Linux distributions, install `google-chrome` yourself before running the setup script, and install `xvfb` too when installing over SSH or any shell without `DISPLAY`.
 
 One-command install and first-time setup:
 
@@ -20,6 +20,7 @@ The installer:
 
 - creates a dedicated Python venv under `~/.local/share/multishell`
 - installs a `multishell` wrapper into `~/.local/bin`
+- installs missing Ubuntu system packages with `sudo` when needed
 - launches `multishell login` so you can enter the Google account emails and passwords in a curses TUI
 - runs `multishell install-browser`
 - runs `multishell auto-login --all` and uses `--headed` automatically when `DISPLAY` is available
@@ -62,7 +63,6 @@ multishell uninstall --keep-state
 - Runtime state lives under `~/.multishell` by default.
 - Set `MULTISHELL_STATE_ROOT` to move the runtime state elsewhere.
 - Set `MULTISHELL_WORKSPACE_ROOT` if you want to override the default worker cwd instead of using the current directory.
-- The legacy repo-local `.env` file is still read as a fallback for older setups.
 - On startup, `multishell` cleans up stale old sessions from the same state root before starting the fresh controller.
 - `Tab` toggles the debug view and `Ctrl+C` exits.
 
