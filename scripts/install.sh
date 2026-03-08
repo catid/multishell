@@ -55,38 +55,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
-install_ubuntu_chrome() {
-  if have_cmd google-chrome || have_cmd google-chrome-stable; then
-    return 0
-  fi
-
-  local arch deb
-  arch="$(dpkg --print-architecture 2>/dev/null || true)"
-  if [[ "$arch" != "amd64" ]]; then
-    echo "automatic google-chrome install currently supports Ubuntu amd64 only" >&2
-    exit 1
-  fi
-
-  deb="$tmp_dir/google-chrome-stable_current_amd64.deb"
-  ubuntu_apt_install ca-certificates
-  curl -fsSL https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -o "$deb"
-  sudo apt-get install -y "$deb"
-}
-
 install_ubuntu_dependencies() {
   local packages=()
 
   if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
     packages+=(python3-venv)
   fi
-  if [[ -z "${DISPLAY:-}" ]] && ! have_cmd xvfb-run; then
-    packages+=(xvfb)
+  if ! have_cmd cmake; then
+    packages+=(cmake)
+  fi
+  if ! have_cmd c++; then
+    packages+=(build-essential)
   fi
   if ((${#packages[@]} > 0)); then
     ubuntu_apt_install "${packages[@]}"
   fi
-
-  install_ubuntu_chrome
 }
 
 require_cmd curl
@@ -120,22 +103,6 @@ fi
 
 if ! "$PYTHON_BIN" -m venv --help >/dev/null 2>&1; then
   echo "python venv support is required; install python3-venv and rerun the installer" >&2
-  exit 1
-fi
-
-if ! have_cmd google-chrome && ! have_cmd google-chrome-stable; then
-  echo "google-chrome is required for the automated Google login flow" >&2
-  if ! is_ubuntu; then
-    echo "install it manually, or run the installer on Ubuntu so it can install it with sudo" >&2
-  fi
-  exit 1
-fi
-
-if [[ -z "${DISPLAY:-}" ]] && ! have_cmd xvfb-run; then
-  echo "xvfb-run is required when DISPLAY is not set" >&2
-  if ! is_ubuntu; then
-    echo "install xvfb manually, or run the installer on Ubuntu so it can install it with sudo" >&2
-  fi
   exit 1
 fi
 
@@ -179,14 +146,17 @@ log_step "Preparing config file"
 "$BIN_DIR/multishell" init-config <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
 log_step "Opening account login TUI"
 "$BIN_DIR/multishell" login <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
-log_step "Installing Playwright browser runtime (this can take several minutes)"
-"$BIN_DIR/multishell" install-browser <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+browser_args=(install-browser)
+if is_ubuntu; then
+  browser_args+=(--with-deps)
+fi
+log_step "Installing Playwright browser runtime (and Linux browser deps on Ubuntu)"
+"$BIN_DIR/multishell" "${browser_args[@]}" <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+log_step "Installing the local auth model runtime and model file (this can take a while)"
+"$BIN_DIR/multishell" install-auth-model <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
 
 auto_args=(auto-login --all)
-if [[ -n "${DISPLAY:-}" ]]; then
-  auto_args+=(--headed)
-fi
-log_step "Running browser auth automation for all configured accounts (press Ctrl+C to skip)"
+log_step "Running headless browser auth automation for all configured accounts (press Ctrl+C to skip)"
 "$BIN_DIR/multishell" "${auto_args[@]}" <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
 
 echo

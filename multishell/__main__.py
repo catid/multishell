@@ -18,10 +18,17 @@ from .config import (
     state_root,
 )
 from .homes import agent_home, all_agent_names, auth_path, claude_home, claude_logged_in, ensure_agent_home, ensure_claude_home
-from .runtime import apply_node_warning_suppression, cleanup_stale_runtime, ensure_runtime_environment, suppress_node_warnings
+from .runtime import (
+    apply_node_warning_suppression,
+    apply_playwright_browser_path,
+    cleanup_stale_runtime,
+    ensure_runtime_environment,
+    install_root as runtime_install_root,
+    playwright_browsers_path,
+    suppress_node_warnings,
+)
 
 
-DEFAULT_INSTALL_ROOT = Path.home() / ".local" / "share" / "multishell"
 DEFAULT_BIN_DIR = Path.home() / ".local" / "bin"
 
 
@@ -60,8 +67,7 @@ def _write_default_config(target: Path, *, force: bool) -> None:
 
 
 def _install_root() -> Path:
-    override = os.environ.get("MULTISHELL_INSTALL_ROOT", "").strip()
-    return Path(override).expanduser() if override else DEFAULT_INSTALL_ROOT
+    return runtime_install_root()
 
 
 def _bin_dir() -> Path:
@@ -90,7 +96,8 @@ def cmd_run(_: argparse.Namespace) -> int:
         print("missing Codex login for:", ", ".join(missing_codex))
         if missing_claude:
             print("missing Claude login for:", ", ".join(missing_claude))
-        print("run `multishell auto-login --all` (or add `--headed` when DISPLAY is available) first")
+        print("run `multishell auto-login --all` first")
+        print("add `--headed` only if you explicitly want visible browser windows for debugging")
         print("for a single lane, use `multishell auth-login <agent>`")
         return 1
     if missing_claude:
@@ -124,14 +131,44 @@ def cmd_init_config(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_install_browser(_: argparse.Namespace) -> int:
+def cmd_install_browser(args: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("playwright"):
         return 0
-    print("installing Playwright Chromium browser; this can take several minutes on first run")
+    print(
+        f"installing Playwright Chromium browser into {playwright_browsers_path()}; this can take several minutes on first run",
+        flush=True,
+    )
     apply_node_warning_suppression()
     env = suppress_node_warnings(os.environ.copy())
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, env=env)
-    print("browser install complete")
+    apply_playwright_browser_path(env)
+    command = [sys.executable, "-m", "playwright", "install"]
+    if args.with_deps:
+        command.append("--with-deps")
+    command.append("chromium")
+    subprocess.run(command, check=True, env=env)
+    print("browser install complete", flush=True)
+    return 0
+
+
+def cmd_install_llama_cpp(args: argparse.Namespace) -> int:
+    from .llama_cpp import install_llama_cpp
+
+    try:
+        install_llama_cpp(force=args.force)
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
+    return 0
+
+
+def cmd_install_auth_model(args: argparse.Namespace) -> int:
+    from .llama_cpp import install_auth_model
+
+    try:
+        install_auth_model(force=args.force)
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
     return 0
 
 
@@ -233,7 +270,10 @@ def cmd_auto_login(args: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("playwright"):
         return 0
 
+    apply_playwright_browser_path()
     from .autologin import resolve_credentials, run_auto_login
+    from .llama_cpp import managed_auth_model_server
+
     apply_node_warning_suppression()
 
     if args.all:
@@ -250,7 +290,54 @@ def cmd_auto_login(args: argparse.Namespace) -> int:
         raise SystemExit(f"missing emails in .env: {', '.join(missing_emails)}")
 
     credentials = resolve_credentials(target_agents)
-    run_auto_login(credentials, headed=args.headed, timeout_seconds=args.timeout)
+    with managed_auth_model_server(required=False, log=lambda message: print(message, flush=True)):
+        run_auto_login(
+            credentials,
+            headed=args.headed,
+            timeout_seconds=args.timeout,
+            max_parallel=args.parallel,
+        )
+    return 0
+
+
+def cmd_auth_model_smoke_test(args: argparse.Namespace) -> int:
+    if _maybe_reexec_into_venv("playwright"):
+        return 0
+
+    apply_playwright_browser_path()
+    from .auth_flow_model import run_auth_model_smoke_test
+    from .llama_cpp import managed_auth_model_server
+
+    try:
+        with managed_auth_model_server(required=True, log=lambda message: print(message, flush=True)):
+            run_auth_model_smoke_test(headed=args.headed)
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
+    return 0
+
+
+def cmd_auth_model_bench(args: argparse.Namespace) -> int:
+    from .llama_cpp import bench_auth_model
+
+    try:
+        result = bench_auth_model(
+            prompt_tokens=args.prompt_tokens,
+            decode_tokens=args.decode_tokens,
+            runs=args.runs,
+        )
+    except RuntimeError as exc:
+        print(str(exc))
+        return 1
+    print(
+        "auth model bench: "
+        f"model={result.model_path} "
+        f"prompt_tps={result.prompt_tokens_per_second:.2f} "
+        f"decode_tps={result.decode_tokens_per_second:.2f} "
+        f"prompt_tokens={result.prompt_tokens} "
+        f"decode_tokens={result.decode_tokens} "
+        f"runs={result.runs}"
+    )
     return 0
 
 
@@ -265,7 +352,16 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.set_defaults(func=cmd_init_config)
 
     browser_parser = subparsers.add_parser("install-browser")
+    browser_parser.add_argument("--with-deps", action="store_true")
     browser_parser.set_defaults(func=cmd_install_browser)
+
+    llama_cpp_parser = subparsers.add_parser("install-llama-cpp")
+    llama_cpp_parser.add_argument("--force", action="store_true")
+    llama_cpp_parser.set_defaults(func=cmd_install_llama_cpp)
+
+    install_auth_model_parser = subparsers.add_parser("install-auth-model")
+    install_auth_model_parser.add_argument("--force", action="store_true")
+    install_auth_model_parser.set_defaults(func=cmd_install_auth_model)
 
     uninstall_parser = subparsers.add_parser("uninstall")
     uninstall_parser.add_argument("--yes", action="store_true")
@@ -292,7 +388,18 @@ def build_parser() -> argparse.ArgumentParser:
     auto_login_parser.add_argument("--all", action="store_true")
     auto_login_parser.add_argument("--headed", action="store_true")
     auto_login_parser.add_argument("--timeout", type=int, default=180)
+    auto_login_parser.add_argument("--parallel", type=int, default=4)
     auto_login_parser.set_defaults(func=cmd_auto_login)
+
+    auth_model_smoke_parser = subparsers.add_parser("auth-model-smoke-test")
+    auth_model_smoke_parser.add_argument("--headed", action="store_true")
+    auth_model_smoke_parser.set_defaults(func=cmd_auth_model_smoke_test)
+
+    auth_model_bench_parser = subparsers.add_parser("auth-model-bench")
+    auth_model_bench_parser.add_argument("--prompt-tokens", type=int, default=128)
+    auth_model_bench_parser.add_argument("--decode-tokens", type=int, default=64)
+    auth_model_bench_parser.add_argument("--runs", type=int, default=3)
+    auth_model_bench_parser.set_defaults(func=cmd_auth_model_bench)
 
     return parser
 

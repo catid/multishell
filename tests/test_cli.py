@@ -105,6 +105,7 @@ def test_install_browser_runs_playwright_install(monkeypatch) -> None:
 
     monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
     monkeypatch.setenv("NODE_NO_WARNINGS", "0")
+    monkeypatch.setenv("MULTISHELL_INSTALL_ROOT", "/tmp/multishell-install")
 
     def fake_run(cmd, check, env):
         captured["cmd"] = cmd
@@ -120,6 +121,158 @@ def test_install_browser_runs_playwright_install(monkeypatch) -> None:
     assert captured["cmd"][1:] == ["-m", "playwright", "install", "chromium"]
     assert captured["check"] is True
     assert captured["env"]["NODE_NO_WARNINGS"] == "1"
+    assert captured["env"]["PLAYWRIGHT_BROWSERS_PATH"] == "/tmp/multishell-install/playwright-browsers"
+
+
+def test_install_browser_can_request_system_deps(monkeypatch) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+
+    def fake_run(cmd, check, env):
+        captured["cmd"] = cmd
+        captured["check"] = check
+        captured["env"] = env
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("multishell.__main__.subprocess.run", fake_run)
+
+    args = parser.parse_args(["install-browser", "--with-deps"])
+
+    assert args.func(args) == 0
+    assert captured["cmd"][1:] == ["-m", "playwright", "install", "--with-deps", "chromium"]
+
+
+def test_install_llama_cpp_runs_installer(monkeypatch) -> None:
+    parser = build_parser()
+    called: dict[str, object] = {"force": None}
+
+    monkeypatch.setattr(
+        "multishell.llama_cpp.install_llama_cpp",
+        lambda *, force=False: called.__setitem__("force", force) or {},
+    )
+
+    args = parser.parse_args(["install-llama-cpp"])
+
+    assert args.func(args) == 0
+    assert called["force"] is False
+
+
+def test_install_auth_model_runs_installer(monkeypatch) -> None:
+    parser = build_parser()
+    called: dict[str, object] = {"force": None}
+
+    monkeypatch.setattr(
+        "multishell.llama_cpp.install_auth_model",
+        lambda *, force=False: called.__setitem__("force", force) or {},
+    )
+
+    args = parser.parse_args(["install-auth-model"])
+
+    assert args.func(args) == 0
+    assert called["force"] is False
+
+
+def test_install_auth_model_passes_force(monkeypatch) -> None:
+    parser = build_parser()
+    called: dict[str, object] = {"force": None}
+
+    monkeypatch.setattr(
+        "multishell.llama_cpp.install_auth_model",
+        lambda *, force=False: called.__setitem__("force", force) or {},
+    )
+
+    args = parser.parse_args(["install-auth-model", "--force"])
+
+    assert args.func(args) == 0
+    assert called["force"] is True
+
+
+def test_auth_model_smoke_test_runs_requested_mode(monkeypatch) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {}
+    entered: dict[str, bool] = {"value": False}
+
+    class _ManagedServer:
+        def __enter__(self):
+            entered["value"] = True
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.llama_cpp.managed_auth_model_server", lambda **_kwargs: _ManagedServer())
+    monkeypatch.setattr(
+        "multishell.auth_flow_model.run_auth_model_smoke_test",
+        lambda *, headed: captured.__setitem__("headed", headed),
+    )
+
+    args = parser.parse_args(["auth-model-smoke-test", "--headed"])
+
+    assert args.func(args) == 0
+    assert entered["value"] is True
+    assert captured["headed"] is True
+
+
+def test_auth_model_bench_prints_summary(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+
+    monkeypatch.setattr(
+        "multishell.llama_cpp.bench_auth_model",
+        lambda **_kwargs: SimpleNamespace(
+            model_path=Path("/tmp/model.gguf"),
+            prompt_tokens_per_second=150.5,
+            decode_tokens_per_second=11.2,
+            prompt_tokens=128,
+            decode_tokens=64,
+            runs=3,
+        ),
+    )
+
+    args = parser.parse_args(["auth-model-bench"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "prompt_tps=150.50" in out
+    assert "decode_tps=11.20" in out
+
+
+def test_auto_login_manages_local_auth_model_server(monkeypatch) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {"entered": False, "credentials": None}
+
+    class _ManagedServer:
+        def __enter__(self):
+            captured["entered"] = True
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.__main__.apply_node_warning_suppression", lambda: None)
+    monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["worker-1"])
+    monkeypatch.setattr("multishell.__main__.missing_email_env_vars", lambda _agents: [])
+    monkeypatch.setattr("multishell.autologin.resolve_credentials", lambda _agents: ["cred"])
+    monkeypatch.setattr(
+        "multishell.llama_cpp.managed_auth_model_server",
+        lambda **_kwargs: _ManagedServer(),
+    )
+    monkeypatch.setattr(
+        "multishell.autologin.run_auto_login",
+        lambda credentials, headed, timeout_seconds, max_parallel: captured.__setitem__(
+            "credentials",
+            (credentials, headed, timeout_seconds, max_parallel),
+        ),
+    )
+
+    args = parser.parse_args(["auto-login", "--all"])
+
+    assert args.func(args) == 0
+    assert captured["entered"] is True
+    assert captured["credentials"] == (["cred"], False, 180, 4)
 
 
 def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

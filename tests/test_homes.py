@@ -5,7 +5,7 @@ def test_manager_config_contains_model() -> None:
     ensure_agent_home("manager", manager_bridge_command=["python3", "-m", "multishell.mcp_bridge", "--socket", "/tmp/x"])
     config = config_path("manager").read_text(encoding="utf-8")
     assert 'model = "gpt-5.4"' in config
-    assert 'model_reasoning_effort = "medium"' in config
+    assert 'model_reasoning_effort = "high"' in config
     assert "[mcp_servers.multishell]" in config
 
 

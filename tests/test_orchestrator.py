@@ -26,7 +26,7 @@ class FakeSession:
         event_callback=None,
         turn_timeout_seconds=None,
         model="gpt-5.4",
-        reasoning_effort="medium",
+        reasoning_effort="high",
         auth_source_agent=None,
         **kwargs,
     ) -> None:

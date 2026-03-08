@@ -7,12 +7,15 @@ from multishell.runtime import (
     ENV_AGENT,
     ENV_INSTANCE_ID,
     ENV_NODE_NO_WARNINGS,
+    ENV_PLAYWRIGHT_BROWSERS_PATH,
     ENV_ROLE,
     ENV_STATE_ROOT,
     ObservedProcess,
     _discover_stale_processes,
     apply_node_warning_suppression,
+    apply_playwright_browser_path,
     child_env,
+    playwright_browsers_path,
     suppress_node_warnings,
 )
 
@@ -20,6 +23,7 @@ from multishell.runtime import (
 def test_child_env_inherits_runtime_markers(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv(ENV_STATE_ROOT, str(tmp_path / ".multishell"))
     monkeypatch.setenv(ENV_INSTANCE_ID, "instance-1")
+    monkeypatch.setenv("MULTISHELL_INSTALL_ROOT", str(tmp_path / ".install"))
 
     env = child_env({"PATH": "/usr/bin"}, role="codex-session", agent="worker-1")
 
@@ -28,6 +32,7 @@ def test_child_env_inherits_runtime_markers(monkeypatch, tmp_path: Path) -> None
     assert env[ENV_ROLE] == "codex-session"
     assert env[ENV_AGENT] == "worker-1"
     assert env[ENV_NODE_NO_WARNINGS] == "1"
+    assert env[ENV_PLAYWRIGHT_BROWSERS_PATH] == str((tmp_path / ".install" / "playwright-browsers"))
     assert env["PATH"] == "/usr/bin"
 
 
@@ -45,6 +50,15 @@ def test_apply_node_warning_suppression_updates_current_process_env(monkeypatch)
 
     assert env is not None
     assert env[ENV_NODE_NO_WARNINGS] == "1"
+
+
+def test_apply_playwright_browser_path_updates_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("MULTISHELL_INSTALL_ROOT", str(tmp_path / ".install"))
+
+    env = apply_playwright_browser_path({})
+
+    assert env[ENV_PLAYWRIGHT_BROWSERS_PATH] == str((tmp_path / ".install" / "playwright-browsers"))
+    assert playwright_browsers_path() == tmp_path / ".install" / "playwright-browsers"
 
 
 def test_discover_stale_processes_finds_previous_runtime_homes_and_browser_profiles(tmp_path: Path) -> None:

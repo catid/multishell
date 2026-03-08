@@ -18,7 +18,7 @@ from .envfile import parse_env_value
 
 
 MODEL = "gpt-5.4"
-MODEL_REASONING_EFFORT = "medium"
+MODEL_REASONING_EFFORT = "high"
 SPARK_MODEL = "gpt-5.3-spark"
 SPARK_REASONING_EFFORT = "xhigh"
 CLAUDE_MODEL = "claude-opus-4-6"

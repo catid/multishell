@@ -113,7 +113,7 @@ def test_run_turn_omits_null_cwd_and_updates_metrics(monkeypatch, tmp_path: Path
                 "threadId": "thread-123",
                 "input": [{"type": "text", "text": "ship it", "text_elements": []}],
                 "model": "gpt-5.4",
-                "effort": "medium",
+                "effort": "high",
                 "personality": "pragmatic",
             },
         )

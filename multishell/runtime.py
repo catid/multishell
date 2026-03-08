@@ -16,6 +16,8 @@ ENV_INSTANCE_ID = "MULTISHELL_INSTANCE_ID"
 ENV_ROLE = "MULTISHELL_ROLE"
 ENV_AGENT = "MULTISHELL_AGENT"
 ENV_NODE_NO_WARNINGS = "NODE_NO_WARNINGS"
+ENV_PLAYWRIGHT_BROWSERS_PATH = "PLAYWRIGHT_BROWSERS_PATH"
+DEFAULT_INSTALL_ROOT = Path.home() / ".local" / "share" / "multishell"
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ def child_env(
 ) -> dict[str, str]:
     ensure_runtime_environment()
     env = suppress_node_warnings(base_env)
+    apply_playwright_browser_path(env)
     env[ENV_STATE_ROOT] = os.environ[ENV_STATE_ROOT]
     env[ENV_INSTANCE_ID] = os.environ[ENV_INSTANCE_ID]
     if role is not None:
@@ -76,6 +79,21 @@ def suppress_node_warnings(base_env: dict[str, str] | None = None) -> dict[str, 
 def apply_node_warning_suppression(env: MutableMapping[str, str] | None = None) -> MutableMapping[str, str]:
     target = os.environ if env is None else env
     target[ENV_NODE_NO_WARNINGS] = "1"
+    return target
+
+
+def install_root() -> Path:
+    override = os.environ.get("MULTISHELL_INSTALL_ROOT", "").strip()
+    return Path(override).expanduser() if override else DEFAULT_INSTALL_ROOT
+
+
+def playwright_browsers_path() -> Path:
+    return install_root() / "playwright-browsers"
+
+
+def apply_playwright_browser_path(env: MutableMapping[str, str] | None = None) -> MutableMapping[str, str]:
+    target = os.environ if env is None else env
+    target[ENV_PLAYWRIGHT_BROWSERS_PATH] = str(playwright_browsers_path())
     return target
 
 

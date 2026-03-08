@@ -7,7 +7,10 @@ import shutil
 import signal
 import socket
 import subprocess
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,12 +18,75 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pexpect
 
+from .auth_flow_model import (
+    AuthModelFailure,
+    AuthModelProtocolError,
+    AuthModelUnavailable,
+    capture_auth_snapshot,
+    drive_google_auth_with_model,
+    snapshot_requires_model,
+)
 from .config import AgentSpec, account_for_agent, all_agent_specs, credential_source_agent, state_root
-from .homes import agent_home, auth_path, claude_home, ensure_agent_home, ensure_claude_home, has_claude_auth
-from .runtime import apply_node_warning_suppression, child_env, suppress_node_warnings
+from .homes import (
+    agent_home,
+    auth_path,
+    claude_auth_path,
+    claude_home,
+    claude_root_auth_path,
+    ensure_agent_home,
+    ensure_claude_home,
+    has_claude_auth,
+)
+from .runtime import apply_node_warning_suppression, apply_playwright_browser_path, child_env, suppress_node_warnings
 
 
 DEVICE_URL = "https://auth.openai.com/codex/device"
+GOOGLE_EMAIL_SELECTORS = [
+    "input[type='email']:visible",
+    "input[name='identifier']:visible",
+    "input[autocomplete='username']:visible",
+]
+GOOGLE_PASSWORD_SELECTORS = [
+    "input[type='password']:visible",
+    "input[name='Passwd']:visible",
+    "input[autocomplete='current-password']:visible",
+]
+GOOGLE_EMAIL_NEXT_SELECTORS = ["#identifierNext", "button:has-text('Next')"]
+GOOGLE_PASSWORD_NEXT_SELECTORS = ["#passwordNext", "button:has-text('Next')"]
+GOOGLE_CODE_SELECTORS = ["input[name*=code]", "input[autocomplete='one-time-code']", "input[inputmode='numeric']"]
+GOOGLE_ERROR_SNIPPETS = (
+    "Couldn’t find your Google Account",
+    "Couldn't find your Google Account",
+    "Enter a valid email or phone number",
+    "Enter an email or phone number",
+    "Wrong password",
+    "This browser or app may not be secure",
+    "Couldn’t sign you in",
+    "Couldn't sign you in",
+    "2-Step Verification",
+    "Verify it’s you",
+    "Verify it's you",
+)
+GOOGLE_MANUAL_CHALLENGE_SNIPPETS = {
+    "2-Step Verification",
+    "Verify it’s you",
+    "Verify it's you",
+}
+_LOG_LOCK = threading.RLock()
+LOGIN_ERROR_RETRY_ATTEMPTS = 10
+LOGIN_ERROR_RETRY_DELAY_SECONDS = 15
+
+
+class CodexDeviceAuthRateLimit(RuntimeError):
+    pass
+
+
+class RetryableLoginError(RuntimeError):
+    pass
+
+
+class NoAuthLoginError(RuntimeError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -30,7 +96,8 @@ class AgentCredentials:
 
 
 def _log_progress(agent_name: str, message: str) -> None:
-    print(f"[{agent_name}] {message}", flush=True)
+    with _LOG_LOCK:
+        print(f"[{agent_name}] {message}", flush=True)
 
 
 def _log_stage_once(agent_name: str | None, seen: set[str], stage: str, message: str) -> None:
@@ -46,6 +113,28 @@ def _periodic_progress(agent_name: str, last_logged_at: float, message: str, *, 
         _log_progress(agent_name, message)
         return now
     return last_logged_at
+
+
+def _auth_model_trace_logger(agent_name: str, flow_name: str, progress_label: str | None) -> tuple[Callable[[str], None], Path]:
+    debug_dir = state_root() / "debug" / agent_name
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = int(time.time())
+    slug = re.sub(r"[^a-z0-9]+", "-", flow_name.lower()).strip("-") or "auth-model"
+    trace_path = debug_dir / f"{timestamp}-{slug}.auth-model.log"
+    with _LOG_LOCK:
+        trace_path.write_text(f"agent={agent_name}\nflow={flow_name}\n", encoding="utf-8")
+
+    if progress_label is not None:
+        _log_progress(progress_label, f"auth model trace: {trace_path}")
+
+    def logger(message: str) -> None:
+        with _LOG_LOCK:
+            if progress_label is not None:
+                _log_progress(progress_label, message)
+            with trace_path.open("a", encoding="utf-8") as handle:
+                handle.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {message}\n")
+
+    return logger, trace_path
 
 
 def specs_by_name() -> dict[str, AgentSpec]:
@@ -74,8 +163,15 @@ def resolve_credentials(agent_names: list[str]) -> list[AgentCredentials]:
     return credentials
 
 
-def run_auto_login(credentials: list[AgentCredentials], headed: bool = False, timeout_seconds: int = 180) -> None:
+def run_auto_login(
+    credentials: list[AgentCredentials],
+    headed: bool = False,
+    timeout_seconds: int = 180,
+    *,
+    max_parallel: int = 4,
+) -> None:
     apply_node_warning_suppression()
+    apply_playwright_browser_path()
     try:
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError as exc:
@@ -84,17 +180,151 @@ def run_auto_login(credentials: list[AgentCredentials], headed: bool = False, ti
             "and `python3 -m playwright install chromium` first."
         ) from exc
 
-    with sync_playwright() as playwright:
-        total = len(credentials)
+    if max_parallel < 1:
+        raise RuntimeError("max_parallel must be at least 1")
+
+    total = len(credentials)
+    failures: list[tuple[int, str, str, str]] = []
+    max_workers = min(max_parallel, total) if total else 0
+    engine_limits = {engine: _engine_parallel_limit(engine, max_parallel) for engine in {credential.spec.engine for credential in credentials}}
+
+    def run_one(credential: AgentCredentials) -> None:
+        for attempt in range(1, LOGIN_ERROR_RETRY_ATTEMPTS + 1):
+            try:
+                with sync_playwright() as playwright:
+                    if credential.spec.role == "claude-worker":
+                        _login_claude_one(playwright, credential, timeout_seconds, headed=headed)
+                    else:
+                        _login_codex_one(playwright, credential, timeout_seconds, headed=headed)
+                return
+            except NoAuthLoginError:
+                raise
+            except RetryableLoginError as exc:
+                if attempt >= LOGIN_ERROR_RETRY_ATTEMPTS:
+                    raise RetryableLoginError(str(exc)) from exc
+                _log_progress(
+                    credential.spec.name,
+                    f"retryable login error; retrying in {LOGIN_ERROR_RETRY_DELAY_SECONDS}s "
+                    f"(attempt {attempt + 1}/{LOGIN_ERROR_RETRY_ATTEMPTS}): {exc}",
+                )
+                _reset_login_attempt_state(credential.spec.name)
+                time.sleep(LOGIN_ERROR_RETRY_DELAY_SECONDS)
+            except Exception as exc:
+                if attempt >= LOGIN_ERROR_RETRY_ATTEMPTS:
+                    raise RetryableLoginError(str(exc).strip() or exc.__class__.__name__) from exc
+                _log_progress(
+                    credential.spec.name,
+                    f"unexpected login error; retrying in {LOGIN_ERROR_RETRY_DELAY_SECONDS}s "
+                    f"(attempt {attempt + 1}/{LOGIN_ERROR_RETRY_ATTEMPTS}): {exc}",
+                )
+                _reset_login_attempt_state(credential.spec.name)
+                time.sleep(LOGIN_ERROR_RETRY_DELAY_SECONDS)
+
+    def record_failure(index: int, credential: AgentCredentials, exc: BaseException) -> None:
+        message = str(exc).strip() or exc.__class__.__name__
+        kind = _login_failure_kind(exc)
+        failures.append((index, credential.spec.name, kind, message))
+        _log_progress(credential.spec.name, f"login failed [{kind}]: {message}")
+
+    if max_workers <= 1:
         for index, credential in enumerate(credentials, start=1):
             print(
                 f"auto-login {index}/{total}: {credential.spec.name} "
                 f"({credential.spec.engine}, {credential.spec.account_email})"
             )
-            if credential.spec.role == "claude-worker":
-                _login_claude_one(playwright, credential, timeout_seconds, headed=headed)
-            else:
-                _login_codex_one(playwright, credential, timeout_seconds, headed=headed)
+            try:
+                run_one(credential)
+            except Exception as exc:
+                record_failure(index, credential, exc)
+    else:
+        remaining: list[tuple[int, AgentCredentials]] = list(enumerate(credentials, start=1))
+        pending: dict[Future[None], tuple[int, AgentCredentials]] = {}
+        active_by_engine: dict[str, int] = {}
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="multishell-auth") as executor:
+            while remaining or pending:
+                while remaining and len(pending) < max_workers:
+                    deferred: list[tuple[int, AgentCredentials]] = []
+                    submitted = False
+                    for index, credential in remaining:
+                        engine = credential.spec.engine
+                        if active_by_engine.get(engine, 0) >= engine_limits.get(engine, max_parallel):
+                            deferred.append((index, credential))
+                            continue
+                        print(
+                            f"auto-login {index}/{total}: {credential.spec.name} "
+                            f"({credential.spec.engine}, {credential.spec.account_email})"
+                        )
+                        pending[executor.submit(run_one, credential)] = (index, credential)
+                        active_by_engine[engine] = active_by_engine.get(engine, 0) + 1
+                        submitted = True
+                        deferred.extend(remaining[remaining.index((index, credential)) + 1 :])
+                        remaining = deferred
+                        break
+                    if not submitted:
+                        break
+                done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                for future in done:
+                    index, credential = pending.pop(future)
+                    engine = credential.spec.engine
+                    active_by_engine[engine] = max(0, active_by_engine.get(engine, 1) - 1)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        record_failure(index, credential, exc)
+
+    if failures:
+        lines = ["auto-login completed with failures:"]
+        for _index, agent_name, kind, message in sorted(failures):
+            lines.append(f"- {agent_name} [{kind}]: {message}")
+        raise RuntimeError("\n".join(lines))
+
+
+def _engine_parallel_limit(engine: str, max_parallel: int) -> int:
+    if engine == "codex":
+        return 1
+    return max_parallel
+
+
+def _reset_login_attempt_state(agent_name: str) -> None:
+    for path in (
+        auth_path(agent_name),
+        claude_auth_path(agent_name),
+        claude_root_auth_path(agent_name),
+    ):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            continue
+        except Exception:
+            continue
+
+    profile_dir = state_root() / "browser-profiles" / agent_name
+    if profile_dir.exists():
+        _cleanup_stale_chrome_profile(profile_dir)
+        try:
+            shutil.rmtree(profile_dir)
+        except Exception:
+            pass
+
+
+def _login_failure_kind(exc: BaseException) -> str:
+    if isinstance(exc, NoAuthLoginError):
+        return "no_auth"
+    return "error"
+
+
+def _raise_auth_model_exception(flow_label: str, exc: Exception, logger: Callable[[str], None] | None = None) -> None:
+    if isinstance(exc, AuthModelFailure):
+        if logger is not None:
+            logger(f"auth model failed the {flow_label} flow ({exc}) failure_kind={exc.failure_kind}")
+        if exc.failure_kind == "no_auth":
+            raise NoAuthLoginError(str(exc)) from exc
+        raise RetryableLoginError(str(exc)) from exc
+    if isinstance(exc, AuthModelUnavailable):
+        raise RetryableLoginError(f"auth model unavailable for {flow_label} flow: {exc}") from exc
+    if isinstance(exc, AuthModelProtocolError):
+        raise RetryableLoginError(f"auth model returned unusable output for {flow_label} flow: {exc}") from exc
+    raise RuntimeError(str(exc).strip() or exc.__class__.__name__) from exc
 
 
 def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
@@ -111,6 +341,29 @@ def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_s
         env = suppress_node_warnings(os.environ.copy())
         env["HOME"] = str(agent_home(credential.spec.name))
         _log_progress(agent_name, "starting `codex login --device-auth`")
+        child, url, device_code = _start_codex_device_auth(agent_name, env)
+        _log_progress(agent_name, f"received device code {device_code}; launching browser")
+        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=agent_name) as (browser, context, page):
+            try:
+                _log_progress(agent_name, "browser ready; completing Google/OpenAI sign-in")
+                _complete_openai_google_sign_in(page, url, device_code, credential, progress_label=agent_name)
+                _log_progress(agent_name, "waiting for Codex auth.json to be created")
+                _wait_for_codex_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+            except Exception as exc:
+                raise _enrich_login_error(exc, page, credential.spec.name) from exc
+        _log_progress(agent_name, "Codex login complete")
+    except RuntimeError:
+        raise
+    except Exception as exc:
+        raise RuntimeError(str(exc).strip() or exc.__class__.__name__) from exc
+    finally:
+        if child is not None and child.isalive():
+            child.terminate(force=True)
+
+
+def _start_codex_device_auth(agent_name: str, env: dict[str, str], *, max_attempts: int = 3) -> tuple[pexpect.spawn, str, str]:
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
         child = pexpect.spawn(
             "codex",
             ["login", "--device-auth"],
@@ -118,26 +371,28 @@ def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_s
             encoding="utf-8",
             timeout=30,
         )
+        output = _collect_child_output(child, seconds=5)
         try:
-            output = child.read_nonblocking(size=4096, timeout=2)
-        except Exception:
-            output = ""
-
-        url, device_code = _extract_device_flow(output)
-        _log_progress(agent_name, f"received device code {device_code}; launching browser")
-        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=agent_name) as (browser, context, page):
-            _log_progress(agent_name, "browser ready; completing Google/OpenAI sign-in")
-            _complete_openai_google_sign_in(page, url, device_code, credential, progress_label=agent_name)
-            _log_progress(agent_name, "waiting for Codex auth.json to be created")
-            _wait_for_codex_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
-        _log_progress(agent_name, "Codex login complete")
-    except Exception:
-        if page is not None:
-            _write_debug_artifacts(page, credential.spec.name)
-        raise
-    finally:
-        if child is not None and child.isalive():
-            child.terminate(force=True)
+            url, device_code = _extract_device_flow(output)
+            return child, url, device_code
+        except CodexDeviceAuthRateLimit as exc:
+            last_error = exc
+            if child.isalive():
+                child.terminate(force=True)
+            if attempt >= max_attempts:
+                break
+            delay_seconds = min(30, attempt * 10)
+            _log_progress(
+                agent_name,
+                f"codex device-auth hit a rate limit; retrying in {delay_seconds}s (attempt {attempt + 1}/{max_attempts})",
+            )
+            time.sleep(delay_seconds)
+        except Exception as exc:
+            if child.isalive():
+                child.terminate(force=True)
+            raise RetryableLoginError(str(exc).strip() or exc.__class__.__name__) from exc
+    detail = str(last_error).strip() if last_error is not None else "rate limited"
+    raise RetryableLoginError(f"codex device-auth hit OpenAI rate limits after {max_attempts} attempts: {detail}")
 
 
 def _ensure_home(agent_name: str) -> None:
@@ -179,19 +434,22 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
         _log_progress(agent_name, "waiting for Claude local callback URL")
         auth_url = _wait_for_claude_local_callback_url(child.pid, manual_url, timeout_seconds=10, progress_label=agent_name) or manual_url
         _log_progress(agent_name, "launching browser for Claude/Google sign-in")
-        with _isolated_chrome(playwright, credential_source_agent(credential.spec.name), headed=headed, progress_label=agent_name) as (browser, context, page):
-            _log_progress(agent_name, "browser ready; completing Claude/Google sign-in")
-            callback_code = _complete_claude_google_sign_in(page, auth_url, credential, progress_label=agent_name)
-            if callback_code:
-                _log_progress(agent_name, "received Claude callback code; sending it back to the CLI")
-                child.sendline(callback_code)
-            _log_progress(agent_name, "waiting for Claude auth status to become logged in")
-            _wait_for_claude_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=agent_name) as (browser, context, page):
+            try:
+                _log_progress(agent_name, "browser ready; completing Claude/Google sign-in")
+                callback_code = _complete_claude_google_sign_in(page, auth_url, credential, progress_label=agent_name)
+                if callback_code:
+                    _log_progress(agent_name, "received Claude callback code; sending it back to the CLI")
+                    child.sendline(callback_code)
+                _log_progress(agent_name, "waiting for Claude auth status to become logged in")
+                _wait_for_claude_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+            except Exception as exc:
+                raise _enrich_login_error(exc, page, credential.spec.name) from exc
         _log_progress(agent_name, "Claude login complete")
-    except Exception:
-        if page is not None:
-            _write_debug_artifacts(page, credential.spec.name)
+    except RuntimeError:
         raise
+    except Exception as exc:
+        raise RuntimeError(str(exc).strip() or exc.__class__.__name__) from exc
     finally:
         if child is not None and child.isalive():
             child.terminate(force=True)
@@ -200,6 +458,8 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
 def _extract_device_flow(output: str) -> tuple[str, str]:
     ansi_re = re.compile(r"\x1b\[[0-9;]*m")
     clean = ansi_re.sub("", output)
+    if "429 Too Many Requests" in clean or "rate limit" in clean.lower():
+        raise CodexDeviceAuthRateLimit(_truncate_output(clean))
     url_match = re.search(r"https://auth\.openai\.com/codex/device", clean)
     code_match = re.search(r"\b([A-Z0-9]{4}-[A-Z0-9]{5})\b", clean)
     if not url_match or not code_match:
@@ -225,6 +485,13 @@ def _collect_child_output(child: pexpect.spawn, seconds: int) -> str:
         if chunk:
             chunks.append(chunk)
     return "".join(chunks)
+
+
+def _truncate_output(text: str, *, limit: int = 240) -> str:
+    compact = " ".join(text.split())
+    if len(compact) <= limit:
+        return compact
+    return f"{compact[: limit - 3]}..."
 
 
 def _wait_for_claude_local_callback_url(
@@ -313,111 +580,64 @@ def _complete_claude_google_sign_in(
         except Exception:
             pass
 
-    deadline = time.time() + 180
+    auth_model_logger, _trace_path = _auth_model_trace_logger(credential.spec.name, "claude-google", progress_label)
+    try:
+        drive_google_auth_with_model(
+            flow_page,
+            flow_label="claude/google",
+            account_email=credential.spec.account_email,
+            password=credential.password,
+            logger=auth_model_logger,
+        )
+    except AuthModelFailure as exc:
+        _raise_auth_model_exception("Claude/Google", exc, auth_model_logger)
+    except (AuthModelUnavailable, AuthModelProtocolError) as exc:
+        _raise_auth_model_exception("Claude/Google", exc, auth_model_logger)
+
+    deadline = time.time() + 20
     last_progress = 0.0
-    seen_stages: set[str] = set()
     while time.time() < deadline:
         flow_page = _preferred_claude_auth_page(flow_page)
+        try:
+            snapshot = capture_auth_snapshot(flow_page)
+        except Exception:
+            snapshot = None
+        if snapshot is not None and snapshot_requires_model(snapshot):
+            auth_model_logger(
+                "Claude auth handoff still has interactive auth controls; re-entering auth model drive "
+                f"({snapshot.get('url') or ''})"
+            )
+            try:
+                drive_google_auth_with_model(
+                    flow_page,
+                    flow_label="claude/google",
+                    account_email=credential.spec.account_email,
+                    password=credential.password,
+                    logger=auth_model_logger,
+                )
+            except AuthModelFailure as exc:
+                _raise_auth_model_exception("Claude/Google", exc, auth_model_logger)
+            except (AuthModelUnavailable, AuthModelProtocolError) as exc:
+                _raise_auth_model_exception("Claude/Google", exc, auth_model_logger)
+            continue
         body = _body_text(flow_page)
-        title = _page_title(flow_page)
-        email_visible = _has_visible(
-            flow_page,
-            ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
-            timeout_ms=1000,
-        )
-        password_visible = _has_visible(
-            flow_page,
-            ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
-            timeout_ms=1000,
-        )
-        account_picker_visible = (
-            "Choose an account" in body
-            or _has_visible(flow_page, ["text=Use another account"], timeout_ms=1000)
-        )
         if progress_label is not None:
             last_progress = _periodic_progress(
                 progress_label,
                 last_progress,
-                f"waiting for Claude/Google auth flow: {_describe_auth_surface(flow_page, body=body, title=title)}",
+                f"waiting for Claude auth handoff: {_describe_auth_surface(flow_page, body=body, title=_page_title(flow_page))}",
+                interval_seconds=5.0,
             )
-
         if _claude_logged_in(credential.spec.name):
             return None
-
         callback_code = _extract_claude_callback_code(body)
         if callback_code:
             return callback_code
+        if "platform.claude.com/oauth/code/success" in getattr(flow_page, "url", "") or "You’re all set up for Claude Code" in body or "You're all set up for Claude Code" in body:
+            return None
+        time.sleep(0.5)
 
-        if email_visible:
-            _log_stage_once(progress_label, seen_stages, "email", f"email field visible; entering {credential.spec.account_email}")
-            _fill_first(
-                flow_page,
-                ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
-                credential.spec.account_email,
-            )
-            _click_first(flow_page, ["#identifierNext", "button:has-text('Next')"])
-            time.sleep(1)
-            continue
-
-        if password_visible:
-            _log_stage_once(progress_label, seen_stages, "password", "password field visible; submitting password")
-            _fill_first(
-                flow_page,
-                ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
-                credential.password,
-            )
-            _click_first(flow_page, ["#passwordNext", "button:has-text('Next')"])
-            time.sleep(1)
-            continue
-
-        if account_picker_visible and _has_visible(
-            flow_page,
-            [f"text={credential.spec.account_email}", "text=Use another account"],
-            timeout_ms=1000,
-        ):
-            _log_stage_once(progress_label, seen_stages, "choose-account", "Google account chooser visible; selecting the configured email")
-            account = flow_page.locator(f"text={credential.spec.account_email}").first
-            try:
-                account.click(timeout=3000)
-                time.sleep(1)
-                continue
-            except Exception:
-                pass
-
-        if "Select organization" in body or "Logged in as" in body:
-            _log_stage_once(progress_label, seen_stages, "organization", "Claude organization chooser visible; selecting an org")
-            if _click_claude_organization_option(flow_page):
-                time.sleep(1)
-                continue
-
-        _click_optional(
-            flow_page,
-            [
-                "button:has-text('Continue')",
-                "button:has-text('Allow')",
-                "button:has-text('Authorize')",
-                "button:has-text('Accept')",
-                "button:has-text('Open Claude')",
-            ],
-        )
-
-        if account_picker_visible and credential.spec.account_email in body:
-            time.sleep(1)
-            continue
-
-        if title == "Just a moment..." or "Just a moment..." in body:
-            _log_stage_once(progress_label, seen_stages, "just-a-moment", "Google interstitial visible; waiting for it to clear")
-            time.sleep(2)
-            continue
-
-        if "This browser or app may not be secure" in body:
-            _log_stage_once(progress_label, seen_stages, "browser-not-secure", "Google rejected the browser session as not secure")
-            time.sleep(2)
-            continue
-
-        time.sleep(1)
-
-    raise RuntimeError(f"timed out completing Claude auth flow at {flow_page.url!r} with title={_page_title(flow_page)!r}")
+    raise RuntimeError(f"timed out waiting for Claude auth handoff at {flow_page.url!r} with title={_page_title(flow_page)!r}")
 
 
 def _preferred_claude_auth_page(page: object) -> object:
@@ -517,7 +737,19 @@ def _click_google_and_capture_page(page: object) -> object:
 
 
 def _normalize_openai_login_entry(page: object) -> None:
-    _wait_for_live_login_surface(page, timeout_seconds=30)
+    try:
+        _wait_for_live_login_surface(page, timeout_seconds=30)
+    except RuntimeError:
+        body = _body_text(page)
+        title = _page_title(page)
+        url = getattr(page, "url", "")
+        if "auth.openai.com" in url and (
+            title == "Just a moment..."
+            or "Performing security verification" in body
+            or "This website uses a security service to protect against malicious bots" in body
+        ):
+            return
+        raise
     body = _body_text(page)
     if "Your session has ended" in body and _has_visible(page, ["text=Log in"], timeout_ms=5000):
         page.locator("text=Log in").first.click()
@@ -534,114 +766,20 @@ def _advance_auth_flow(
     *,
     progress_label: str | None = None,
 ) -> None:
-    deadline = time.time() + 180
-    last_progress = 0.0
-    seen_stages: set[str] = set()
-    while time.time() < deadline:
-        body = _body_text(page)
-        title = _page_title(page)
-        google_visible = _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=1000)
-        email_visible = _has_visible(
+    auth_model_logger, _trace_path = _auth_model_trace_logger(credential.spec.name, "codex-google", progress_label)
+    try:
+        drive_google_auth_with_model(
             page,
-            ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
-            timeout_ms=1000,
+            flow_label="codex/google",
+            account_email=credential.spec.account_email,
+            password=credential.password,
+            device_code=device_code,
+            logger=auth_model_logger,
         )
-        password_visible = _has_visible(
-            page,
-            ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
-            timeout_ms=1000,
-        )
-        device_code_visible = _has_visible(
-            page,
-            ["input[name*=code]", "input[autocomplete='one-time-code']", "input[inputmode='numeric']"],
-            timeout_ms=1000,
-        )
-        if progress_label is not None:
-            last_progress = _periodic_progress(
-                progress_label,
-                last_progress,
-                f"waiting for OpenAI/Google auth flow: {_describe_auth_surface(page, body=body, title=title)}",
-            )
-
-        if not body and not title:
-            time.sleep(0.5)
-            continue
-
-        if google_visible:
-            _log_stage_once(progress_label, seen_stages, "google-button", "Continue with Google button visible; opening Google sign-in")
-            _click_google_and_capture_page(page)
-            time.sleep(1)
-            continue
-
-        if email_visible:
-            _log_stage_once(progress_label, seen_stages, "email", f"email field visible; entering {credential.spec.account_email}")
-            _fill_first(
-                page,
-                ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
-                credential.spec.account_email,
-            )
-            _click_first(page, ["#identifierNext", "button:has-text('Next')"])
-            time.sleep(1)
-            continue
-
-        if password_visible:
-            _log_stage_once(progress_label, seen_stages, "password", "password field visible; submitting password")
-            _fill_first(
-                page,
-                ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
-                credential.password,
-            )
-            _click_first(page, ["#passwordNext", "button:has-text('Next')"])
-            time.sleep(1)
-            continue
-
-        if "Use your device code to grant access to Codex CLI" in body:
-            _log_stage_once(progress_label, seen_stages, "device-code", f"device code prompt visible; entering {device_code}")
-            _enter_device_code(page, device_code)
-            _click_enabled_continue(page)
-            return
-
-        if "/deviceauth/callback" in page.url and page.locator("input:visible").count() >= 1:
-            _log_stage_once(progress_label, seen_stages, "device-code", f"device code callback form visible; entering {device_code}")
-            _enter_device_code(page, device_code)
-            _click_enabled_continue(page)
-            return
-
-        if device_code_visible:
-            _log_stage_once(progress_label, seen_stages, "device-code", f"code input visible; entering {device_code}")
-            _enter_device_code(page, device_code)
-            _click_enabled_continue(page)
-            return
-
-        if "Sign in to Codex with ChatGPT" in body or "Select a workspace" in body:
-            _log_stage_once(progress_label, seen_stages, "workspace", "OpenAI workspace consent visible; confirming workspace")
-            _complete_workspace_consent(page)
-            time.sleep(1)
-            continue
-
-        if "Just a moment..." in body or title == "Just a moment...":
-            _log_stage_once(progress_label, seen_stages, "just-a-moment", "interstitial visible; waiting for it to clear")
-            time.sleep(2)
-            continue
-
-        if "This browser or app may not be secure" in body:
-            _log_stage_once(progress_label, seen_stages, "browser-not-secure", "Google rejected the browser session as not secure")
-            time.sleep(2)
-            continue
-
-        if "Couldn’t sign you in" in body or "Couldn't sign you in" in body:
-            _log_stage_once(progress_label, seen_stages, "signin-error", "Google sign-in error page detected")
-            time.sleep(2)
-            continue
-
-        if not body:
-            time.sleep(1)
-            continue
-
-        # Let navigations settle; OpenAI bounces through several pages after Google auth.
-        time.sleep(1)
-
-    raise RuntimeError(f"timed out completing auth flow at {page.url!r} with title={_page_title(page)!r}")
+    except AuthModelFailure as exc:
+        _raise_auth_model_exception("Codex/Google", exc, auth_model_logger)
+    except (AuthModelUnavailable, AuthModelProtocolError) as exc:
+        _raise_auth_model_exception("Codex/Google", exc, auth_model_logger)
 
 
 def _complete_workspace_consent(page: object) -> None:
@@ -667,6 +805,143 @@ def _complete_workspace_consent(page: object) -> None:
         time.sleep(0.5)
 
     raise RuntimeError(f"workspace Continue button stayed disabled at {page.url!r}")
+
+
+def _advance_google_form_step(
+    page: object,
+    *,
+    step_name: str,
+    field_selectors: list[str],
+    value: str,
+    next_selectors: list[str],
+    progress_label: str | None = None,
+    submitted_value: str | None = None,
+    hide_value: bool = False,
+) -> None:
+    _fill_first(page, field_selectors, value)
+    if _submit_google_form_step(
+        page,
+        step_name=step_name,
+        next_selectors=next_selectors,
+        progress_label=progress_label,
+        submitted_value=submitted_value,
+        hide_value=hide_value,
+    ):
+        return
+
+    if progress_label is not None:
+        _log_progress(progress_label, f"{step_name} step did not advance after a normal submit; retrying with typed input")
+    _type_first(page, field_selectors, value)
+    if _submit_google_form_step(
+        page,
+        step_name=step_name,
+        next_selectors=next_selectors,
+        progress_label=progress_label,
+        submitted_value=submitted_value,
+        hide_value=hide_value,
+    ):
+        return
+
+    error_text = _google_inline_error(page)
+    raise RuntimeError(_format_google_step_error(step_name, submitted_value, error_text, hide_value=hide_value))
+
+
+def _submit_google_form_step(
+    page: object,
+    *,
+    step_name: str,
+    next_selectors: list[str],
+    progress_label: str | None = None,
+    submitted_value: str | None = None,
+    hide_value: bool = False,
+) -> bool:
+    actions = [
+        ("clicking the Google Next button", lambda: _click_first(page, next_selectors)),
+        ("pressing Enter", lambda: page.keyboard.press("Enter")),
+    ]
+    for index, (description, action) in enumerate(actions, start=1):
+        try:
+            action()
+        except Exception:
+            pass
+        if _wait_for_google_step_transition(page, step_name):
+            return True
+        error_text = _google_inline_error(page)
+        if error_text:
+            raise RuntimeError(_format_google_step_error(step_name, submitted_value, error_text, hide_value=hide_value))
+        if progress_label is not None and index < len(actions):
+            _log_progress(progress_label, f"{step_name} step did not advance after {description}; retrying")
+    return False
+
+
+def _wait_for_google_step_transition(page: object, step_name: str, timeout_seconds: int = 6) -> bool:
+    deadline = time.time() + timeout_seconds
+    while time.time() < deadline:
+        body = _body_text(page)
+        if step_name == "email":
+            if _visible_now(page, GOOGLE_PASSWORD_SELECTORS):
+                return True
+            if _visible_now(page, GOOGLE_CODE_SELECTORS):
+                return True
+            if "Choose an account" in body or "Use another account" in body:
+                return True
+            if "Select a workspace" in body or "Sign in to Codex with ChatGPT" in body:
+                return True
+            if not _visible_now(page, GOOGLE_EMAIL_SELECTORS):
+                return True
+        elif step_name == "password":
+            if _visible_now(page, GOOGLE_CODE_SELECTORS):
+                return True
+            if "Select a workspace" in body or "Sign in to Codex with ChatGPT" in body:
+                return True
+            if "/deviceauth/callback" in getattr(page, "url", ""):
+                return True
+            if not _visible_now(page, GOOGLE_PASSWORD_SELECTORS):
+                return True
+        else:
+            return True
+        time.sleep(0.25)
+    return False
+
+
+def _google_inline_error(page: object) -> str | None:
+    body = " ".join(_body_text(page).split())
+    for snippet in GOOGLE_ERROR_SNIPPETS:
+        if snippet in body:
+            return snippet
+    return None
+
+
+def _raise_if_google_error(page: object, account_email: str) -> None:
+    error_text = _google_inline_error(page)
+    if not error_text:
+        return
+    if error_text in GOOGLE_MANUAL_CHALLENGE_SNIPPETS:
+        raise RuntimeError(f"Google requires manual verification and cannot be automated here: {error_text}")
+    if error_text == "This browser or app may not be secure":
+        raise RuntimeError("Google rejected the browser session as not secure")
+    if _visible_now(page, GOOGLE_PASSWORD_SELECTORS):
+        raise RuntimeError(_format_google_step_error("password", None, error_text, hide_value=True))
+    if _visible_now(page, GOOGLE_EMAIL_SELECTORS):
+        raise RuntimeError(_format_google_step_error("email", account_email, error_text))
+    if _visible_now(page, GOOGLE_CODE_SELECTORS):
+        raise RuntimeError(_format_google_step_error("device-code", None, error_text))
+    raise RuntimeError(f"Google rejected the sign-in flow: {error_text}")
+
+
+def _format_google_step_error(
+    step_name: str,
+    submitted_value: str | None,
+    error_text: str | None,
+    *,
+    hide_value: bool = False,
+) -> str:
+    detail = error_text or "Google kept the step open without returning a clearer error"
+    if step_name == "email" and submitted_value and not hide_value:
+        return f"Google rejected the configured email {submitted_value!r}: {detail}"
+    if step_name == "password":
+        return f"Google rejected the configured password or requested extra verification: {detail}"
+    return f"Google rejected the {step_name} step: {detail}"
 
 
 def _click_first_workspace_option(page: object) -> bool:
@@ -773,32 +1048,60 @@ def _continue_enabled(page: object) -> bool:
         return False
 
 
+def _build_chrome_command(chrome_binary: str, profile_dir: Path, port: int, *, headed: bool) -> list[str]:
+    version = _browser_product_version(chrome_binary) or "145.0.0.0"
+    user_agent = (
+        "Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        f"Chrome/{version} Safari/537.36"
+    )
+    command = [
+        chrome_binary,
+        f"--user-data-dir={profile_dir}",
+        f"--remote-debugging-port={port}",
+        f"--user-agent={user_agent}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--start-maximized",
+        "--disable-background-networking",
+        "--disable-blink-features=AutomationControlled",
+        "--disable-dev-shm-usage",
+        "--disable-sync",
+        "--lang=en-US,en",
+        "--window-size=1366,768",
+    ]
+    if not headed:
+        command.extend(
+            [
+                "--headless=new",
+                "--disable-gpu",
+            ]
+        )
+    command.append("about:blank")
+    return command
+
+
+def _browser_product_version(chrome_binary: str) -> str:
+    try:
+        output = subprocess.check_output([chrome_binary, "--product-version"], text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        output = ""
+    if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", output):
+        return ""
+    return output
+
+
 @contextmanager
 def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress_label: str | None = None):
-    chrome_binary = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
-    if chrome_binary is None:
-        raise RuntimeError("google-chrome is not installed")
+    chrome_binary = _resolve_browser_binary(playwright)
+    if progress_label is not None:
+        _log_progress(progress_label, f"launching browser binary {chrome_binary}")
 
     profile_dir = state_root() / "browser-profiles" / agent_name
     profile_dir.mkdir(parents=True, exist_ok=True)
     _cleanup_stale_chrome_profile(profile_dir)
     port = _reserve_port()
-
-    command = [
-        chrome_binary,
-        f"--user-data-dir={profile_dir}",
-        f"--remote-debugging-port={port}",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--start-maximized",
-        "--disable-background-networking",
-        "--disable-dev-shm-usage",
-        "--disable-sync",
-        "--window-size=1366,768",
-        "about:blank",
-    ]
-    if not headed or not os.environ.get("DISPLAY"):
-        command = ["xvfb-run", "-a", *command]
+    command = _build_chrome_command(chrome_binary, profile_dir, port, headed=headed)
 
     process = subprocess.Popen(
         command,
@@ -835,6 +1138,26 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
                 os.killpg(process.pid, signal.SIGKILL)
             except Exception:
                 pass
+
+
+def _resolve_browser_binary(playwright: object) -> str:
+    override = os.environ.get("MULTISHELL_BROWSER_BINARY", "").strip()
+    if override:
+        if Path(override).exists():
+            return override
+        raise RuntimeError(f"configured browser binary does not exist: {override}")
+
+    bundled = getattr(getattr(playwright, "chromium", None), "executable_path", "")
+    if callable(bundled):
+        bundled = bundled()
+    bundled_path = str(bundled or "").strip()
+    if bundled_path and Path(bundled_path).exists():
+        return bundled_path
+
+    system_chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+    if system_chrome:
+        return system_chrome
+    raise RuntimeError("no browser binary is available; run `multishell install-browser` first")
 
 
 def _cleanup_stale_chrome_profile(profile_dir: Path) -> None:
@@ -1006,12 +1329,12 @@ def _wait_for_codex_auth(
         if not child.isalive():
             if auth_path(agent_name).exists():
                 return
-            raise RuntimeError(f"codex login exited before auth.json was created for {agent_name}")
+            raise RetryableLoginError(f"codex login exited before auth.json was created for {agent_name}")
         if progress_label is not None:
             last_progress = _periodic_progress(progress_label, last_progress, "still waiting for Codex auth.json")
         time.sleep(1)
     child.terminate(force=True)
-    raise RuntimeError(f"timed out waiting for codex login to finish for {agent_name}")
+    raise RetryableLoginError(f"timed out waiting for codex login to finish for {agent_name}")
 
 
 def _wait_for_claude_auth(
@@ -1030,12 +1353,12 @@ def _wait_for_claude_auth(
         if not child.isalive():
             if _claude_logged_in(agent_name):
                 return
-            raise RuntimeError(f"claude auth login exited before auth completed for {agent_name}")
+            raise RetryableLoginError(f"claude auth login exited before auth completed for {agent_name}")
         if progress_label is not None:
             last_progress = _periodic_progress(progress_label, last_progress, "still waiting for Claude auth status")
         time.sleep(1)
     child.terminate(force=True)
-    raise RuntimeError(f"timed out waiting for Claude auth to finish for {agent_name}")
+    raise RetryableLoginError(f"timed out waiting for Claude auth to finish for {agent_name}")
 
 
 def _claude_logged_in(agent_name: str) -> bool:
@@ -1082,6 +1405,28 @@ def _fill_first(page: object, selectors: list[str], value: str) -> None:
                 continue
     raise RuntimeError(
         f"unable to fill any selector from {selectors}; title={_page_title(page)!r}; url={page.url!r}; body={_body_text(page)[:240]!r}"
+    )
+
+
+def _type_first(page: object, selectors: list[str], value: str) -> None:
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            count = locator.count()
+        except Exception:
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=7000)
+                candidate.click()
+                page.keyboard.press("Control+A")
+                page.keyboard.type(value, delay=20)
+                return
+            except Exception:
+                continue
+    raise RuntimeError(
+        f"unable to type into any selector from {selectors}; title={_page_title(page)!r}; url={page.url!r}; body={_body_text(page)[:240]!r}"
     )
 
 
@@ -1171,22 +1516,48 @@ def _page_title(page: object) -> str:
         return ""
 
 
-def _write_debug_artifacts(page: object, agent_name: str) -> None:
+def _enrich_login_error(exc: Exception, page: object | None, agent_name: str) -> RuntimeError:
+    message = str(exc).strip() or exc.__class__.__name__
+    if page is None:
+        return _wrap_login_error(exc, message)
+    debug_dir = _write_debug_artifacts(page, agent_name)
+    _log_progress(agent_name, f"debug artifacts: {debug_dir}")
+    return _wrap_login_error(exc, f"{message} (debug: {debug_dir})")
+
+
+def _wrap_login_error(exc: Exception, message: str) -> RuntimeError:
+    if isinstance(exc, NoAuthLoginError):
+        return NoAuthLoginError(message)
+    if isinstance(exc, RetryableLoginError):
+        return RetryableLoginError(message)
+    return RetryableLoginError(message)
+
+
+def _write_debug_artifacts(page: object, agent_name: str) -> Path:
     debug_dir = state_root() / "debug" / agent_name
     debug_dir.mkdir(parents=True, exist_ok=True)
     timestamp = int(time.time())
     screenshot_path = debug_dir / f"{timestamp}.png"
     html_path = debug_dir / f"{timestamp}.html"
     meta_path = debug_dir / f"{timestamp}.txt"
+    meta_lines: list[str] = []
     try:
         page.screenshot(path=str(screenshot_path), full_page=True)
-    except Exception:
-        pass
+        meta_lines.append(f"screenshot={screenshot_path.name}")
+    except Exception as exc:
+        meta_lines.append(f"screenshot_error={exc}")
     try:
         html_path.write_text(page.content(), encoding="utf-8")
-    except Exception:
-        pass
+        meta_lines.append(f"html={html_path.name}")
+    except Exception as exc:
+        meta_lines.append(f"html_error={exc}")
     try:
-        meta_path.write_text(f"url={page.url}\ntitle={page.title()}\n", encoding="utf-8")
-    except Exception:
-        pass
+        meta_lines.append(f"url={page.url}")
+    except Exception as exc:
+        meta_lines.append(f"url_error={exc}")
+    try:
+        meta_lines.append(f"title={page.title()}")
+    except Exception as exc:
+        meta_lines.append(f"title_error={exc}")
+    meta_path.write_text("\n".join(meta_lines) + "\n", encoding="utf-8")
+    return debug_dir
