@@ -673,6 +673,8 @@ def test_build_chrome_command_uses_real_headless_mode(tmp_path) -> None:
     assert command[0] == "/usr/bin/google-chrome"
     assert "--headless=new" in command
     assert "--disable-gpu" in command
+    assert "--no-sandbox" in command
+    assert "--disable-setuid-sandbox" in command
     assert "--disable-blink-features=AutomationControlled" in command
     assert any(arg.startswith("--user-agent=Mozilla/5.0") and " Chrome/" in arg and "HeadlessChrome" not in arg for arg in command)
     assert "about:blank" == command[-1]
@@ -682,6 +684,7 @@ def test_build_chrome_command_can_run_headed_when_requested(tmp_path) -> None:
     command = _build_chrome_command("/usr/bin/google-chrome", tmp_path / "profile", 9222, headed=True)
 
     assert "--headless=new" not in command
+    assert "--no-sandbox" in command
 
 
 class _SecurityInterstitialBody:

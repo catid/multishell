@@ -1050,7 +1050,13 @@ def _continue_enabled(page: object) -> bool:
         return False
 
 
-def _build_chrome_command(chrome_binary: str, profile_dir: Path, port: int, *, headed: bool) -> list[str]:
+def _build_chrome_command(
+    chrome_binary: str,
+    profile_dir: Path,
+    port: int,
+    *,
+    headed: bool,
+) -> list[str]:
     version = _browser_product_version(chrome_binary) or "145.0.0.0"
     user_agent = (
         "Mozilla/5.0 (X11; Linux x86_64) "
@@ -1079,6 +1085,12 @@ def _build_chrome_command(chrome_binary: str, profile_dir: Path, port: int, *, h
                 "--disable-gpu",
             ]
         )
+    command.extend(
+        [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+        ]
+    )
     command.append("about:blank")
     return command
 
@@ -1188,6 +1200,23 @@ def _is_browser_signal_line(line: str) -> bool:
     )
 
 
+def _stop_browser_process(process: subprocess.Popen[str] | None, output_tail: _ProcessOutputTail | None) -> None:
+    if process is not None:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except Exception:
+            pass
+        try:
+            process.wait(timeout=10)
+        except Exception:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except Exception:
+                pass
+    if output_tail is not None:
+        output_tail.join()
+
+
 @contextmanager
 def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress_label: str | None = None):
     chrome_binary = _resolve_browser_binary(playwright)
@@ -1200,25 +1229,27 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
     port = _reserve_port()
     command = _build_chrome_command(chrome_binary, profile_dir, port, headed=headed)
     browser_log_path = _browser_log_path(agent_name)
-
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        env=child_env(os.environ.copy(), role="browser", agent=agent_name),
-        start_new_session=True,
-    )
-    output_tail = _ProcessOutputTail(process.stdout, progress_label=progress_label, log_path=browser_log_path)
+    process = None
+    output_tail = None
     browser = None
 
     try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            env=child_env(os.environ.copy(), role="browser", agent=agent_name),
+            start_new_session=True,
+        )
+        output_tail = _ProcessOutputTail(process.stdout, progress_label=progress_label, log_path=browser_log_path)
         if progress_label is not None:
             _log_progress(
                 progress_label,
-                f"browser launch: pid={process.pid} port={port} headed={'yes' if headed else 'no'} profile={profile_dir}",
+                f"browser launch: pid={process.pid} port={port} headed={'yes' if headed else 'no'} "
+                f"profile={profile_dir} sandbox=off",
             )
             _log_progress(progress_label, f"browser command: {' '.join(shlex.quote(part) for part in command)}")
             _log_progress(progress_label, f"browser log file: {browser_log_path}")
@@ -1242,18 +1273,7 @@ def _isolated_chrome(playwright: object, agent_name: str, headed: bool, progress
                 browser.close()
         except Exception:
             pass
-        try:
-            os.killpg(process.pid, signal.SIGTERM)
-        except Exception:
-            pass
-        try:
-            process.wait(timeout=10)
-        except Exception:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except Exception:
-                pass
-        output_tail.join()
+        _stop_browser_process(process, output_tail)
 
 
 def _browser_log_path(agent_name: str) -> Path:
