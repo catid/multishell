@@ -11,6 +11,7 @@ from multishell.auth_flow_model import (
     DEFAULT_AUTH_MODEL_NAME,
     _extract_json_object,
     _locate_tagged_element,
+    _normalize_auth_action,
     _snapshot_fingerprint,
     _strip_thinking_markup,
     drive_google_auth_with_model,
@@ -555,6 +556,66 @@ def test_drive_google_auth_with_model_detects_repeated_no_progress(monkeypatch) 
     assert any("repeated the same action on the same page state" in line for line in logs)
 
 
+def test_drive_google_auth_with_model_normalizes_stale_fill_into_advance_click(monkeypatch) -> None:
+    logs: list[str] = []
+    actions: list[AuthModelAction] = []
+    snapshots = iter(
+        [
+            {
+                "url": "https://accounts.google.com/v3/signin/challenge/pwd",
+                "title": "Welcome",
+                "body_text": "Enter your password Next",
+                "elements": [
+                    {"id": "ms-auth-passwd", "tag": "input", "type": "password", "ariaLabel": "Enter your password", "filled": True, "focused": True, "disabled": False},
+                    {"id": "ms-auth-next", "tag": "button", "type": "button", "text": "Next", "disabled": False},
+                ],
+            },
+            {
+                "url": "https://accounts.google.com/v3/signin/challenge/pwd",
+                "title": "Welcome",
+                "body_text": "Enter your password Next",
+                "elements": [
+                    {"id": "ms-auth-passwd", "tag": "input", "type": "password", "ariaLabel": "Enter your password", "filled": True, "focused": True, "disabled": False},
+                    {"id": "ms-auth-next", "tag": "button", "type": "button", "text": "Next", "disabled": False},
+                ],
+            },
+            {
+                "url": "https://example.com/done",
+                "title": "Done",
+                "body_text": "Done",
+                "elements": [],
+            },
+            {
+                "url": "https://example.com/done",
+                "title": "Done",
+                "body_text": "Done",
+                "elements": [],
+            },
+        ]
+    )
+
+    monkeypatch.setattr("multishell.auth_flow_model.capture_auth_snapshot", lambda _page: next(snapshots))
+    monkeypatch.setattr(
+        "multishell.auth_flow_model.request_auth_model_decision",
+        lambda *_args, **_kwargs: AuthModelDecision(action=AuthModelAction(action="fill", target="ms-auth-passwd", value_key="password", message="fill password")),
+    )
+    monkeypatch.setattr("multishell.auth_flow_model._wait_for_surface_change", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        "multishell.auth_flow_model._apply_auth_action",
+        lambda _page, action, **_kwargs: actions.append(action),
+    )
+
+    assert drive_google_auth_with_model(
+        object(),
+        flow_label="claude/google",
+        account_email="worker@example.com",
+        password="secret",
+        logger=logs.append,
+    ) is True
+    assert [(action.action, action.target) for action in actions] == [("click", "ms-auth-next")]
+    assert any("auth model normalized action:" in line for line in logs)
+
+
 def test_drive_google_auth_with_model_treats_closed_page_as_navigation_handoff(monkeypatch) -> None:
     logs: list[str] = []
     snapshots = iter(
@@ -999,6 +1060,23 @@ def test_apply_auth_action_uses_visible_device_code_helper(monkeypatch) -> None:
 
     assert seen["value"] == "ABCD-EFGHI"
     assert seen["settled"] is True
+
+
+def test_normalize_auth_action_submits_filled_field_with_enter_when_no_advance_target() -> None:
+    action = _normalize_auth_action(
+        {
+            "url": "https://accounts.google.com/v3/signin/challenge/pwd",
+            "title": "Welcome",
+            "body_text": "Enter your password",
+            "elements": [
+                {"id": "ms-auth-passwd", "tag": "input", "type": "password", "ariaLabel": "Enter your password", "filled": True, "focused": True, "disabled": False},
+            ],
+        },
+        AuthModelAction(action="fill", target="ms-auth-passwd", value_key="password", message="fill password"),
+    )
+
+    assert action.action == "press"
+    assert action.key == "Enter"
 
 
 def test_drive_google_auth_with_model_uses_model_on_account_chooser_and_consent(monkeypatch) -> None:

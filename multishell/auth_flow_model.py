@@ -495,6 +495,14 @@ def drive_google_auth_with_model(
                 logger(f"auth model step {step}: {summarize_action(action)}")
                 if carry_forward:
                     logger(f"auth model carry-forward: {json.dumps(carry_forward, ensure_ascii=True)}")
+        normalized_action = _normalize_auth_action(snapshot, action)
+        if normalized_action != action:
+            if logger is not None:
+                logger(
+                    "auth model normalized action: "
+                    f"{summarize_action(action)} -> {summarize_action(normalized_action)}"
+                )
+            action = normalized_action
 
         if action.action == "done":
             return True
@@ -1141,6 +1149,123 @@ def _coerce_auth_decision(payload: dict[str, object]) -> AuthModelDecision:
         ),
         carry_forward=tuple(carry_forward),
     )
+
+
+def _normalize_auth_action(snapshot: dict[str, object], action: AuthModelAction) -> AuthModelAction:
+    if action.action != "fill":
+        return action
+    target_element = _snapshot_element_by_id(snapshot, action.target)
+    if target_element is None or not _is_text_entry_element(target_element):
+        return action
+    if not bool(target_element.get("filled")):
+        return action
+
+    advance_target = _best_advance_target(snapshot)
+    if advance_target:
+        return AuthModelAction(
+            action="click",
+            target=advance_target,
+            message="advancing from an already-filled field",
+        )
+
+    if bool(target_element.get("focused")):
+        return AuthModelAction(
+            action="press",
+            key="Enter",
+            message="submitting an already-filled field with Enter",
+        )
+
+    return AuthModelAction(
+        action="wait",
+        seconds=0.5,
+        message="waiting after a stale refill request on an already-filled field",
+    )
+
+
+def _snapshot_element_by_id(snapshot: dict[str, object], target: str) -> dict[str, object] | None:
+    if not target:
+        return None
+    raw_elements = snapshot.get("elements")
+    if not isinstance(raw_elements, list):
+        return None
+    for element in raw_elements:
+        if not isinstance(element, dict):
+            continue
+        if str(element.get("id") or "").strip() == target:
+            return element
+    return None
+
+
+def _is_text_entry_element(element: dict[str, object]) -> bool:
+    tag = str(element.get("tag") or "").lower()
+    if tag not in {"input", "textarea", "select"}:
+        return False
+    element_type = str(element.get("type") or "").lower()
+    return element_type not in {
+        "button",
+        "checkbox",
+        "color",
+        "file",
+        "hidden",
+        "image",
+        "radio",
+        "range",
+        "reset",
+        "submit",
+    }
+
+
+def _best_advance_target(snapshot: dict[str, object]) -> str:
+    raw_elements = snapshot.get("elements")
+    if not isinstance(raw_elements, list):
+        return ""
+
+    preferred_labels = (
+        "next",
+        "continue",
+        "sign in",
+        "log in",
+        "submit",
+        "authorize",
+        "allow",
+        "verify",
+        "confirm",
+        "proceed",
+        "finish",
+        "done",
+        "ok",
+    )
+    best_target = ""
+    best_score: tuple[int, int] | None = None
+    for index, element in enumerate(raw_elements):
+        if not isinstance(element, dict) or bool(element.get("disabled")):
+            continue
+        target = str(element.get("id") or "").strip()
+        if not target:
+            continue
+        tag = str(element.get("tag") or "").lower()
+        role = str(element.get("role") or "").lower()
+        element_type = str(element.get("type") or "").lower()
+        if tag not in {"button", "input", "a", "div", "span"} and role not in {"button", "link", "option", "menuitem"}:
+            continue
+        label = " ".join(
+            str(element.get(key) or "")
+            for key in ("text", "ariaLabel", "placeholder", "name")
+        ).strip().lower()
+        if not label and element_type != "submit":
+            continue
+
+        rank = next((position for position, needle in enumerate(preferred_labels) if needle in label), None)
+        if rank is None and element_type == "submit":
+            rank = len(preferred_labels)
+        if rank is None:
+            continue
+
+        score = (rank, index)
+        if best_score is None or score < best_score:
+            best_score = score
+            best_target = target
+    return best_target
 
 
 def _apply_auth_action(page: object, action: AuthModelAction, *, secret_values: dict[str, str]) -> None:
