@@ -501,7 +501,7 @@ def drive_google_auth_with_model(
                     "device_code": device_code,
                 },
             )
-        except AuthModelProtocolError:
+        except Exception:
             try:
                 current_page, current_snapshot = _capture_snapshot_with_recovery(
                     current_page,
@@ -1247,6 +1247,9 @@ def _surface_prompt_hints(snapshot: dict[str, object]) -> list[str]:
             f"{selected_count} element(s) already appear selected or pressed. Reuse that state instead of re-selecting unless the page suggests otherwise."
         )
 
+    if _looks_like_script_body(body) and not enabled_elements:
+        hints.append("The page body looks like bootstrap or app script output rather than a usable auth form. Wait for the real UI to render.")
+
     if not enabled_elements and (not body_lower or "just a moment..." in title_lower or "security verification" in body_lower):
         hints.append("No enabled interactive controls are visible right now; waiting is often safer than guessing.")
 
@@ -1283,13 +1286,21 @@ def _surface_summary(snapshot: dict[str, object]) -> dict[str, int | bool]:
         "filled_short_input_count": filled_short_input_count,
         "all_short_inputs_filled": short_input_count > 0 and filled_short_input_count == short_input_count,
         "selected_count": selected_count,
-        "script_like_body": (
-            "window." in body_text
-            or "__reactroutercontext" in body_lower
-            or "sessionstorage" in body_lower
-            or "history.replaceState".lower() in body_lower
-        ),
+        "script_like_body": _looks_like_script_body(body_text),
     }
+
+
+def _looks_like_script_body(body_text: str) -> bool:
+    body_lower = body_text.lower()
+    return (
+        "window." in body_text
+        or "__reactroutercontext" in body_lower
+        or "sessionstorage" in body_lower
+        or "history.replacestate" in body_lower
+        or "self.__next_f" in body_lower
+        or "__next_f.push" in body_lower
+        or "__next_s" in body_lower
+    )
 
 
 def _fill_visible_device_code_inputs(page: object, device_code: str) -> None:

@@ -293,6 +293,34 @@ def test_request_auth_model_decision_includes_step_scoped_guidance(monkeypatch) 
     assert user_message["surface"]["all_short_inputs_filled"] is False
 
 
+def test_request_auth_model_decision_marks_next_flight_payload_as_script_like(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_urlopen(request, timeout):
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        return _FakeHTTPResponse(json.dumps({"choices": [{"message": {"content": "{\"action\":\"wait\",\"seconds\":1}"}}]}))
+
+    monkeypatch.setattr("urllib.request.urlopen", fake_urlopen)
+
+    request_auth_model_decision(
+        load_auth_model_settings(),
+        flow_label="claude/google",
+        snapshot={
+            "url": "https://claude.ai/oauth/authorize",
+            "title": "Claude",
+            "body_text": '(self.__next_f=self.__next_f||[]).push([0])self.__next_f.push([1,"1:\\\"$Sreact.fragment\\\""])',
+            "elements": [],
+        },
+        history=[],
+        carry_forward=[],
+    )
+
+    user_message = json.loads(captured["payload"]["messages"][1]["content"])
+    system_message = captured["payload"]["messages"][0]["content"]
+    assert user_message["surface"]["script_like_body"] is True
+    assert "bootstrap or app script output" in system_message
+
+
 def test_strip_thinking_markup_removes_think_blocks() -> None:
     assert _strip_thinking_markup("<think>internal</think>{\"action\":\"wait\"}") == "{\"action\":\"wait\"}"
 
@@ -874,6 +902,67 @@ def test_drive_google_auth_with_model_tolerates_target_churn_after_navigation(mo
         object(),
         flow_label="claude/google",
         account_email="two@kuang2.ai",
+        password="secret",
+        logger=logs.append,
+    ) is True
+    assert any("changed the page surface before the original target could be reused" in line for line in logs)
+
+
+def test_drive_google_auth_with_model_tolerates_generic_action_failure_after_navigation(monkeypatch) -> None:
+    logs: list[str] = []
+    snapshots = iter(
+        [
+            {
+                "url": "https://accounts.google.com/v3/signin/identifier",
+                "title": "Sign in - Google Accounts",
+                "body_text": "Sign in with Google Email or phone Next",
+                "elements": [
+                    {"id": "ms-auth-email", "tag": "input", "type": "email", "text": "", "placeholder": "Email or phone", "ariaLabel": "Email or phone", "autocomplete": "", "filled": False, "checked": False, "focused": True, "disabled": False},
+                ],
+            },
+            {
+                "url": "https://accounts.google.com/v3/signin/identifier",
+                "title": "Sign in - Google Accounts",
+                "body_text": "Sign in with Google Email or phone Next",
+                "elements": [
+                    {"id": "ms-auth-email", "tag": "input", "type": "email", "text": "", "placeholder": "Email or phone", "ariaLabel": "Email or phone", "autocomplete": "", "filled": False, "checked": False, "focused": True, "disabled": False},
+                ],
+            },
+            {
+                "url": "https://accounts.google.com/v3/signin/challenge/pwd",
+                "title": "Welcome",
+                "body_text": "Enter your password Next",
+                "elements": [
+                    {"id": "ms-auth-passwd", "tag": "input", "type": "password", "text": "", "placeholder": "", "ariaLabel": "Enter your password", "autocomplete": "", "filled": False, "checked": False, "focused": True, "disabled": False},
+                ],
+            },
+            {
+                "url": "https://example.com/done",
+                "title": "Done",
+                "body_text": "Done",
+                "elements": [],
+            },
+        ]
+    )
+
+    monkeypatch.setattr("multishell.auth_flow_model.capture_auth_snapshot", lambda _page: next(snapshots))
+    decisions = iter(
+        [
+            AuthModelDecision(action=AuthModelAction(action="fill", target="ms-auth-email", value_key="account_email", message="fill email")),
+            AuthModelDecision(action=AuthModelAction(action="done", message="complete")),
+        ]
+    )
+    monkeypatch.setattr("multishell.auth_flow_model.request_auth_model_decision", lambda *_args, **_kwargs: next(decisions))
+
+    def fake_apply(_page, _action, **_kwargs):
+        raise RuntimeError("Locator.fill: Timeout 5000ms exceeded.")
+
+    monkeypatch.setattr("multishell.auth_flow_model._apply_auth_action", fake_apply)
+
+    assert drive_google_auth_with_model(
+        object(),
+        flow_label="codex/google",
+        account_email="worker@example.com",
         password="secret",
         logger=logs.append,
     ) is True

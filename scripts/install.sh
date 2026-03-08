@@ -133,31 +133,52 @@ exec "$VENV_DIR/bin/python" -m multishell "\$@"
 EOF
 chmod +x "$BIN_DIR/multishell"
 
-if [[ -r /dev/tty ]]; then
-  setup_tty=/dev/tty
-else
-  echo "interactive setup requires /dev/tty" >&2
-  exit 1
-fi
-
 export PATH="$BIN_DIR:$PATH"
 
 log_step "Preparing config file"
-"$BIN_DIR/multishell" init-config <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
-log_step "Opening account login TUI"
-"$BIN_DIR/multishell" login <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+"$BIN_DIR/multishell" init-config
+
+needs_login="$("$VENV_DIR/bin/python" - <<'PY'
+from multishell.install_state import needs_account_login
+print("yes" if needs_account_login() else "no")
+PY
+)"
+
+if [[ "$needs_login" == "yes" ]]; then
+  if [[ -r /dev/tty ]]; then
+    setup_tty=/dev/tty
+  else
+    echo "interactive account setup requires /dev/tty because no saved credentials were detected" >&2
+    exit 1
+  fi
+  log_step "Opening account login TUI"
+  "$BIN_DIR/multishell" login <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+else
+  log_step "Detected saved account credentials; skipping account login TUI"
+fi
+
 browser_args=(install-browser)
 if is_ubuntu; then
   browser_args+=(--with-deps)
 fi
 log_step "Installing Playwright browser runtime (and Linux browser deps on Ubuntu)"
-"$BIN_DIR/multishell" "${browser_args[@]}" <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+"$BIN_DIR/multishell" "${browser_args[@]}"
 log_step "Installing the local auth model runtime and model file (this can take a while)"
-"$BIN_DIR/multishell" install-auth-model <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+"$BIN_DIR/multishell" install-auth-model
 
-auto_args=(auto-login --all)
-log_step "Running headless browser auth automation for all configured accounts (press Ctrl+C to skip)"
-"$BIN_DIR/multishell" "${auto_args[@]}" <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+missing_auth="$("$VENV_DIR/bin/python" - <<'PY'
+from multishell.install_state import missing_auth_agents
+print("yes" if missing_auth_agents() else "no")
+PY
+)"
+
+if [[ "$missing_auth" == "yes" ]]; then
+  auto_args=(auto-login --all)
+  log_step "Running headless browser auth automation for all configured accounts (press Ctrl+C to skip)"
+  "$BIN_DIR/multishell" "${auto_args[@]}"
+else
+  log_step "Detected existing auth state for all configured agents; skipping headless auth automation"
+fi
 
 echo
 echo "multishell installed"

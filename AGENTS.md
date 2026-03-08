@@ -5,3 +5,4 @@
 - Long-running install or auth automation steps must print explicit progress messages before they begin so browser downloads and login automation do not look hung.
 - When using Qwen 3.5 for auth automation, explicitly disable thinking in the request payload and ignore any stray `<think>...</think>` output before parsing the model response.
 - Keep the local auth-model flow self-contained inside this repo: install the `llama.cpp` runtime, the GGUF, and any server lifecycle from `multishell` commands or the installer instead of relying on manual shell setup outside the repo workflow.
+- Do not add auth-flow logic that depends on specific page field names, ids, or site-specific selector heuristics; rely on the structural snapshot and the locally hosted Qwen 3.5 model so the flow stays resilient to website changes.
