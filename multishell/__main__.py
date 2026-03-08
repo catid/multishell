@@ -266,6 +266,25 @@ def cmd_auth_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def _auto_login_server_logger(*, verbose: bool):
+    waiting_logged = False
+
+    def log(message: str) -> None:
+        nonlocal waiting_logged
+        if verbose:
+            print(message, flush=True)
+            return
+        if message.startswith("auth model server log:"):
+            return
+        if message.startswith("waiting for local auth model server to finish loading"):
+            if waiting_logged:
+                return
+            waiting_logged = True
+        print(message, flush=True)
+
+    return log
+
+
 def cmd_auto_login(args: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("playwright"):
         return 0
@@ -290,12 +309,13 @@ def cmd_auto_login(args: argparse.Namespace) -> int:
         raise SystemExit(f"missing emails in .env: {', '.join(missing_emails)}")
 
     credentials = resolve_credentials(target_agents)
-    with managed_auth_model_server(required=False, log=lambda message: print(message, flush=True)):
+    with managed_auth_model_server(required=False, log=_auto_login_server_logger(verbose=args.verbose)):
         run_auto_login(
             credentials,
             headed=args.headed,
             timeout_seconds=args.timeout,
             max_parallel=args.parallel,
+            verbose=args.verbose,
         )
     return 0
 
@@ -389,6 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
     auto_login_parser.add_argument("--headed", action="store_true")
     auto_login_parser.add_argument("--timeout", type=int, default=180)
     auto_login_parser.add_argument("--parallel", type=int, default=1)
+    auto_login_parser.add_argument("--verbose", action="store_true")
     auto_login_parser.set_defaults(func=cmd_auto_login)
 
     auth_model_smoke_parser = subparsers.add_parser("auth-model-smoke-test")

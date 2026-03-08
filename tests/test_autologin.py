@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import multishell.autologin as autologin_module
 from playwright.sync_api import TimeoutError
 
 from multishell.auth_flow_model import AuthModelFailure, AuthModelUnavailable
@@ -171,6 +172,62 @@ def test_run_auto_login_emits_progress_lines(monkeypatch, capsys) -> None:
 
     out = capsys.readouterr().out
     assert "auto-login 1/1: worker-1 (codex, worker@example.com)" in out
+
+
+def test_run_auto_login_defaults_to_terse_mode(monkeypatch) -> None:
+    credential = AgentCredentials(
+        spec=AgentSpec(
+            name="worker-1",
+            account_email="worker@example.com",
+            role="worker",
+            personality="Test worker.",
+            accent_color=2,
+            account_key="account-1",
+        ),
+        password="secret",
+    )
+    verbose_seen: list[bool] = []
+
+    monkeypatch.setattr("multishell.autologin.apply_node_warning_suppression", lambda: None)
+    monkeypatch.setattr("multishell.autologin.apply_playwright_browser_path", lambda: None)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _FakePlaywrightContext())
+
+    def fake_login(*_args, **_kwargs):
+        verbose_seen.append(autologin_module._auto_login_verbose())
+
+    monkeypatch.setattr("multishell.autologin._login_codex_one", fake_login)
+
+    run_auto_login([credential])
+
+    assert verbose_seen == [False]
+
+
+def test_run_auto_login_can_enable_verbose_mode(monkeypatch) -> None:
+    credential = AgentCredentials(
+        spec=AgentSpec(
+            name="worker-1",
+            account_email="worker@example.com",
+            role="worker",
+            personality="Test worker.",
+            accent_color=2,
+            account_key="account-1",
+        ),
+        password="secret",
+    )
+    verbose_seen: list[bool] = []
+
+    monkeypatch.setattr("multishell.autologin.apply_node_warning_suppression", lambda: None)
+    monkeypatch.setattr("multishell.autologin.apply_playwright_browser_path", lambda: None)
+    monkeypatch.setattr("playwright.sync_api.sync_playwright", lambda: _FakePlaywrightContext())
+
+    def fake_login(*_args, **_kwargs):
+        verbose_seen.append(autologin_module._auto_login_verbose())
+
+    monkeypatch.setattr("multishell.autologin._login_codex_one", fake_login)
+
+    run_auto_login([credential], verbose=True)
+
+    assert verbose_seen == [True]
 
 
 def test_run_auto_login_continues_after_lane_failure(monkeypatch, capsys) -> None:

@@ -161,6 +161,7 @@ def test_request_auth_model_decision_compacts_snapshot_payload(monkeypatch) -> N
             {"page": "older-3", "action": "wait"},
         ],
         carry_forward=["remember device_code for later", "workspace not chosen yet"],
+        available_keys=["account_email", "password", "device_code"],
     )
 
     messages = captured["payload"]["messages"]
@@ -180,6 +181,7 @@ def test_request_auth_model_decision_compacts_snapshot_payload(monkeypatch) -> N
     assert "selected" not in user_message["snapshot"]["elements"][0]
     assert user_message["last"] == "action=wait"
     assert user_message["memory"] == ["remember device_code for later", "workspace not chosen yet"]
+    assert user_message["available_keys"] == ["account_email", "password", "device_code"]
     assert user_message["surface"]["interactive_count"] == 30
     assert user_message["surface"]["enabled_count"] == 30
     assert user_message["surface"]["input_count"] == 30
@@ -278,6 +280,7 @@ def test_request_auth_model_decision_includes_step_scoped_guidance(monkeypatch) 
         },
         history=[],
         carry_forward=["If the code form appears, use value_key=device_code on the first visible code input."],
+        available_keys=["device_code"],
     )
 
     messages = captured["payload"]["messages"]
@@ -287,7 +290,9 @@ def test_request_auth_model_decision_includes_step_scoped_guidance(monkeypatch) 
     assert "segmented token entry" in system_message
     assert "device_code handle" in system_message
     assert "URL tokens or callback codes" in system_message
+    assert "available_keys" in system_message
     assert user_message["memory"] == ["If the code form appears, use value_key=device_code on the first visible code input."]
+    assert user_message["available_keys"] == ["device_code"]
     assert user_message["last"] == ""
     assert user_message["surface"]["short_input_count"] == 2
     assert user_message["surface"]["all_short_inputs_filled"] is False
@@ -647,6 +652,103 @@ def test_drive_google_auth_with_model_relays_model_carry_forward_between_steps(m
     logs: list[str] = []
     actions: list[AuthModelAction] = []
     memories_seen: list[list[str]] = []
+    available_keys_seen: list[list[str]] = []
+    snapshots = iter(
+        [
+            {
+                "url": "https://auth.openai.com/codex/device",
+                "title": "Device code",
+                "body_text": "Use your device code to grant access to Codex CLI",
+                "elements": [
+                    {"id": "ms-auth-code-1", "tag": "input", "type": "text", "name": "code-1", "text": "", "placeholder": "", "ariaLabel": "Character 1", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": True, "disabled": False},
+                    {"id": "ms-auth-code-2", "tag": "input", "type": "text", "name": "code-2", "text": "", "placeholder": "", "ariaLabel": "Character 2", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": False, "disabled": False},
+                    {"id": "ms-auth-continue", "tag": "button", "type": "button", "name": "", "text": "Continue", "placeholder": "", "ariaLabel": "", "autocomplete": "", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": False, "disabled": True},
+                ],
+            },
+            {
+                "url": "https://auth.openai.com/codex/device",
+                "title": "Device code",
+                "body_text": "Use your device code to grant access to Codex CLI",
+                "elements": [
+                    {"id": "ms-auth-code-1", "tag": "input", "type": "text", "name": "code-1", "text": "", "placeholder": "", "ariaLabel": "Character 1", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": True, "disabled": False},
+                    {"id": "ms-auth-code-2", "tag": "input", "type": "text", "name": "code-2", "text": "", "placeholder": "", "ariaLabel": "Character 2", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": False, "disabled": False},
+                    {"id": "ms-auth-continue", "tag": "button", "type": "button", "name": "", "text": "Continue", "placeholder": "", "ariaLabel": "", "autocomplete": "", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": False, "disabled": True},
+                ],
+            },
+            {
+                "url": "https://auth.openai.com/codex/device",
+                "title": "Device code",
+                "body_text": "Use your device code to grant access to Codex CLI",
+                "elements": [
+                    {"id": "ms-auth-code-1", "tag": "input", "type": "text", "name": "code-1", "text": "", "placeholder": "", "ariaLabel": "Character 1", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": True, "valueLength": 1, "checked": False, "selected": False, "focused": False, "disabled": False},
+                    {"id": "ms-auth-code-2", "tag": "input", "type": "text", "name": "code-2", "text": "", "placeholder": "", "ariaLabel": "Character 2", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": True, "valueLength": 1, "checked": False, "selected": False, "focused": False, "disabled": False},
+                    {"id": "ms-auth-continue", "tag": "button", "type": "button", "name": "", "text": "Continue", "placeholder": "", "ariaLabel": "", "autocomplete": "", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": False, "disabled": False},
+                ],
+            },
+            {
+                "url": "https://auth.openai.com/codex/device",
+                "title": "Device code",
+                "body_text": "Use your device code to grant access to Codex CLI",
+                "elements": [
+                    {"id": "ms-auth-code-1", "tag": "input", "type": "text", "name": "code-1", "text": "", "placeholder": "", "ariaLabel": "Character 1", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": True, "valueLength": 1, "checked": False, "selected": False, "focused": False, "disabled": False},
+                    {"id": "ms-auth-code-2", "tag": "input", "type": "text", "name": "code-2", "text": "", "placeholder": "", "ariaLabel": "Character 2", "autocomplete": "", "inputMode": "text", "maxLength": "1", "filled": True, "valueLength": 1, "checked": False, "selected": False, "focused": False, "disabled": False},
+                    {"id": "ms-auth-continue", "tag": "button", "type": "button", "name": "", "text": "Continue", "placeholder": "", "ariaLabel": "", "autocomplete": "", "filled": False, "valueLength": 0, "checked": False, "selected": False, "focused": False, "disabled": False},
+                ],
+            },
+            {
+                "url": "https://chatgpt.com/",
+                "title": "ChatGPT",
+                "body_text": "Welcome back",
+                "elements": [],
+            },
+        ]
+    )
+
+    monkeypatch.setattr("multishell.auth_flow_model.capture_auth_snapshot", lambda _page: next(snapshots))
+
+    def fake_request(_settings, *, carry_forward, available_keys, **_kwargs):
+        memories_seen.append(list(carry_forward))
+        available_keys_seen.append(list(available_keys))
+        if not carry_forward:
+            return AuthModelDecision(
+                action=AuthModelAction(action="fill", target="ms-auth-code-1", value_key="device_code", message="fill code"),
+                carry_forward=("device code already entered; click Continue if it becomes enabled",),
+            )
+        return AuthModelDecision(
+            action=AuthModelAction(action="click", target="ms-auth-continue", message="submit code"),
+            carry_forward=("waiting for OpenAI redirect after device code submit",),
+        )
+
+    monkeypatch.setattr("multishell.auth_flow_model.request_auth_model_decision", fake_request)
+    monkeypatch.setattr(
+        "multishell.auth_flow_model._apply_auth_action",
+        lambda _page, action, **_kwargs: actions.append(action),
+    )
+    monkeypatch.setattr("multishell.auth_flow_model._wait_for_surface_change", lambda *_args, **_kwargs: None)
+
+    assert drive_google_auth_with_model(
+        object(),
+        flow_label="codex/google",
+        account_email="worker@example.com",
+        password="secret",
+        device_code="ABCD-EFGHI",
+        logger=logs.append,
+    ) is True
+    assert [action.action for action in actions] == ["fill", "click"]
+    assert actions[0].value_key == "device_code"
+    assert actions[1].target == "ms-auth-continue"
+    assert memories_seen == [[], ["device code already entered; click Continue if it becomes enabled"]]
+    assert available_keys_seen == [
+        ["account_email", "password", "device_code"],
+        ["account_email", "password", "device_code"],
+    ]
+    assert any("auth model carry-forward:" in line for line in logs)
+
+
+def test_drive_google_auth_with_model_recovers_missing_device_code_failure(monkeypatch) -> None:
+    logs: list[str] = []
+    actions: list[AuthModelAction] = []
+    memories_seen: list[list[str]] = []
     snapshots = iter(
         [
             {
@@ -704,8 +806,12 @@ def test_drive_google_auth_with_model_relays_model_carry_forward_between_steps(m
         memories_seen.append(list(carry_forward))
         if not carry_forward:
             return AuthModelDecision(
-                action=AuthModelAction(action="fill", target="ms-auth-code-1", value_key="device_code", message="fill code"),
-                carry_forward=("device code already entered; click Continue if it becomes enabled",),
+                action=AuthModelAction(
+                    action="fail",
+                    failure_kind="error",
+                    message="Device code not provided in context; cannot proceed with token entry.",
+                ),
+                carry_forward=("waiting_for_device_code",),
             )
         return AuthModelDecision(
             action=AuthModelAction(action="click", target="ms-auth-continue", message="submit code"),
@@ -729,9 +835,14 @@ def test_drive_google_auth_with_model_relays_model_carry_forward_between_steps(m
     ) is True
     assert [action.action for action in actions] == ["fill", "click"]
     assert actions[0].value_key == "device_code"
-    assert actions[1].target == "ms-auth-continue"
-    assert memories_seen == [[], ["device code already entered; click Continue if it becomes enabled"]]
-    assert any("auth model carry-forward:" in line for line in logs)
+    assert memories_seen == [
+        [],
+        [
+            "device_code is available via value_key=device_code",
+            "after the code is entered, continue when the button enables",
+        ],
+    ]
+    assert any("auth model recovery: device_code handle is available" in line for line in logs)
 
 
 def test_apply_auth_action_uses_visible_device_code_helper(monkeypatch) -> None:

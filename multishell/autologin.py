@@ -77,6 +77,7 @@ GOOGLE_MANUAL_CHALLENGE_SNIPPETS = {
 _LOG_LOCK = threading.RLock()
 LOGIN_ERROR_RETRY_ATTEMPTS = 10
 LOGIN_ERROR_RETRY_DELAY_SECONDS = 15
+_AUTO_LOGIN_VERBOSE = False
 
 
 class CodexDeviceAuthRateLimit(RuntimeError):
@@ -100,6 +101,19 @@ class AgentCredentials:
 def _log_progress(agent_name: str, message: str) -> None:
     with _LOG_LOCK:
         print(f"[{agent_name}] {message}", flush=True)
+
+
+def _auto_login_verbose() -> bool:
+    return _AUTO_LOGIN_VERBOSE
+
+
+def _verbose_progress_label(agent_name: str) -> str | None:
+    return agent_name if _auto_login_verbose() else None
+
+
+def _log_verbose(agent_name: str, message: str) -> None:
+    if _auto_login_verbose():
+        _log_progress(agent_name, message)
 
 
 def _log_stage_once(agent_name: str | None, seen: set[str], stage: str, message: str) -> None:
@@ -171,7 +185,9 @@ def run_auto_login(
     timeout_seconds: int = 180,
     *,
     max_parallel: int = 1,
+    verbose: bool = False,
 ) -> None:
+    global _AUTO_LOGIN_VERBOSE
     apply_node_warning_suppression()
     apply_playwright_browser_path()
     try:
@@ -190,95 +206,100 @@ def run_auto_login(
     max_workers = min(max_parallel, total) if total else 0
     engine_limits = {engine: _engine_parallel_limit(engine, max_parallel) for engine in {credential.spec.engine for credential in credentials}}
 
-    def run_one(credential: AgentCredentials) -> None:
-        for attempt in range(1, LOGIN_ERROR_RETRY_ATTEMPTS + 1):
-            try:
-                with sync_playwright() as playwright:
-                    if credential.spec.role == "claude-worker":
-                        _login_claude_one(playwright, credential, timeout_seconds, headed=headed)
-                    else:
-                        _login_codex_one(playwright, credential, timeout_seconds, headed=headed)
-                return
-            except NoAuthLoginError:
-                raise
-            except RetryableLoginError as exc:
-                if attempt >= LOGIN_ERROR_RETRY_ATTEMPTS:
-                    raise RetryableLoginError(str(exc)) from exc
-                _log_progress(
-                    credential.spec.name,
-                    f"retryable login error; retrying in {LOGIN_ERROR_RETRY_DELAY_SECONDS}s "
-                    f"(attempt {attempt + 1}/{LOGIN_ERROR_RETRY_ATTEMPTS}): {exc}",
-                )
-                _reset_login_attempt_state(credential.spec.name)
-                time.sleep(LOGIN_ERROR_RETRY_DELAY_SECONDS)
-            except Exception as exc:
-                if attempt >= LOGIN_ERROR_RETRY_ATTEMPTS:
-                    raise RetryableLoginError(str(exc).strip() or exc.__class__.__name__) from exc
-                _log_progress(
-                    credential.spec.name,
-                    f"unexpected login error; retrying in {LOGIN_ERROR_RETRY_DELAY_SECONDS}s "
-                    f"(attempt {attempt + 1}/{LOGIN_ERROR_RETRY_ATTEMPTS}): {exc}",
-                )
-                _reset_login_attempt_state(credential.spec.name)
-                time.sleep(LOGIN_ERROR_RETRY_DELAY_SECONDS)
+    previous_verbose = _AUTO_LOGIN_VERBOSE
+    _AUTO_LOGIN_VERBOSE = bool(verbose)
+    try:
+        def run_one(credential: AgentCredentials) -> None:
+            for attempt in range(1, LOGIN_ERROR_RETRY_ATTEMPTS + 1):
+                try:
+                    with sync_playwright() as playwright:
+                        if credential.spec.role == "claude-worker":
+                            _login_claude_one(playwright, credential, timeout_seconds, headed=headed)
+                        else:
+                            _login_codex_one(playwright, credential, timeout_seconds, headed=headed)
+                    return
+                except NoAuthLoginError:
+                    raise
+                except RetryableLoginError as exc:
+                    if attempt >= LOGIN_ERROR_RETRY_ATTEMPTS:
+                        raise RetryableLoginError(str(exc)) from exc
+                    _log_progress(
+                        credential.spec.name,
+                        f"retryable login error; retrying in {LOGIN_ERROR_RETRY_DELAY_SECONDS}s "
+                        f"(attempt {attempt + 1}/{LOGIN_ERROR_RETRY_ATTEMPTS}): {exc}",
+                    )
+                    _reset_login_attempt_state(credential.spec.name)
+                    time.sleep(LOGIN_ERROR_RETRY_DELAY_SECONDS)
+                except Exception as exc:
+                    if attempt >= LOGIN_ERROR_RETRY_ATTEMPTS:
+                        raise RetryableLoginError(str(exc).strip() or exc.__class__.__name__) from exc
+                    _log_progress(
+                        credential.spec.name,
+                        f"unexpected login error; retrying in {LOGIN_ERROR_RETRY_DELAY_SECONDS}s "
+                        f"(attempt {attempt + 1}/{LOGIN_ERROR_RETRY_ATTEMPTS}): {exc}",
+                    )
+                    _reset_login_attempt_state(credential.spec.name)
+                    time.sleep(LOGIN_ERROR_RETRY_DELAY_SECONDS)
 
-    def record_failure(index: int, credential: AgentCredentials, exc: BaseException) -> None:
-        message = str(exc).strip() or exc.__class__.__name__
-        kind = _login_failure_kind(exc)
-        failures.append((index, credential.spec.name, kind, message))
-        _log_progress(credential.spec.name, f"login failed [{kind}]: {message}")
+        def record_failure(index: int, credential: AgentCredentials, exc: BaseException) -> None:
+            message = str(exc).strip() or exc.__class__.__name__
+            kind = _login_failure_kind(exc)
+            failures.append((index, credential.spec.name, kind, message))
+            _log_progress(credential.spec.name, f"login failed [{kind}]: {message}")
 
-    if max_workers <= 1:
-        for index, credential in enumerate(credentials, start=1):
-            print(
-                f"auto-login {index}/{total}: {credential.spec.name} "
-                f"({credential.spec.engine}, {credential.spec.account_email})"
-            )
-            try:
-                run_one(credential)
-            except Exception as exc:
-                record_failure(index, credential, exc)
-    else:
-        remaining: list[tuple[int, AgentCredentials]] = list(enumerate(credentials, start=1))
-        pending: dict[Future[None], tuple[int, AgentCredentials]] = {}
-        active_by_engine: dict[str, int] = {}
-        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="multishell-auth") as executor:
-            while remaining or pending:
-                while remaining and len(pending) < max_workers:
-                    deferred: list[tuple[int, AgentCredentials]] = []
-                    submitted = False
-                    for index, credential in remaining:
+        if max_workers <= 1:
+            for index, credential in enumerate(credentials, start=1):
+                print(
+                    f"auto-login {index}/{total}: {credential.spec.name} "
+                    f"({credential.spec.engine}, {credential.spec.account_email})"
+                )
+                try:
+                    run_one(credential)
+                except Exception as exc:
+                    record_failure(index, credential, exc)
+        else:
+            remaining: list[tuple[int, AgentCredentials]] = list(enumerate(credentials, start=1))
+            pending: dict[Future[None], tuple[int, AgentCredentials]] = {}
+            active_by_engine: dict[str, int] = {}
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="multishell-auth") as executor:
+                while remaining or pending:
+                    while remaining and len(pending) < max_workers:
+                        deferred: list[tuple[int, AgentCredentials]] = []
+                        submitted = False
+                        for index, credential in remaining:
+                            engine = credential.spec.engine
+                            if active_by_engine.get(engine, 0) >= engine_limits.get(engine, max_parallel):
+                                deferred.append((index, credential))
+                                continue
+                            print(
+                                f"auto-login {index}/{total}: {credential.spec.name} "
+                                f"({credential.spec.engine}, {credential.spec.account_email})"
+                            )
+                            pending[executor.submit(run_one, credential)] = (index, credential)
+                            active_by_engine[engine] = active_by_engine.get(engine, 0) + 1
+                            submitted = True
+                            deferred.extend(remaining[remaining.index((index, credential)) + 1 :])
+                            remaining = deferred
+                            break
+                        if not submitted:
+                            break
+                    done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+                    for future in done:
+                        index, credential = pending.pop(future)
                         engine = credential.spec.engine
-                        if active_by_engine.get(engine, 0) >= engine_limits.get(engine, max_parallel):
-                            deferred.append((index, credential))
-                            continue
-                        print(
-                            f"auto-login {index}/{total}: {credential.spec.name} "
-                            f"({credential.spec.engine}, {credential.spec.account_email})"
-                        )
-                        pending[executor.submit(run_one, credential)] = (index, credential)
-                        active_by_engine[engine] = active_by_engine.get(engine, 0) + 1
-                        submitted = True
-                        deferred.extend(remaining[remaining.index((index, credential)) + 1 :])
-                        remaining = deferred
-                        break
-                    if not submitted:
-                        break
-                done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
-                for future in done:
-                    index, credential = pending.pop(future)
-                    engine = credential.spec.engine
-                    active_by_engine[engine] = max(0, active_by_engine.get(engine, 1) - 1)
-                    try:
-                        future.result()
-                    except Exception as exc:
-                        record_failure(index, credential, exc)
+                        active_by_engine[engine] = max(0, active_by_engine.get(engine, 1) - 1)
+                        try:
+                            future.result()
+                        except Exception as exc:
+                            record_failure(index, credential, exc)
 
-    if failures:
-        lines = ["auto-login completed with failures:"]
-        for _index, agent_name, kind, message in sorted(failures):
-            lines.append(f"- {agent_name} [{kind}]: {message}")
-        raise RuntimeError("\n".join(lines))
+        if failures:
+            lines = ["auto-login completed with failures:"]
+            for _index, agent_name, kind, message in sorted(failures):
+                lines.append(f"- {agent_name} [{kind}]: {message}")
+            raise RuntimeError("\n".join(lines))
+    finally:
+        _AUTO_LOGIN_VERBOSE = previous_verbose
 
 
 def _engine_parallel_limit(engine: str, max_parallel: int) -> int:
@@ -331,10 +352,11 @@ def _raise_auth_model_exception(flow_label: str, exc: Exception, logger: Callabl
 
 def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
     agent_name = credential.spec.name
+    progress_label = _verbose_progress_label(agent_name)
     page = None
     child = None
     try:
-        _log_progress(agent_name, "preparing Codex login state")
+        _log_verbose(agent_name, "preparing Codex login state")
         _ensure_home(credential.spec.name)
         if auth_path(credential.spec.name).exists():
             _log_progress(agent_name, "already logged in; skipping")
@@ -342,15 +364,15 @@ def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_s
 
         env = suppress_node_warnings(os.environ.copy())
         env["HOME"] = str(agent_home(credential.spec.name))
-        _log_progress(agent_name, "starting `codex login --device-auth`")
+        _log_verbose(agent_name, "starting `codex login --device-auth`")
         child, url, device_code = _start_codex_device_auth(agent_name, env)
-        _log_progress(agent_name, f"received device code {device_code}; launching browser")
-        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=agent_name) as (browser, context, page):
+        _log_verbose(agent_name, f"received device code {device_code}; launching browser")
+        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=progress_label) as (browser, context, page):
             try:
-                _log_progress(agent_name, "browser ready; completing Google/OpenAI sign-in")
-                _complete_openai_google_sign_in(page, url, device_code, credential, progress_label=agent_name)
-                _log_progress(agent_name, "waiting for Codex auth.json to be created")
-                _wait_for_codex_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+                _log_verbose(agent_name, "browser ready; completing Google/OpenAI sign-in")
+                _complete_openai_google_sign_in(page, url, device_code, credential, progress_label=progress_label)
+                _log_verbose(agent_name, "waiting for Codex auth.json to be created")
+                _wait_for_codex_auth(child, credential.spec.name, timeout_seconds, progress_label=progress_label)
             except Exception as exc:
                 raise _enrich_login_error(exc, page, credential.spec.name) from exc
         _log_progress(agent_name, "Codex login complete")
@@ -411,10 +433,11 @@ def _ensure_home(agent_name: str) -> None:
 
 def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
     agent_name = credential.spec.name
+    progress_label = _verbose_progress_label(agent_name)
     page = None
     child = None
     try:
-        _log_progress(agent_name, "preparing Claude login state")
+        _log_verbose(agent_name, "preparing Claude login state")
         ensure_claude_home(credential.spec.name)
         if _claude_logged_in(credential.spec.name):
             _log_progress(agent_name, "already logged in; skipping")
@@ -423,7 +446,7 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
         env = suppress_node_warnings(os.environ.copy())
         env.pop("ANTHROPIC_API_KEY", None)
         env["HOME"] = str(claude_home(credential.spec.name))
-        _log_progress(agent_name, f"starting `claude auth login --email {credential.spec.account_email}`")
+        _log_verbose(agent_name, f"starting `claude auth login --email {credential.spec.account_email}`")
         child = pexpect.spawn(
             "claude",
             ["auth", "login", "--email", credential.spec.account_email],
@@ -433,18 +456,18 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
         )
         output = _collect_child_output(child, seconds=5)
         manual_url = _extract_claude_login_url(output)
-        _log_progress(agent_name, "waiting for Claude local callback URL")
-        auth_url = _wait_for_claude_local_callback_url(child.pid, manual_url, timeout_seconds=10, progress_label=agent_name) or manual_url
-        _log_progress(agent_name, "launching browser for Claude/Google sign-in")
-        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=agent_name) as (browser, context, page):
+        _log_verbose(agent_name, "waiting for Claude local callback URL")
+        auth_url = _wait_for_claude_local_callback_url(child.pid, manual_url, timeout_seconds=10, progress_label=progress_label) or manual_url
+        _log_verbose(agent_name, "launching browser for Claude/Google sign-in")
+        with _isolated_chrome(playwright, credential.spec.name, headed=headed, progress_label=progress_label) as (browser, context, page):
             try:
-                _log_progress(agent_name, "browser ready; completing Claude/Google sign-in")
-                callback_code = _complete_claude_google_sign_in(page, auth_url, credential, progress_label=agent_name)
+                _log_verbose(agent_name, "browser ready; completing Claude/Google sign-in")
+                callback_code = _complete_claude_google_sign_in(page, auth_url, credential, progress_label=progress_label)
                 if callback_code:
-                    _log_progress(agent_name, "received Claude callback code; sending it back to the CLI")
+                    _log_verbose(agent_name, "received Claude callback code; sending it back to the CLI")
                     child.sendline(callback_code)
-                _log_progress(agent_name, "waiting for Claude auth status to become logged in")
-                _wait_for_claude_auth(child, credential.spec.name, timeout_seconds, progress_label=agent_name)
+                _log_verbose(agent_name, "waiting for Claude auth status to become logged in")
+                _wait_for_claude_auth(child, credential.spec.name, timeout_seconds, progress_label=progress_label)
             except Exception as exc:
                 raise _enrich_login_error(exc, page, credential.spec.name) from exc
         _log_progress(agent_name, "Claude login complete")

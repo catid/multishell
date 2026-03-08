@@ -434,6 +434,15 @@ def drive_google_auth_with_model(
             logger(f"auth model skipped: snapshot is outside model-controlled auth surfaces ({summarize_snapshot(snapshot)})")
         return False
 
+    available_keys = [
+        key
+        for key, value in (
+            ("account_email", account_email),
+            ("password", password),
+            ("device_code", device_code),
+        )
+        if value
+    ]
     history: list[dict[str, str]] = []
     carry_forward: list[str] = []
     last_repeat_signature = ""
@@ -461,8 +470,17 @@ def drive_google_auth_with_model(
             snapshot=snapshot,
             history=history,
             carry_forward=carry_forward,
+            available_keys=available_keys,
             logger=logger,
         )
+        recovered_decision = _recover_missing_device_code_decision(
+            snapshot,
+            decision,
+            device_code=device_code,
+            logger=logger,
+        )
+        if recovered_decision is not None:
+            decision = recovered_decision
         action = decision.action
         carry_forward = list(decision.carry_forward[:6])
         if logger is not None:
@@ -711,6 +729,7 @@ def request_auth_model_decision(
     snapshot: dict[str, object],
     history: list[dict[str, str]],
     carry_forward: list[str],
+    available_keys: list[str] | None = None,
     logger: Callable[[str], None] | None = None,
 ) -> AuthModelDecision:
     messages = _auth_messages(
@@ -718,6 +737,7 @@ def request_auth_model_decision(
         snapshot=snapshot,
         history=history,
         carry_forward=carry_forward,
+        available_keys=available_keys or [],
     )
     if logger is not None:
         logger(f"auth model system prompt: {_truncate_for_log(str(messages[0].get('content') or ''), limit=2200)}")
@@ -728,6 +748,7 @@ def request_auth_model_decision(
             f"api_base={settings.api_base} model={settings.model} "
             f"snapshot={summarize_snapshot(snapshot)} "
             f"elements={_summarize_elements(snapshot.get('elements'))} "
+            f"available_keys={json.dumps((available_keys or [])[-6:], ensure_ascii=True)} "
             f"carry_forward={json.dumps(carry_forward[-6:], ensure_ascii=True)}"
         )
     payload = {
@@ -801,12 +822,14 @@ def _auth_messages(
     snapshot: dict[str, object],
     history: list[dict[str, str]],
     carry_forward: list[str],
+    available_keys: list[str],
 ) -> list[dict[str, str]]:
     model_snapshot = _compact_snapshot_for_model(snapshot)
     system = _auth_system_prompt(flow_label=flow_label, snapshot=snapshot)
     user_payload = {
         "flow": flow_label,
         "keys": ["account_email", "password", "device_code"],
+        "available_keys": available_keys[:6],
         "memory": carry_forward[-6:],
         "last": _compact_last_step(history),
         "snapshot": model_snapshot,
@@ -1201,6 +1224,8 @@ def _auth_system_prompt(*, flow_label: str, snapshot: dict[str, object]) -> str:
         "Actions: click, fill, press, wait, done, fail. "
         "Use current snapshot over old memory. Element ids are per-step handles only. "
         "For secrets use value_key account_email, password, or device_code; never output literal passwords. "
+        "The user payload's available_keys list tells you which secret handles are actually available right now. "
+        "If a needed handle is listed there, use that value_key directly instead of claiming the secret is missing. "
         "Never click disabled controls. If a field is already filled, advance instead of refilling. "
         "If all short inputs are filled, treat token entry as complete and advance. "
         "If the last action did not change the page, try something else. "
@@ -1300,6 +1325,54 @@ def _looks_like_script_body(body_text: str) -> bool:
         or "self.__next_f" in body_lower
         or "__next_f.push" in body_lower
         or "__next_s" in body_lower
+    )
+
+
+def _recover_missing_device_code_decision(
+    snapshot: dict[str, object],
+    decision: AuthModelDecision,
+    *,
+    device_code: str,
+    logger: Callable[[str], None] | None = None,
+) -> AuthModelDecision | None:
+    if not device_code:
+        return None
+    action = decision.action
+    if action.action != "fail":
+        return None
+    if not _is_device_code_surface(snapshot):
+        return None
+    detail = " ".join(
+        part
+        for part in [
+            action.message,
+            *decision.carry_forward,
+        ]
+        if part
+    ).lower()
+    if "device code" not in detail:
+        return None
+    if not any(token in detail for token in ("not provided", "missing", "waiting_for_device_code", "waiting for device code")):
+        return None
+    inputs = _device_code_input_elements(snapshot)
+    if not inputs:
+        return None
+    target = str(inputs[0].get("id") or "").strip()
+    if not target:
+        return None
+    if logger is not None:
+        logger("auth model recovery: device_code handle is available; filling the visible device code inputs")
+    return AuthModelDecision(
+        action=AuthModelAction(
+            action="fill",
+            target=target,
+            value_key="device_code",
+            message="fill the device code from the available handle",
+        ),
+        carry_forward=(
+            "device_code is available via value_key=device_code",
+            "after the code is entered, continue when the button enables",
+        ),
     )
 
 

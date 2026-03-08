@@ -241,7 +241,7 @@ def test_auth_model_bench_prints_summary(monkeypatch, capsys: pytest.CaptureFixt
 
 def test_auto_login_manages_local_auth_model_server(monkeypatch) -> None:
     parser = build_parser()
-    captured: dict[str, object] = {"entered": False, "credentials": None}
+    captured: dict[str, object] = {"entered": False, "credentials": None, "logger": None}
 
     class _ManagedServer:
         def __enter__(self):
@@ -258,13 +258,13 @@ def test_auto_login_manages_local_auth_model_server(monkeypatch) -> None:
     monkeypatch.setattr("multishell.autologin.resolve_credentials", lambda _agents: ["cred"])
     monkeypatch.setattr(
         "multishell.llama_cpp.managed_auth_model_server",
-        lambda **_kwargs: _ManagedServer(),
+        lambda **kwargs: captured.__setitem__("logger", kwargs["log"]) or _ManagedServer(),
     )
     monkeypatch.setattr(
         "multishell.autologin.run_auto_login",
-        lambda credentials, headed, timeout_seconds, max_parallel: captured.__setitem__(
+        lambda credentials, headed, timeout_seconds, max_parallel, verbose=False: captured.__setitem__(
             "credentials",
-            (credentials, headed, timeout_seconds, max_parallel),
+            (credentials, headed, timeout_seconds, max_parallel, verbose),
         ),
     )
 
@@ -272,7 +272,35 @@ def test_auto_login_manages_local_auth_model_server(monkeypatch) -> None:
 
     assert args.func(args) == 0
     assert captured["entered"] is True
-    assert captured["credentials"] == (["cred"], False, 180, 1)
+    assert captured["credentials"] == (["cred"], False, 180, 1, False)
+
+
+def test_auto_login_passes_verbose_flag(monkeypatch) -> None:
+    parser = build_parser()
+    captured: dict[str, object] = {"verbose": None}
+
+    class _ManagedServer:
+        def __enter__(self):
+            return True
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.__main__.apply_node_warning_suppression", lambda: None)
+    monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["worker-1"])
+    monkeypatch.setattr("multishell.__main__.missing_email_env_vars", lambda _agents: [])
+    monkeypatch.setattr("multishell.autologin.resolve_credentials", lambda _agents: ["cred"])
+    monkeypatch.setattr("multishell.llama_cpp.managed_auth_model_server", lambda **_kwargs: _ManagedServer())
+    monkeypatch.setattr(
+        "multishell.autologin.run_auto_login",
+        lambda credentials, headed, timeout_seconds, max_parallel, verbose=False: captured.__setitem__("verbose", verbose),
+    )
+
+    args = parser.parse_args(["auto-login", "--all", "--verbose"])
+
+    assert args.func(args) == 0
+    assert captured["verbose"] is True
 
 
 def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
