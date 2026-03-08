@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -17,10 +18,14 @@ AUTH_MODEL_API_KEY_ENV_VAR = "MULTISHELL_AUTH_MODEL_API_KEY"
 AUTH_MODEL_NAME_ENV_VAR = "MULTISHELL_AUTH_MODEL"
 AUTH_MODEL_MAX_STEPS_ENV_VAR = "MULTISHELL_AUTH_MODEL_MAX_STEPS"
 AUTH_MODEL_TIMEOUT_ENV_VAR = "MULTISHELL_AUTH_MODEL_TIMEOUT_SECONDS"
+AUTH_MODEL_MAX_CONCURRENCY_ENV_VAR = "MULTISHELL_AUTH_MODEL_MAX_CONCURRENCY"
 
 DEFAULT_AUTH_MODEL_API_BASE = "http://127.0.0.1:8080/v1"
 DEFAULT_AUTH_MODEL_NAME = "Qwen/Qwen3.5-9B"
 DEFAULT_AUTH_MODEL_API_KEY = "EMPTY"
+
+_AUTH_MODEL_SEMAPHORE_LOCK = threading.Lock()
+_AUTH_MODEL_SEMAPHORE_CACHE: dict[int, threading.Semaphore] = {}
 
 _SMOKE_TEST_HTML = """
 <!doctype html>
@@ -308,6 +313,7 @@ class AuthModelSettings:
     model: str
     timeout_seconds: int
     max_steps: int
+    max_concurrency: int
 
 
 @dataclass(frozen=True)
@@ -375,8 +381,9 @@ def load_auth_model_settings() -> AuthModelSettings:
     api_base = os.environ.get(AUTH_MODEL_API_BASE_ENV_VAR, DEFAULT_AUTH_MODEL_API_BASE).strip() or DEFAULT_AUTH_MODEL_API_BASE
     api_key = os.environ.get(AUTH_MODEL_API_KEY_ENV_VAR, DEFAULT_AUTH_MODEL_API_KEY).strip() or DEFAULT_AUTH_MODEL_API_KEY
     model = os.environ.get(AUTH_MODEL_NAME_ENV_VAR, DEFAULT_AUTH_MODEL_NAME).strip() or DEFAULT_AUTH_MODEL_NAME
-    timeout_seconds = _safe_int(os.environ.get(AUTH_MODEL_TIMEOUT_ENV_VAR), default=60, minimum=5, maximum=300)
+    timeout_seconds = _safe_int(os.environ.get(AUTH_MODEL_TIMEOUT_ENV_VAR), default=180, minimum=5, maximum=900)
     max_steps = _safe_int(os.environ.get(AUTH_MODEL_MAX_STEPS_ENV_VAR), default=16, minimum=1, maximum=40)
+    max_concurrency = _safe_int(os.environ.get(AUTH_MODEL_MAX_CONCURRENCY_ENV_VAR), default=1, minimum=1, maximum=16)
     return AuthModelSettings(
         enabled=enabled,
         api_base=api_base.rstrip("/"),
@@ -384,7 +391,18 @@ def load_auth_model_settings() -> AuthModelSettings:
         model=model,
         timeout_seconds=timeout_seconds,
         max_steps=max_steps,
+        max_concurrency=max_concurrency,
     )
+
+
+def _auth_model_semaphore(limit: int) -> threading.Semaphore:
+    normalized = max(1, int(limit))
+    with _AUTH_MODEL_SEMAPHORE_LOCK:
+        semaphore = _AUTH_MODEL_SEMAPHORE_CACHE.get(normalized)
+        if semaphore is None:
+            semaphore = threading.Semaphore(normalized)
+            _AUTH_MODEL_SEMAPHORE_CACHE[normalized] = semaphore
+        return semaphore
 
 
 def drive_google_auth_with_model(
@@ -734,8 +752,21 @@ def request_auth_model_decision(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
-            raw = response.read().decode("utf-8")
+        semaphore = _auth_model_semaphore(settings.max_concurrency)
+        queue_started_at = time.time()
+        acquired_immediately = semaphore.acquire(blocking=False)
+        if not acquired_immediately:
+            if logger is not None:
+                logger(f"auth model queue: waiting for slot (max_concurrency={settings.max_concurrency})")
+            semaphore.acquire()
+        try:
+            waited_seconds = time.time() - queue_started_at
+            if logger is not None and waited_seconds >= 0.05:
+                logger(f"auth model queue: acquired slot after {waited_seconds:.2f}s")
+            with urllib.request.urlopen(request, timeout=settings.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        finally:
+            semaphore.release()
     except urllib.error.URLError as exc:
         raise AuthModelUnavailable(f"unable to reach auth model at {settings.api_base}: {exc.reason}") from exc
     except Exception as exc:

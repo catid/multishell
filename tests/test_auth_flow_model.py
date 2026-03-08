@@ -45,7 +45,9 @@ def test_load_auth_model_settings_defaults(monkeypatch) -> None:
     assert settings.enabled is True
     assert settings.api_base == DEFAULT_AUTH_MODEL_API_BASE
     assert settings.model == DEFAULT_AUTH_MODEL_NAME
+    assert settings.timeout_seconds == 180
     assert settings.max_steps == 16
+    assert settings.max_concurrency == 1
 
 
 def test_request_auth_model_decision_disables_qwen_thinking(monkeypatch) -> None:
