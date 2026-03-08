@@ -4,6 +4,7 @@ import os
 import signal
 import time
 import uuid
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -68,8 +69,14 @@ def child_env(
 
 def suppress_node_warnings(base_env: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(base_env if base_env is not None else os.environ)
-    env[ENV_NODE_NO_WARNINGS] = "1"
+    apply_node_warning_suppression(env)
     return env
+
+
+def apply_node_warning_suppression(env: MutableMapping[str, str] | None = None) -> MutableMapping[str, str]:
+    target = os.environ if env is None else env
+    target[ENV_NODE_NO_WARNINGS] = "1"
+    return target
 
 
 def cleanup_stale_runtime(grace_seconds: float = 3.0) -> list[str]:

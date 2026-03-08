@@ -17,7 +17,7 @@ import pexpect
 
 from .config import AgentSpec, account_for_agent, all_agent_specs, credential_source_agent, state_root
 from .homes import agent_home, auth_path, claude_home, ensure_agent_home, ensure_claude_home, has_claude_auth
-from .runtime import child_env, suppress_node_warnings
+from .runtime import apply_node_warning_suppression, child_env, suppress_node_warnings
 
 
 DEVICE_URL = "https://auth.openai.com/codex/device"
@@ -56,6 +56,7 @@ def resolve_credentials(agent_names: list[str]) -> list[AgentCredentials]:
 
 
 def run_auto_login(credentials: list[AgentCredentials], headed: bool = False, timeout_seconds: int = 180) -> None:
+    apply_node_warning_suppression()
     try:
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError as exc:

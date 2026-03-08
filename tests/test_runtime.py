@@ -11,6 +11,7 @@ from multishell.runtime import (
     ENV_STATE_ROOT,
     ObservedProcess,
     _discover_stale_processes,
+    apply_node_warning_suppression,
     child_env,
     suppress_node_warnings,
 )
@@ -35,6 +36,15 @@ def test_suppress_node_warnings_overrides_inherited_setting() -> None:
 
     assert env[ENV_NODE_NO_WARNINGS] == "1"
     assert env["PATH"] == "/usr/bin"
+
+
+def test_apply_node_warning_suppression_updates_current_process_env(monkeypatch) -> None:
+    monkeypatch.setenv(ENV_NODE_NO_WARNINGS, "0")
+
+    env = apply_node_warning_suppression()
+
+    assert env is not None
+    assert env[ENV_NODE_NO_WARNINGS] == "1"
 
 
 def test_discover_stale_processes_finds_previous_runtime_homes_and_browser_profiles(tmp_path: Path) -> None:

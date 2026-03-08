@@ -20,6 +20,7 @@ from .autologin import (
     _write_debug_artifacts,
 )
 from .config import account_for_agent, provider_account_for_name
+from .runtime import apply_node_warning_suppression
 
 
 SUPPORTED_PROVIDERS = frozenset({"chatgpt_pro", "gemini_deepthink"})
@@ -234,6 +235,7 @@ class WebReasonerManager:
             return job
 
     def _execute_job(self, job: WebReasonerJob) -> str:
+        apply_node_warning_suppression()
         try:
             from playwright.sync_api import sync_playwright
         except ModuleNotFoundError as exc:

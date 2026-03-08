@@ -18,7 +18,7 @@ from .config import (
     state_root,
 )
 from .homes import agent_home, all_agent_names, auth_path, claude_home, claude_logged_in, ensure_agent_home, ensure_claude_home
-from .runtime import cleanup_stale_runtime, ensure_runtime_environment, suppress_node_warnings
+from .runtime import apply_node_warning_suppression, cleanup_stale_runtime, ensure_runtime_environment, suppress_node_warnings
 
 
 DEFAULT_INSTALL_ROOT = Path.home() / ".local" / "share" / "multishell"
@@ -128,6 +128,7 @@ def cmd_install_browser(_: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("playwright"):
         return 0
     print("installing Playwright Chromium browser; this can take several minutes on first run")
+    apply_node_warning_suppression()
     env = suppress_node_warnings(os.environ.copy())
     subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, env=env)
     print("browser install complete")
@@ -233,6 +234,7 @@ def cmd_auto_login(args: argparse.Namespace) -> int:
         return 0
 
     from .autologin import resolve_credentials, run_auto_login
+    apply_node_warning_suppression()
 
     if args.all:
         target_agents = all_agent_names()
