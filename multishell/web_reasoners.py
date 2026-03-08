@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import threading
 import time
 import uuid
@@ -20,7 +19,7 @@ from .autologin import (
     _page_title,
     _write_debug_artifacts,
 )
-from .config import email_env_var, gemini_email_env_var, gemini_password_env_var, password_env_var
+from .config import account_for_agent, provider_account_for_name
 
 
 SUPPORTED_PROVIDERS = frozenset({"chatgpt_pro", "gemini_deepthink"})
@@ -340,12 +339,7 @@ class WebReasonerManager:
         )
 
     def _run_gemini_deepthink(self, page: object, job: WebReasonerJob, cancel_flag: threading.Event) -> str:
-        email = os.environ.get(gemini_email_env_var(), "")
-        password = os.environ.get(gemini_password_env_var(), "")
-        if not email or not password:
-            raise WebReasonerError(
-                f"missing Gemini OAuth credentials in env: {gemini_email_env_var()} / {gemini_password_env_var()}"
-            )
+        email, password = _resolve_gemini_account(job.account_agent)
         _check_cancel(cancel_flag)
         page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(3000)
@@ -380,11 +374,25 @@ class WebReasonerManager:
 
 
 def _resolve_openai_account(account_agent: str) -> tuple[str, str]:
-    email = os.environ.get(email_env_var(account_agent), "")
-    password = os.environ.get(password_env_var(account_agent), "")
+    try:
+        account = account_for_agent(account_agent)
+    except KeyError as exc:
+        raise WebReasonerError(f"unknown OpenAI account agent: {account_agent}") from exc
+    email = account.email
+    password = account.password
     if not email or not password:
         raise WebReasonerError(f"missing OpenAI OAuth credentials for {account_agent}")
     return email, password
+
+
+def _resolve_gemini_account(account_name: str) -> tuple[str, str]:
+    try:
+        account = provider_account_for_name(account_name)
+    except KeyError as exc:
+        raise WebReasonerError(f"unknown Gemini account: {account_name}") from exc
+    if not account.email or not account.password:
+        raise WebReasonerError(f"missing Gemini OAuth credentials for {account_name}")
+    return account.email, account.password
 
 
 def _check_cancel(cancel_flag: threading.Event) -> None:

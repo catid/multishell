@@ -2,13 +2,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from multishell.account_login import account_slots, mask_secret, run_login_editor
+from multishell.account_login import mask_secret, run_login_editor
+from multishell.accounts import (
+    PROVIDER_ANTHROPIC,
+    PROVIDER_OPENAI,
+    AccountRecord,
+    load_accounts_from_dotenv,
+    save_accounts_to_dotenv,
+)
+from multishell.envfile import DotenvFile
 
 
-def test_account_slots_cover_manager_workers_and_gemini() -> None:
-    slots = account_slots()
+def test_account_inventory_round_trips_through_dotenv(tmp_path: Path) -> None:
+    env_path = tmp_path / ".env"
+    env_file = DotenvFile.load(env_path, 'MULTISHELL_ACCOUNTS="[]"\n')
+    accounts = [
+        AccountRecord(
+            key="account-1",
+            email="person@example.com",
+            password="secret",
+            providers=(PROVIDER_OPENAI, PROVIDER_ANTHROPIC),
+        )
+    ]
 
-    assert [slot.key for slot in slots] == ["manager", "worker-1", "worker-2", "worker-3", "worker-4", "gemini"]
+    save_accounts_to_dotenv(env_file, accounts)
+    env_file.save()
+
+    reloaded = DotenvFile.load(env_path, 'MULTISHELL_ACCOUNTS="[]"\n')
+    assert load_accounts_from_dotenv(reloaded) == accounts
 
 
 def test_mask_secret_hides_non_empty_values() -> None:

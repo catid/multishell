@@ -79,6 +79,9 @@ class DotenvFile:
                 return
         self._lines.append(DotenvLine(raw="", key=key, value=value))
 
+    def delete(self, key: str) -> None:
+        self._lines = [line for line in self._lines if line.key != key]
+
     def save(self) -> None:
         rendered: list[str] = []
         seen: set[str] = set()

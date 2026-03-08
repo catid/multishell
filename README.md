@@ -21,7 +21,7 @@ The installer:
 - creates a dedicated Python venv under `~/.local/share/multishell`
 - installs a `multishell` wrapper into `~/.local/bin`
 - installs missing Ubuntu system packages with `sudo` when needed
-- launches `multishell login` so you can enter the Google account emails and passwords in a curses TUI
+- launches `multishell login` so you can add Google accounts in a curses TUI, mask/edit passwords, and toggle OpenAI, Anthropic, and Gemini AI Ultra access per account
 - runs `multishell install-browser`
 - runs `multishell auto-login --all` and uses `--headed` automatically when `DISPLAY` is available
 
@@ -43,6 +43,12 @@ Edit the account list again later:
 ```bash
 multishell login
 ```
+
+The login TUI starts with an empty account list. Add as many Google accounts as you want and toggle provider access per row:
+
+- OpenAI-enabled accounts determine the manager account plus the available Codex worker pool.
+- Anthropic-enabled accounts determine the available Claude worker pool.
+- Gemini-enabled accounts become the Gemini AI Ultra account pool for Deep Think jobs.
 
 ## Uninstall
 

@@ -15,7 +15,7 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import pexpect
 
-from .config import AgentSpec, all_agent_specs, credential_source_agent, password_env_var, state_root
+from .config import AgentSpec, account_for_agent, all_agent_specs, credential_source_agent, state_root
 from .homes import agent_home, auth_path, claude_home, ensure_agent_home, ensure_claude_home, has_claude_auth
 from .runtime import child_env, suppress_node_warnings
 
@@ -40,16 +40,18 @@ def resolve_credentials(agent_names: list[str]) -> list[AgentCredentials]:
 
     for agent_name in agent_names:
         spec = by_name[agent_name]
-        env_name = password_env_var(agent_name)
-        password = os.environ.get(env_name)
+        try:
+            password = account_for_agent(agent_name).password
+        except KeyError:
+            password = ""
         if not password:
-            missing.append(f"{agent_name} via ${env_name}")
+            missing.append(agent_name)
             continue
         credentials.append(AgentCredentials(spec=spec, password=password))
 
     if missing:
         missing_text = ", ".join(missing)
-        raise RuntimeError(f"missing passwords: {missing_text}")
+        raise RuntimeError(f"missing passwords for: {missing_text}")
     return credentials
 
 

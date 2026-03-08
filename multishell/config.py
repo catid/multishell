@@ -4,6 +4,16 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from .accounts import (
+    ACCOUNTS_ENV_VAR,
+    PROVIDER_ANTHROPIC,
+    PROVIDER_GEMINI,
+    PROVIDER_OPENAI,
+    AccountRecord,
+    legacy_accounts_present,
+    load_accounts_from_env,
+    placeholder_accounts,
+)
 from .envfile import parse_env_value
 
 
@@ -11,35 +21,62 @@ MODEL = "gpt-5.4"
 MODEL_REASONING_EFFORT = "medium"
 SPARK_MODEL = "gpt-5.3-spark"
 SPARK_REASONING_EFFORT = "xhigh"
-# Verified locally with `claude -p --model claude-opus-4-6 ...`.
 CLAUDE_MODEL = "claude-opus-4-6"
-# `high` is the maximum effort level currently exposed by `claude --help`.
 CLAUDE_REASONING_EFFORT = "high"
 MISSING_ENV_PREFIX = "<missing:"
 ENV_FILE_ENV_VAR = "MULTISHELL_ENV_FILE"
 STATE_ROOT_ENV_VAR = "MULTISHELL_STATE_ROOT"
 WORKSPACE_ROOT_ENV_VAR = "MULTISHELL_WORKSPACE_ROOT"
-DEFAULT_DOTENV_TEMPLATE = """MULTISHELL_MANAGER_EMAIL=manager@example.com
-MULTISHELL_MANAGER_PASSWORD="replace-me"
-# The manager lane is reused by the Codex manager and `claude-worker-5`.
-
-MULTISHELL_WORKER_1_EMAIL=worker1@example.com
-MULTISHELL_WORKER_1_PASSWORD="replace-me"
-
-MULTISHELL_WORKER_2_EMAIL=worker2@example.com
-MULTISHELL_WORKER_2_PASSWORD="replace-me"
-
-MULTISHELL_WORKER_3_EMAIL=worker3@example.com
-MULTISHELL_WORKER_3_PASSWORD="replace-me"
-
-MULTISHELL_WORKER_4_EMAIL=worker4@example.com
-MULTISHELL_WORKER_4_PASSWORD="replace-me"
-
-# Gemini Deep Think uses a separate Google OAuth mapping.
-# The current implementation uses the manager/bot account only.
-MULTISHELL_GEMINI_EMAIL=bot@example.com
-MULTISHELL_GEMINI_PASSWORD="replace-me"
+DEFAULT_DOTENV_TEMPLATE = """# Multishell stores its Google account inventory in this file.
+# Use `multishell login` to add or remove accounts and toggle OpenAI, Anthropic, and Gemini access.
+MULTISHELL_ACCOUNTS="[]"
 """
+
+_CODEX_PERSONALITIES = (
+    (
+        "You are a fast implementation specialist. Bias toward shipping the first correct cut quickly, "
+        "then tightening rough edges.",
+        2,
+    ),
+    (
+        "You are a cautious systems engineer. Bias toward reliability, state management, failure handling, "
+        "and operational clarity.",
+        3,
+    ),
+    (
+        "You are a product-minded UI engineer. Bias toward terminal UX quality, visual clarity, "
+        "and interaction polish.",
+        4,
+    ),
+    (
+        "You are a debugging and integration closer. Bias toward verifying joins between pieces, "
+        "removing hidden assumptions, and finishing work.",
+        5,
+    ),
+)
+
+_CLAUDE_PERSONALITIES = (
+    (
+        "You are a creative implementation and review partner. Bias toward diverse candidate code, "
+        "novel approaches, and high-signal review comments.",
+        2,
+    ),
+    (
+        "You are a systems-minded creative reviewer. Bias toward unusual but viable designs, risk spotting, "
+        "and code review from a different model family.",
+        3,
+    ),
+    (
+        "You are a product and UX ideation partner. Bias toward creative interface exploration, terminal UX alternatives, "
+        "and high-leverage review.",
+        4,
+    ),
+    (
+        "You are an integration and review closer with a creative bent. Bias toward diverse bug-hunting, "
+        "cross-checking, and alternative code paths.",
+        5,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -50,6 +87,20 @@ class AgentSpec:
     personality: str
     accent_color: int
     engine: str = "codex"
+    account_key: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.account_key:
+            object.__setattr__(self, "account_key", self.name)
+
+
+@dataclass(frozen=True)
+class ProviderAccountSpec:
+    name: str
+    account_key: str
+    account_email: str
+    provider: str
+    accent_color: int
 
 
 def app_root() -> Path:
@@ -101,9 +152,44 @@ def required_env(name: str) -> str:
 _load_dotenv()
 
 
+def _initial_account_records() -> list[AccountRecord]:
+    records = load_accounts_from_env(os.environ)
+    if records:
+        return records
+    if ACCOUNTS_ENV_VAR in os.environ or legacy_accounts_present(os.environ):
+        return records
+    return placeholder_accounts()
+
+
+ACCOUNT_RECORDS = _initial_account_records()
+ACCOUNT_RECORDS_BY_KEY = {account.key: account for account in ACCOUNT_RECORDS}
+
+_OPENAI_ACCOUNTS = [account for account in ACCOUNT_RECORDS if account.uses(PROVIDER_OPENAI)]
+_ANTHROPIC_ACCOUNTS = [account for account in ACCOUNT_RECORDS if account.uses(PROVIDER_ANTHROPIC)]
+_GEMINI_ACCOUNTS = [account for account in ACCOUNT_RECORDS if account.uses(PROVIDER_GEMINI)]
+
+
+def _missing_account_value(label: str) -> str:
+    return f"<missing:{label}>"
+
+
+def _cycled(values: tuple[tuple[str, int], ...], index: int) -> tuple[str, int]:
+    return values[(index - 1) % len(values)]
+
+
+def _manager_account() -> AccountRecord | None:
+    if _OPENAI_ACCOUNTS:
+        return _OPENAI_ACCOUNTS[0]
+    return None
+
+
+_manager_account_record = _manager_account()
 MANAGER_SPEC = AgentSpec(
     name="manager",
-    account_email=required_env("MULTISHELL_MANAGER_EMAIL"),
+    account_key=_manager_account_record.key if _manager_account_record is not None else "manager",
+    account_email=(
+        _manager_account_record.email if _manager_account_record is not None and _manager_account_record.email else _missing_account_value("manager-email")
+    ),
     role="manager",
     personality=(
         "You are the delegation manager. You do not directly modify files. "
@@ -115,104 +201,40 @@ MANAGER_SPEC = AgentSpec(
 
 WORKER_SPECS = [
     AgentSpec(
-        name="worker-1",
-        account_email=required_env("MULTISHELL_WORKER_1_EMAIL"),
+        name=f"worker-{index}",
+        account_key=account.key,
+        account_email=account.email or _missing_account_value(f"{account.key}-email"),
         role="worker",
-        personality=(
-            "You are a fast implementation specialist. Bias toward shipping the first correct cut, "
-            "then tightening rough edges."
-        ),
-        accent_color=2,
-    ),
-    AgentSpec(
-        name="worker-2",
-        account_email=required_env("MULTISHELL_WORKER_2_EMAIL"),
-        role="worker",
-        personality=(
-            "You are a cautious systems engineer. Bias toward reliability, state management, "
-            "failure handling, and operational clarity."
-        ),
-        accent_color=3,
-    ),
-    AgentSpec(
-        name="worker-3",
-        account_email=required_env("MULTISHELL_WORKER_3_EMAIL"),
-        role="worker",
-        personality=(
-            "You are a product-minded UI engineer. Bias toward terminal UX quality, visual clarity, "
-            "and interaction polish."
-        ),
-        accent_color=4,
-    ),
-    AgentSpec(
-        name="worker-4",
-        account_email=required_env("MULTISHELL_WORKER_4_EMAIL"),
-        role="worker",
-        personality=(
-            "You are a debugging and integration closer. Bias toward verifying joins between pieces, "
-            "removing hidden assumptions, and finishing work."
-        ),
-        accent_color=5,
-    ),
+        personality=_cycled(_CODEX_PERSONALITIES, index)[0],
+        accent_color=_cycled(_CODEX_PERSONALITIES, index)[1],
+    )
+    for index, account in enumerate(_OPENAI_ACCOUNTS[1:], start=1)
 ]
 
 CLAUDE_WORKER_SPECS = [
     AgentSpec(
-        name="claude-worker-5",
-        account_email=MANAGER_SPEC.account_email,
+        name=f"claude-worker-{index}",
+        account_key=account.key,
+        account_email=account.email or _missing_account_value(f"{account.key}-email"),
         role="claude-worker",
-        personality=(
-            "You are a creative cross-model reviewer paired with the manager account. "
-            "Bias toward fresh ideas, code review, alternative framings, and different-model perspective."
-        ),
-        accent_color=6,
+        personality=_cycled(_CLAUDE_PERSONALITIES, index)[0],
+        accent_color=_cycled(_CLAUDE_PERSONALITIES, index)[1],
         engine="claude",
-    ),
-    AgentSpec(
-        name="claude-worker-1",
-        account_email=required_env("MULTISHELL_WORKER_1_EMAIL"),
-        role="claude-worker",
-        personality=(
-            "You are a creative implementation and review partner. Bias toward diverse candidate code, "
-            "novel approaches, and high-signal review comments."
-        ),
-        accent_color=2,
-        engine="claude",
-    ),
-    AgentSpec(
-        name="claude-worker-2",
-        account_email=required_env("MULTISHELL_WORKER_2_EMAIL"),
-        role="claude-worker",
-        personality=(
-            "You are a systems-minded creative reviewer. Bias toward unusual but viable designs, "
-            "risk spotting, and code review from a different model family."
-        ),
-        accent_color=3,
-        engine="claude",
-    ),
-    AgentSpec(
-        name="claude-worker-3",
-        account_email=required_env("MULTISHELL_WORKER_3_EMAIL"),
-        role="claude-worker",
-        personality=(
-            "You are a product and UX ideation partner. Bias toward creative interface exploration, "
-            "terminal UX alternatives, and high-leverage review."
-        ),
-        accent_color=4,
-        engine="claude",
-    ),
-    AgentSpec(
-        name="claude-worker-4",
-        account_email=required_env("MULTISHELL_WORKER_4_EMAIL"),
-        role="claude-worker",
-        personality=(
-            "You are an integration and review closer with a creative bent. Bias toward diverse bug-hunting, "
-            "cross-checking, and alternative code paths."
-        ),
-        accent_color=5,
-        engine="claude",
-    ),
+    )
+    for index, account in enumerate(_ANTHROPIC_ACCOUNTS, start=1)
 ]
+
+GEMINI_ACCOUNT_SPECS = [
+    ProviderAccountSpec(
+        name=f"gemini-account-{index}",
+        account_key=account.key,
+        account_email=account.email or _missing_account_value(f"{account.key}-email"),
+        provider="gemini_deepthink",
+        accent_color=3,
+    )
+    for index, account in enumerate(_GEMINI_ACCOUNTS, start=1)
+]
+
 
 def manager_workspace_root() -> Path:
     path = state_root() / "workspaces" / "manager"
@@ -228,6 +250,10 @@ def all_agent_specs() -> list[AgentSpec]:
     return [MANAGER_SPEC, *WORKER_SPECS, *CLAUDE_WORKER_SPECS]
 
 
+def all_codex_specs() -> list[AgentSpec]:
+    return [MANAGER_SPEC, *WORKER_SPECS]
+
+
 def spec_by_name(agent_name: str) -> AgentSpec:
     for spec in all_agent_specs():
         if spec.name == agent_name:
@@ -235,32 +261,75 @@ def spec_by_name(agent_name: str) -> AgentSpec:
     raise KeyError(agent_name)
 
 
+def maybe_spec_by_name(agent_name: str) -> AgentSpec | None:
+    try:
+        return spec_by_name(agent_name)
+    except KeyError:
+        return None
+
+
+def account_by_key(account_key: str) -> AccountRecord:
+    if account_key in ACCOUNT_RECORDS_BY_KEY:
+        return ACCOUNT_RECORDS_BY_KEY[account_key]
+    raise KeyError(account_key)
+
+
+def account_for_agent(agent_name: str) -> AccountRecord:
+    return account_by_key(spec_by_name(agent_name).account_key)
+
+
+def gemini_account_specs() -> list[ProviderAccountSpec]:
+    return list(GEMINI_ACCOUNT_SPECS)
+
+
+def default_gemini_account_name() -> str | None:
+    if not GEMINI_ACCOUNT_SPECS:
+        return None
+    return GEMINI_ACCOUNT_SPECS[0].name
+
+
+def gemini_account_by_name(name: str) -> ProviderAccountSpec:
+    for spec in GEMINI_ACCOUNT_SPECS:
+        if spec.name == name:
+            return spec
+    raise KeyError(name)
+
+
+def provider_account_for_name(name: str) -> AccountRecord:
+    return account_by_key(gemini_account_by_name(name).account_key)
+
+
+def home_owner_name(agent_name: str) -> str:
+    spec = maybe_spec_by_name(agent_name)
+    if spec is not None:
+        return spec.account_key
+    if agent_name.endswith("-spark"):
+        return home_owner_name(agent_name[: -len("-spark")])
+    return agent_name
+
+
 def password_env_var(agent_name: str) -> str:
-    normalized = credential_source_agent(agent_name).upper().replace("-", "_")
-    return f"MULTISHELL_{normalized}_PASSWORD"
+    return account_config_label(home_owner_name(agent_name), "password")
 
 
 def email_env_var(agent_name: str) -> str:
-    normalized = credential_source_agent(agent_name).upper().replace("-", "_")
-    return f"MULTISHELL_{normalized}_EMAIL"
+    return account_config_label(home_owner_name(agent_name), "email")
 
 
 def gemini_email_env_var() -> str:
-    return "MULTISHELL_GEMINI_EMAIL"
+    return f"{ACCOUNTS_ENV_VAR} [gemini email]"
 
 
 def gemini_password_env_var() -> str:
-    return "MULTISHELL_GEMINI_PASSWORD"
+    return f"{ACCOUNTS_ENV_VAR} [gemini password]"
+
+
+def account_config_label(account_key: str, field: str) -> str:
+    return f"{ACCOUNTS_ENV_VAR} [{account_key} {field}]"
 
 
 def credential_source_agent(agent_name: str) -> str:
-    if agent_name == "claude-worker-5":
-        return "manager"
-    if agent_name.startswith("claude-worker-"):
-        return agent_name.removeprefix("claude-")
-    if agent_name.endswith("-spark"):
-        return agent_name[: -len("-spark")]
-    return agent_name
+    return home_owner_name(agent_name)
 
 
 def spark_agent_name(worker_name: str) -> str:
@@ -279,8 +348,8 @@ def missing_email_env_vars(agent_names: list[str] | None = None) -> list[str]:
         if wanted is not None and spec.name not in wanted:
             continue
         if is_missing_env_value(spec.account_email):
-            env_name = email_env_var(spec.name)
-            if env_name not in seen:
-                missing.append(env_name)
-                seen.add(env_name)
+            label = account_config_label(spec.account_key, "email")
+            if label not in seen:
+                missing.append(label)
+                seen.add(label)
     return missing

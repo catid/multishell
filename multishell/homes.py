@@ -6,16 +6,16 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from .config import MODEL, MODEL_REASONING_EFFORT, all_agent_specs, credential_source_agent, state_root
+from .config import MODEL, MODEL_REASONING_EFFORT, all_agent_specs, credential_source_agent, home_owner_name, state_root
 from .runtime import suppress_node_warnings
 
 
 def agent_home(agent_name: str) -> Path:
-    return state_root() / "homes" / agent_name
+    return state_root() / "homes" / home_owner_name(agent_name)
 
 
 def claude_home_owner(agent_name: str) -> str:
-    return credential_source_agent(agent_name)
+    return home_owner_name(agent_name)
 
 
 def claude_home(agent_name: str) -> Path:
@@ -121,7 +121,7 @@ def ensure_claude_home(agent_name: str, auth_source_agent: str | None = None) ->
 
 
 def _link_auth_state(agent_name: str, auth_source_agent: str) -> None:
-    if auth_source_agent == agent_name:
+    if agent_home(agent_name) == agent_home(auth_source_agent):
         return
 
     source = auth_path(auth_source_agent)

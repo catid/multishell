@@ -9,6 +9,7 @@ from .claude_session import ClaudeSession
 from .codex_session import CodexSession, SessionEvent, TranscriptEntry
 from .config import (
     CLAUDE_WORKER_SPECS,
+    GEMINI_ACCOUNT_SPECS,
     MANAGER_SPEC,
     SPARK_MODEL,
     SPARK_REASONING_EFFORT,
@@ -201,7 +202,7 @@ Rules:
 - Codex workers are generally more reliable for execution. Claude workers are more creative and often useful for alternative ideas and code review.
 - Use cross-review patterns for diversity: Claude drafts with Codex review, Codex drafts with Claude review, or parallel candidates from both families.
 - Claude is especially useful for code review, idea expansion, alternative framings, and different-model perspective. Treat it as creative but less reliable.
-- Use Gemini Deep Think when you want slower but broader world knowledge or math-heavy parallel reasoning. It only runs on the manager/bot account.
+- Use Gemini Deep Think when you want slower but broader world knowledge or math-heavy parallel reasoning. It runs on the configured Gemini AI Ultra account pool.
 - Choose worker working directories intentionally. You can pass `cwd` when starting, restarting, or delegating.
 - Keep messages concise and operational.
 
@@ -349,6 +350,7 @@ class MultiShellController:
                 role="spark",
                 personality=f"Draft delegate paired with {spec.name}",
                 accent_color=spec.accent_color,
+                account_key=spec.account_key,
             )
             self.spark_workers[spec.name] = CodexSession(
                 spark_spec,
@@ -572,7 +574,7 @@ class MultiShellController:
             if not prompt:
                 return {"ok": False, "error": "prompt is required for action=start"}
             if provider == "gemini_deepthink":
-                agent = MANAGER_SPEC.name
+                agent = self._select_gemini_account()
             job = self.web_reasoners.start_job(provider, agent, prompt, label=label, timeout_seconds=timeout_seconds)
             self._push_message("manager", f"started {provider} job {job['id'][:8]} on {agent}: {job['label']}")
             return {"ok": True, "job": job}
@@ -818,6 +820,19 @@ class MultiShellController:
             "completed_turns": completed,
             "failed_turns": failed,
         }
+
+    def _select_gemini_account(self) -> str:
+        if not GEMINI_ACCOUNT_SPECS:
+            raise WebReasonerError("no Gemini AI Ultra accounts configured; use `multishell login` first")
+        active_counts = {spec.name: 0 for spec in GEMINI_ACCOUNT_SPECS}
+        for job in self.web_reasoners.list_jobs(provider="gemini_deepthink"):
+            if str(job.get("status") or "") not in {"queued", "running", "canceling"}:
+                continue
+            name = str(job.get("account_agent") or "")
+            if name in active_counts:
+                active_counts[name] += 1
+        selected = min(GEMINI_ACCOUNT_SPECS, key=lambda spec: (active_counts[spec.name], spec.name))
+        return selected.name
 
     def _fanout_guidance(self, text: str) -> str:
         normalized = text.lower()

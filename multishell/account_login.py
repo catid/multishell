@@ -7,34 +7,33 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import FrameType
 
-from .config import (
-    dotenv_path,
-    dotenv_template_text,
-    email_env_var,
-    gemini_email_env_var,
-    gemini_password_env_var,
-    password_env_var,
+from .accounts import (
+    PROVIDER_ANTHROPIC,
+    PROVIDER_GEMINI,
+    PROVIDER_OPENAI,
+    AccountRecord,
+    load_accounts_from_dotenv,
+    next_account_key,
+    save_accounts_to_dotenv,
 )
+from .config import dotenv_path, dotenv_template_text
 from .envfile import DotenvFile
 
 
 MIN_HEIGHT = 16
-MIN_WIDTH = 78
-
-
-@dataclass(frozen=True)
-class AccountSlot:
-    key: str
-    label: str
-    email_env: str
-    password_env: str
-    used_by: str
+MIN_WIDTH = 92
+EDITABLE_COLUMNS = ("openai", "anthropic", "gemini", "email", "password")
+CHECKBOX_PROVIDERS = {
+    0: PROVIDER_OPENAI,
+    1: PROVIDER_ANTHROPIC,
+    2: PROVIDER_GEMINI,
+}
 
 
 @dataclass
 class AccountState:
     env_file: DotenvFile
-    slots: list[AccountSlot]
+    accounts: list[AccountRecord]
     selected_row: int = 0
     selected_col: int = 0
     status: str = ""
@@ -45,24 +44,23 @@ class InterruptState:
     requested: bool = False
 
 
-def account_slots() -> list[AccountSlot]:
-    return [
-        AccountSlot("manager", "Manager", email_env_var("manager"), password_env_var("manager"), "manager, claude-worker-5"),
-        AccountSlot("worker-1", "Worker 1", email_env_var("worker-1"), password_env_var("worker-1"), "worker-1, claude-worker-1"),
-        AccountSlot("worker-2", "Worker 2", email_env_var("worker-2"), password_env_var("worker-2"), "worker-2, claude-worker-2"),
-        AccountSlot("worker-3", "Worker 3", email_env_var("worker-3"), password_env_var("worker-3"), "worker-3, claude-worker-3"),
-        AccountSlot("worker-4", "Worker 4", email_env_var("worker-4"), password_env_var("worker-4"), "worker-4, claude-worker-4"),
-        AccountSlot("gemini", "Gemini", gemini_email_env_var(), gemini_password_env_var(), "gemini_deepthink"),
-    ]
-
-
 def run_login_editor(path: Path | None = None) -> int:
     env_path = Path(path or dotenv_path()).expanduser()
     env_file = DotenvFile.load(env_path, dotenv_template_text())
-    state = AccountState(env_file=env_file, slots=account_slots(), status=f"editing {env_path}")
+    state = AccountState(
+        env_file=env_file,
+        accounts=load_accounts_from_dotenv(env_file),
+        status=f"editing {env_path}",
+    )
     with _capture_sigint() as interrupt_state:
         curses.wrapper(lambda stdscr: _main(stdscr, state, interrupt_state))
     return 0
+
+
+def mask_secret(value: str) -> str:
+    if not value:
+        return "(missing)"
+    return "*" * min(12, max(8, len(value)))
 
 
 def _main(stdscr: curses.window, state: AccountState, interrupt_state: InterruptState) -> None:
@@ -107,22 +105,31 @@ def _main(stdscr: curses.window, state: AccountState, interrupt_state: Interrupt
             if interrupt_state.requested or key in ("\x03", "q", "Q"):
                 return
             if key in ("\t", curses.KEY_RIGHT, "l"):
-                state.selected_col = (state.selected_col + 1) % 2
+                state.selected_col = (state.selected_col + 1) % len(EDITABLE_COLUMNS)
                 continue
             if key in (curses.KEY_LEFT, "h"):
-                state.selected_col = (state.selected_col - 1) % 2
+                state.selected_col = (state.selected_col - 1) % len(EDITABLE_COLUMNS)
                 continue
             if key in (curses.KEY_UP, "k"):
                 state.selected_row = max(0, state.selected_row - 1)
                 continue
             if key in (curses.KEY_DOWN, "j"):
-                state.selected_row = min(len(state.slots) - 1, state.selected_row + 1)
+                state.selected_row = min(max(0, len(state.accounts) - 1), state.selected_row + 1)
                 continue
-            if key in ("\n", "\r", "e", "E"):
-                _edit_selected(stdscr, state)
+            if key in ("a", "A"):
+                _add_account(state)
                 continue
             if key in ("x", "X", curses.KEY_DC):
+                _remove_selected(state)
+                continue
+            if key in ("c", "C"):
                 _clear_selected(state)
+                continue
+            if key == " ":
+                _toggle_selected_checkbox(state)
+                continue
+            if key in ("\n", "\r", "e", "E"):
+                _activate_selected(stdscr, state)
                 continue
     finally:
         _restore_terminal(stdscr)
@@ -155,28 +162,59 @@ def _draw_too_small(stdscr: curses.window, height: int, width: int) -> None:
 def _draw_screen(stdscr: curses.window, state: AccountState, width: int) -> None:
     _fill_line(stdscr, 0, width, " ", curses.color_pair(4))
     _safe_addnstr(stdscr, 0, 0, " Multishell Google Account Setup ", width - 1, curses.color_pair(4))
-    _safe_addnstr(stdscr, 1, 0, "Edit the email/password pairs stored in ~/.multishell/.env. Passwords stay masked on screen.", width - 1, curses.color_pair(1))
+    _safe_addnstr(
+        stdscr,
+        1,
+        0,
+        "Add Google accounts, then toggle which ones can be used for OpenAI, Anthropic, and Gemini AI Ultra.",
+        width - 1,
+        curses.color_pair(1),
+    )
 
     header_row = 3
     column_widths = _column_widths(width)
     _draw_table_border(stdscr, header_row, width)
-    _draw_row(stdscr, header_row + 1, ["Account", "Email", "Password", "Used By"], column_widths, header=True)
+    _draw_row(
+        stdscr,
+        header_row + 1,
+        ["Account", "OpenAI", "Anthropic", "Gemini", "Email", "Password"],
+        column_widths,
+        header=True,
+    )
     _draw_table_border(stdscr, header_row + 2, width)
 
-    for index, slot in enumerate(state.slots):
-        row = header_row + 3 + index
-        email = state.env_file.get(slot.email_env)
-        password = state.env_file.get(slot.password_env)
-        values = [slot.label, email or "(missing)", mask_secret(password), slot.used_by]
-        _draw_row(stdscr, row, values, column_widths, selected_row=index == state.selected_row, selected_col=state.selected_col)
+    if state.accounts:
+        for index, account in enumerate(state.accounts):
+            row = header_row + 3 + index
+            values = [
+                f"#{index + 1}",
+                _checkbox(account.uses(PROVIDER_OPENAI)),
+                _checkbox(account.uses(PROVIDER_ANTHROPIC)),
+                _checkbox(account.uses(PROVIDER_GEMINI)),
+                account.email or "(missing)",
+                mask_secret(account.password),
+            ]
+            _draw_row(stdscr, row, values, column_widths, selected_row=index == state.selected_row, selected_col=state.selected_col)
+    else:
+        row = header_row + 3
+        _safe_addnstr(stdscr, row, 0, "|", 1)
+        _safe_addnstr(
+            stdscr,
+            row,
+            2,
+            "No accounts configured. Press A to add your first Google account.",
+            max(0, width - 4),
+            curses.color_pair(3),
+        )
+        _safe_addnstr(stdscr, row, width - 2, "|", 1)
 
-    footer_row = header_row + 4 + len(state.slots)
+    footer_row = header_row + 4 + max(1, len(state.accounts))
     _draw_table_border(stdscr, footer_row - 1, width)
     _safe_addnstr(
         stdscr,
         footer_row,
         0,
-        "Arrows move  Tab switches field  Enter edits  X clears  Q quits  Changes save immediately",
+        "Arrows move  Tab next field  Space toggles checkbox  Enter edits  A adds  X removes  C clears field  Q quits",
         width - 1,
         curses.color_pair(3),
     )
@@ -191,12 +229,16 @@ def _draw_screen(stdscr: curses.window, state: AccountState, width: int) -> None
 
 
 def _column_widths(width: int) -> list[int]:
-    usable = max(MIN_WIDTH, width) - 5
-    account = 12
+    usable = max(MIN_WIDTH, width) - 7
+    account = 8
+    checkbox = 10
     password = 14
-    used_by = 24
-    email = max(18, usable - account - password - used_by)
-    return [account, email, password, used_by]
+    email = max(22, usable - account - checkbox - checkbox - checkbox - password)
+    return [account, checkbox, checkbox, checkbox, email, password]
+
+
+def _checkbox(enabled: bool) -> str:
+    return "[x]" if enabled else "[ ]"
 
 
 def _draw_table_border(stdscr: curses.window, row: int, width: int) -> None:
@@ -218,7 +260,7 @@ def _draw_row(
     col += 1
     for index, (value, size) in enumerate(zip(values, column_widths, strict=True)):
         attr = curses.A_BOLD if header else 0
-        if selected_row and index in {1, 2} and (index - 1) == selected_col:
+        if selected_row and index > 0 and (index - 1) == selected_col:
             attr |= curses.color_pair(5) | curses.A_BOLD
         elif header:
             attr |= curses.color_pair(1)
@@ -239,33 +281,96 @@ def _fit_cell(value: str, width: int) -> str:
     return value[: width - 3] + "..."
 
 
-def mask_secret(value: str) -> str:
-    if not value:
-        return "(missing)"
-    return "*" * min(12, max(8, len(value)))
+def _add_account(state: AccountState) -> None:
+    state.accounts.append(AccountRecord(key=next_account_key(state.accounts), email="", password="", providers=()))
+    state.selected_row = len(state.accounts) - 1
+    state.selected_col = 3
+    _save_accounts(state)
+    state.status = f"added account #{len(state.accounts)}"
 
 
-def _edit_selected(stdscr: curses.window, state: AccountState) -> None:
-    slot = state.slots[state.selected_row]
-    is_password = state.selected_col == 1
-    key = slot.password_env if is_password else slot.email_env
-    label = f"{slot.label} {'password' if is_password else 'email'}"
-    initial = state.env_file.get(key)
+def _remove_selected(state: AccountState) -> None:
+    if not state.accounts:
+        state.status = "no account to remove"
+        return
+    removed = state.accounts.pop(state.selected_row)
+    state.selected_row = min(state.selected_row, max(0, len(state.accounts) - 1))
+    _save_accounts(state)
+    state.status = f"removed {removed.email or removed.key}"
+
+
+def _clear_selected(state: AccountState) -> None:
+    if not state.accounts:
+        state.status = "no account to clear"
+        return
+    account = state.accounts[state.selected_row]
+    if state.selected_col in CHECKBOX_PROVIDERS:
+        state.status = "use Space to toggle provider checkboxes"
+        return
+    if state.selected_col == 3:
+        updated = AccountRecord(key=account.key, email="", password=account.password, providers=account.providers)
+        state.accounts[state.selected_row] = updated
+        _save_accounts(state)
+        state.status = f"cleared email for account #{state.selected_row + 1}"
+        return
+    updated = AccountRecord(key=account.key, email=account.email, password="", providers=account.providers)
+    state.accounts[state.selected_row] = updated
+    _save_accounts(state)
+    state.status = f"cleared password for account #{state.selected_row + 1}"
+
+
+def _toggle_selected_checkbox(state: AccountState) -> None:
+    if not state.accounts:
+        state.status = "press A to add an account first"
+        return
+    provider = CHECKBOX_PROVIDERS.get(state.selected_col)
+    if provider is None:
+        state.status = "press Enter to edit email or password fields"
+        return
+    account = state.accounts[state.selected_row]
+    providers = [item for item in account.providers if item != provider]
+    enabled = provider not in account.providers
+    if enabled:
+        providers.append(provider)
+    ordered = tuple(provider_name for provider_name in (PROVIDER_OPENAI, PROVIDER_ANTHROPIC, PROVIDER_GEMINI) if provider_name in providers)
+    state.accounts[state.selected_row] = AccountRecord(
+        key=account.key,
+        email=account.email,
+        password=account.password,
+        providers=ordered,
+    )
+    _save_accounts(state)
+    state.status = f"{'enabled' if enabled else 'disabled'} {provider} for account #{state.selected_row + 1}"
+
+
+def _activate_selected(stdscr: curses.window, state: AccountState) -> None:
+    if not state.accounts:
+        _add_account(state)
+        return
+    if state.selected_col in CHECKBOX_PROVIDERS:
+        _toggle_selected_checkbox(state)
+        return
+    account = state.accounts[state.selected_row]
+    is_password = state.selected_col == 4
+    label = f"account #{state.selected_row + 1} {'password' if is_password else 'email'}"
+    initial = account.password if is_password else account.email
     updated = _edit_value(stdscr, label, initial, secret=is_password)
     if updated is None:
         state.status = f"canceled edit for {label}"
         return
-    state.env_file.set(key, updated)
-    state.env_file.save()
+    state.accounts[state.selected_row] = AccountRecord(
+        key=account.key,
+        email=account.email if is_password else updated.strip(),
+        password=updated if is_password else account.password,
+        providers=account.providers,
+    )
+    _save_accounts(state)
     state.status = f"saved {label} to {state.env_file.path}"
 
 
-def _clear_selected(state: AccountState) -> None:
-    slot = state.slots[state.selected_row]
-    key = slot.password_env if state.selected_col == 1 else slot.email_env
-    state.env_file.set(key, "")
+def _save_accounts(state: AccountState) -> None:
+    save_accounts_to_dotenv(state.env_file, state.accounts)
     state.env_file.save()
-    state.status = f"cleared {key}"
 
 
 def _edit_value(stdscr: curses.window, label: str, initial: str, *, secret: bool) -> str | None:

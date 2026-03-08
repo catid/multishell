@@ -10,5 +10,5 @@ def test_manager_config_contains_model() -> None:
 
 
 def test_claude_home_shares_account_slot_with_codex_worker() -> None:
-    assert ensure_claude_home("claude-worker-5") == agent_home("manager")
-    assert claude_home("claude-worker-1") == agent_home("worker-1")
+    assert ensure_claude_home("claude-worker-1") == agent_home("manager")
+    assert claude_home("claude-worker-2") == agent_home("worker-1")
