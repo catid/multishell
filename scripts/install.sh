@@ -8,6 +8,10 @@ BIN_DIR="${MULTISHELL_BIN_DIR:-$HOME/.local/bin}"
 APP_DIR="$INSTALL_ROOT/app"
 VENV_DIR="$INSTALL_ROOT/venv"
 
+log_step() {
+  printf '\n==> %s\n' "$*"
+}
+
 require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     echo "missing required command: $1" >&2
@@ -136,6 +140,7 @@ if [[ -z "${DISPLAY:-}" ]] && ! have_cmd xvfb-run; then
 fi
 
 tarball="$tmp_dir/multishell.tar.gz"
+log_step "Downloading multishell source from GitHub"
 curl -fsSL "https://codeload.github.com/$REPO/tar.gz/$REF" -o "$tarball"
 tar -xzf "$tarball" -C "$tmp_dir"
 src_dir="$(find "$tmp_dir" -mindepth 1 -maxdepth 1 -type d -name 'multishell-*' | head -n 1)"
@@ -148,7 +153,9 @@ mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
 rm -rf "$APP_DIR"
 cp -R "$src_dir" "$APP_DIR"
 
+log_step "Creating Python virtual environment"
 "$PYTHON_BIN" -m venv "$VENV_DIR"
+log_step "Installing multishell into $VENV_DIR"
 "$VENV_DIR/bin/python" -m pip install --upgrade pip
 "$VENV_DIR/bin/python" -m pip install "$APP_DIR"
 
@@ -168,14 +175,18 @@ fi
 
 export PATH="$BIN_DIR:$PATH"
 
+log_step "Preparing config file"
 "$BIN_DIR/multishell" init-config <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+log_step "Opening account login TUI"
 "$BIN_DIR/multishell" login <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
+log_step "Installing Playwright browser runtime (this can take several minutes)"
 "$BIN_DIR/multishell" install-browser <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
 
 auto_args=(auto-login --all)
 if [[ -n "${DISPLAY:-}" ]]; then
   auto_args+=(--headed)
 fi
+log_step "Running browser auth automation for all configured accounts (press Ctrl+C to skip)"
 "$BIN_DIR/multishell" "${auto_args[@]}" <"$setup_tty" >"$setup_tty" 2>"$setup_tty"
 
 echo

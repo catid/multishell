@@ -127,7 +127,10 @@ def cmd_init_config(args: argparse.Namespace) -> int:
 def cmd_install_browser(_: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("playwright"):
         return 0
-    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True)
+    print("installing Playwright Chromium browser; this can take several minutes on first run")
+    env = suppress_node_warnings(os.environ.copy())
+    subprocess.run([sys.executable, "-m", "playwright", "install", "chromium"], check=True, env=env)
+    print("browser install complete")
     return 0
 
 
@@ -295,7 +298,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("interrupted")
+        return 130
 
 
 if __name__ == "__main__":

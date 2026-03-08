@@ -104,10 +104,12 @@ def test_install_browser_runs_playwright_install(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
     monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setenv("NODE_NO_WARNINGS", "0")
 
-    def fake_run(cmd, check):
+    def fake_run(cmd, check, env):
         captured["cmd"] = cmd
         captured["check"] = check
+        captured["env"] = env
         return SimpleNamespace(returncode=0)
 
     monkeypatch.setattr("multishell.__main__.subprocess.run", fake_run)
@@ -117,6 +119,7 @@ def test_install_browser_runs_playwright_install(monkeypatch) -> None:
     assert args.func(args) == 0
     assert captured["cmd"][1:] == ["-m", "playwright", "install", "chromium"]
     assert captured["check"] is True
+    assert captured["env"]["NODE_NO_WARNINGS"] == "1"
 
 
 def test_uninstall_removes_wrapper_and_install_root(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
@@ -185,3 +188,10 @@ def test_main_defaults_to_run_when_no_subcommand(monkeypatch) -> None:
     monkeypatch.setattr("multishell.__main__.cmd_run", lambda _args: 7)
 
     assert main([]) == 7
+
+
+def test_main_returns_130_on_keyboard_interrupt(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    monkeypatch.setattr("multishell.__main__.cmd_run", lambda _args: (_ for _ in ()).throw(KeyboardInterrupt()))
+
+    assert main([]) == 130
+    assert "interrupted" in capsys.readouterr().out

@@ -65,7 +65,12 @@ def run_auto_login(credentials: list[AgentCredentials], headed: bool = False, ti
         ) from exc
 
     with sync_playwright() as playwright:
-        for credential in credentials:
+        total = len(credentials)
+        for index, credential in enumerate(credentials, start=1):
+            print(
+                f"auto-login {index}/{total}: {credential.spec.name} "
+                f"({credential.spec.engine}, {credential.spec.account_email})"
+            )
             if credential.spec.role == "claude-worker":
                 _login_claude_one(playwright, credential, timeout_seconds, headed=headed)
             else:
