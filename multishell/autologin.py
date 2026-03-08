@@ -33,6 +33,13 @@ def _log_progress(agent_name: str, message: str) -> None:
     print(f"[{agent_name}] {message}", flush=True)
 
 
+def _log_stage_once(agent_name: str | None, seen: set[str], stage: str, message: str) -> None:
+    if agent_name is None or stage in seen:
+        return
+    seen.add(stage)
+    _log_progress(agent_name, message)
+
+
 def _periodic_progress(agent_name: str, last_logged_at: float, message: str, *, interval_seconds: float = 10.0) -> float:
     now = time.time()
     if now - last_logged_at >= interval_seconds:
@@ -308,15 +315,30 @@ def _complete_claude_google_sign_in(
 
     deadline = time.time() + 180
     last_progress = 0.0
+    seen_stages: set[str] = set()
     while time.time() < deadline:
         flow_page = _preferred_claude_auth_page(flow_page)
         body = _body_text(flow_page)
         title = _page_title(flow_page)
+        email_visible = _has_visible(
+            flow_page,
+            ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
+            timeout_ms=1000,
+        )
+        password_visible = _has_visible(
+            flow_page,
+            ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
+            timeout_ms=1000,
+        )
+        account_picker_visible = (
+            "Choose an account" in body
+            or _has_visible(flow_page, ["text=Use another account"], timeout_ms=1000)
+        )
         if progress_label is not None:
             last_progress = _periodic_progress(
                 progress_label,
                 last_progress,
-                f"waiting for Claude/Google auth flow at {flow_page.url}",
+                f"waiting for Claude/Google auth flow: {_describe_auth_surface(flow_page, body=body, title=title)}",
             )
 
         if _claude_logged_in(credential.spec.name):
@@ -326,11 +348,8 @@ def _complete_claude_google_sign_in(
         if callback_code:
             return callback_code
 
-        if _has_visible(
-            flow_page,
-            ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
-            timeout_ms=1000,
-        ):
+        if email_visible:
+            _log_stage_once(progress_label, seen_stages, "email", f"email field visible; entering {credential.spec.account_email}")
             _fill_first(
                 flow_page,
                 ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
@@ -340,11 +359,8 @@ def _complete_claude_google_sign_in(
             time.sleep(1)
             continue
 
-        if _has_visible(
-            flow_page,
-            ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
-            timeout_ms=1000,
-        ):
+        if password_visible:
+            _log_stage_once(progress_label, seen_stages, "password", "password field visible; submitting password")
             _fill_first(
                 flow_page,
                 ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
@@ -354,14 +370,12 @@ def _complete_claude_google_sign_in(
             time.sleep(1)
             continue
 
-        if (
-            "Choose an account" in body
-            or _has_visible(flow_page, ["text=Use another account"], timeout_ms=1000)
-        ) and _has_visible(
+        if account_picker_visible and _has_visible(
             flow_page,
             [f"text={credential.spec.account_email}", "text=Use another account"],
             timeout_ms=1000,
         ):
+            _log_stage_once(progress_label, seen_stages, "choose-account", "Google account chooser visible; selecting the configured email")
             account = flow_page.locator(f"text={credential.spec.account_email}").first
             try:
                 account.click(timeout=3000)
@@ -371,6 +385,7 @@ def _complete_claude_google_sign_in(
                 pass
 
         if "Select organization" in body or "Logged in as" in body:
+            _log_stage_once(progress_label, seen_stages, "organization", "Claude organization chooser visible; selecting an org")
             if _click_claude_organization_option(flow_page):
                 time.sleep(1)
                 continue
@@ -386,11 +401,17 @@ def _complete_claude_google_sign_in(
             ],
         )
 
-        if "Choose an account" in body and credential.spec.account_email in body:
+        if account_picker_visible and credential.spec.account_email in body:
             time.sleep(1)
             continue
 
         if title == "Just a moment..." or "Just a moment..." in body:
+            _log_stage_once(progress_label, seen_stages, "just-a-moment", "Google interstitial visible; waiting for it to clear")
+            time.sleep(2)
+            continue
+
+        if "This browser or app may not be secure" in body:
+            _log_stage_once(progress_label, seen_stages, "browser-not-secure", "Google rejected the browser session as not secure")
             time.sleep(2)
             continue
 
@@ -515,26 +536,45 @@ def _advance_auth_flow(
 ) -> None:
     deadline = time.time() + 180
     last_progress = 0.0
+    seen_stages: set[str] = set()
     while time.time() < deadline:
         body = _body_text(page)
         title = _page_title(page)
+        google_visible = _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=1000)
+        email_visible = _has_visible(
+            page,
+            ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
+            timeout_ms=1000,
+        )
+        password_visible = _has_visible(
+            page,
+            ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
+            timeout_ms=1000,
+        )
+        device_code_visible = _has_visible(
+            page,
+            ["input[name*=code]", "input[autocomplete='one-time-code']", "input[inputmode='numeric']"],
+            timeout_ms=1000,
+        )
         if progress_label is not None:
             last_progress = _periodic_progress(
                 progress_label,
                 last_progress,
-                f"waiting for OpenAI/Google auth flow at {page.url}",
+                f"waiting for OpenAI/Google auth flow: {_describe_auth_surface(page, body=body, title=title)}",
             )
 
         if not body and not title:
             time.sleep(0.5)
             continue
 
-        if _has_visible(page, ["button:has-text('Continue with Google')", "text=Continue with Google"], timeout_ms=1000):
+        if google_visible:
+            _log_stage_once(progress_label, seen_stages, "google-button", "Continue with Google button visible; opening Google sign-in")
             _click_google_and_capture_page(page)
             time.sleep(1)
             continue
 
-        if _has_visible(page, ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"], timeout_ms=1000):
+        if email_visible:
+            _log_stage_once(progress_label, seen_stages, "email", f"email field visible; entering {credential.spec.account_email}")
             _fill_first(
                 page,
                 ["input[type='email']:visible", "input[name='identifier']:visible", "input[autocomplete='username']:visible"],
@@ -544,7 +584,8 @@ def _advance_auth_flow(
             time.sleep(1)
             continue
 
-        if _has_visible(page, ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"], timeout_ms=1000):
+        if password_visible:
+            _log_stage_once(progress_label, seen_stages, "password", "password field visible; submitting password")
             _fill_first(
                 page,
                 ["input[type='password']:visible", "input[name='Passwd']:visible", "input[autocomplete='current-password']:visible"],
@@ -555,26 +596,41 @@ def _advance_auth_flow(
             continue
 
         if "Use your device code to grant access to Codex CLI" in body:
+            _log_stage_once(progress_label, seen_stages, "device-code", f"device code prompt visible; entering {device_code}")
             _enter_device_code(page, device_code)
             _click_enabled_continue(page)
             return
 
         if "/deviceauth/callback" in page.url and page.locator("input:visible").count() >= 1:
+            _log_stage_once(progress_label, seen_stages, "device-code", f"device code callback form visible; entering {device_code}")
             _enter_device_code(page, device_code)
             _click_enabled_continue(page)
             return
 
-        if _has_visible(page, ["input[name*=code]", "input[autocomplete='one-time-code']", "input[inputmode='numeric']"], timeout_ms=1000):
+        if device_code_visible:
+            _log_stage_once(progress_label, seen_stages, "device-code", f"code input visible; entering {device_code}")
             _enter_device_code(page, device_code)
             _click_enabled_continue(page)
             return
 
         if "Sign in to Codex with ChatGPT" in body or "Select a workspace" in body:
+            _log_stage_once(progress_label, seen_stages, "workspace", "OpenAI workspace consent visible; confirming workspace")
             _complete_workspace_consent(page)
             time.sleep(1)
             continue
 
         if "Just a moment..." in body or title == "Just a moment...":
+            _log_stage_once(progress_label, seen_stages, "just-a-moment", "interstitial visible; waiting for it to clear")
+            time.sleep(2)
+            continue
+
+        if "This browser or app may not be secure" in body:
+            _log_stage_once(progress_label, seen_stages, "browser-not-secure", "Google rejected the browser session as not secure")
+            time.sleep(2)
+            continue
+
+        if "Couldn’t sign you in" in body or "Couldn't sign you in" in body:
+            _log_stage_once(progress_label, seen_stages, "signin-error", "Google sign-in error page detected")
             time.sleep(2)
             continue
 
@@ -901,6 +957,39 @@ def _wait_for_live_login_surface(page: object, timeout_seconds: int) -> None:
     raise RuntimeError(f"timed out waiting for auth challenge to clear at {getattr(page, 'url', '<unknown>')}")
 
 
+def _describe_auth_surface(page: object, *, body: str | None = None, title: str | None = None) -> str:
+    body_text = body if body is not None else _body_text(page)
+    title_text = title if title is not None else _page_title(page)
+    location = getattr(page, "url", "") or "<unknown-url>"
+    markers: list[str] = []
+
+    if _visible_now(page, ["button:has-text('Continue with Google')", "text=Continue with Google"]):
+        markers.append("google-button")
+    if _visible_now(page, ["input[type='email']", "input[autocomplete='username']", "input[name='identifier']"]):
+        markers.append("email-input")
+    if _visible_now(page, ["input[type='password']", "input[name='Passwd']", "input[autocomplete='current-password']"]):
+        markers.append("password-input")
+    if _visible_now(page, ["input[name*=code]", "input[autocomplete='one-time-code']", "input[inputmode='numeric']"]):
+        markers.append("code-input")
+    if "Choose an account" in body_text:
+        markers.append("choose-account")
+    if "Use your device code to grant access to Codex CLI" in body_text:
+        markers.append("device-code")
+    if "Sign in to Codex with ChatGPT" in body_text or "Select a workspace" in body_text:
+        markers.append("workspace-consent")
+    if "This browser or app may not be secure" in body_text:
+        markers.append("browser-not-secure")
+    if "Couldn’t sign you in" in body_text or "Couldn't sign you in" in body_text:
+        markers.append("signin-error")
+
+    compact_body = " ".join(body_text.split())
+    if not markers and compact_body:
+        markers.append(compact_body[:120])
+
+    marker_text = ", ".join(markers) if markers else "no-known-surface"
+    return f"url={location} title={title_text!r} state={marker_text}"
+
+
 def _wait_for_codex_auth(
     child: pexpect.spawn,
     agent_name: str,
@@ -1046,6 +1135,23 @@ def _has_visible(page: object, selectors: list[str], timeout_ms: int) -> bool:
             try:
                 candidate.wait_for(state="visible", timeout=slice_timeout)
                 return True
+            except Exception:
+                continue
+    return False
+
+
+def _visible_now(page: object, selectors: list[str]) -> bool:
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            count = locator.count()
+        except Exception:
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                if candidate.is_visible():
+                    return True
             except Exception:
                 continue
     return False
