@@ -1516,19 +1516,76 @@ def _wait_for_codex_auth(
 ) -> None:
     deadline = time.time() + timeout_seconds
     last_progress = 0.0
+    output_tail: deque[str] = deque(maxlen=12)
     while time.time() < deadline:
-        if auth_path(agent_name).exists():
+        _drain_child_output(child, output_tail=output_tail)
+        if auth_path(agent_name).exists() or _codex_logged_in(agent_name):
             child.terminate(force=True)
             return
         if not child.isalive():
-            if auth_path(agent_name).exists():
+            _drain_child_output(child, output_tail=output_tail)
+            if auth_path(agent_name).exists() or _codex_logged_in(agent_name):
                 return
-            raise RetryableLoginError(f"codex login exited before auth.json was created for {agent_name}")
+            raise RetryableLoginError(
+                _codex_auth_wait_error(
+                    f"codex login exited before authentication completed for {agent_name}",
+                    output_tail,
+                )
+            )
         if progress_label is not None:
             last_progress = _periodic_progress(progress_label, last_progress, "still waiting for Codex auth.json")
         time.sleep(1)
     child.terminate(force=True)
-    raise RetryableLoginError(f"timed out waiting for codex login to finish for {agent_name}")
+    _drain_child_output(child, output_tail=output_tail)
+    raise RetryableLoginError(
+        _codex_auth_wait_error(
+            f"timed out waiting for codex login to finish for {agent_name}",
+            output_tail,
+        )
+    )
+
+
+def _codex_logged_in(agent_name: str) -> bool:
+    env = suppress_node_warnings(os.environ.copy())
+    env["HOME"] = str(agent_home(agent_name))
+    result = subprocess.run(
+        ["codex", "login", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return False
+    combined = f"{result.stdout}\n{result.stderr}".strip().lower()
+    return "logged in" in combined
+
+
+def _drain_child_output(child: pexpect.spawn, *, output_tail: deque[str] | None = None) -> None:
+    while True:
+        try:
+            chunk = child.read_nonblocking(size=4096, timeout=0)
+        except (pexpect.TIMEOUT, pexpect.EOF):
+            return
+        except Exception:
+            return
+        if not chunk:
+            return
+        if output_tail is None:
+            continue
+        ansi_re = re.compile(r"\x1b\[[0-9;]*m")
+        cleaned = ansi_re.sub("", chunk)
+        for raw_line in cleaned.splitlines():
+            line = _truncate_output(raw_line.strip(), limit=240)
+            if line:
+                output_tail.append(line)
+
+
+def _codex_auth_wait_error(message: str, output_tail: deque[str]) -> str:
+    if not output_tail:
+        return message
+    return f"{message}; codex output tail: {' | '.join(output_tail)}"
 
 
 def _wait_for_claude_auth(
