@@ -30,6 +30,7 @@ class FakeSession:
         model="gpt-5.4",
         reasoning_effort="high",
         auth_source_agent=None,
+        account_email=None,
         **kwargs,
     ) -> None:
         self.spec = spec
@@ -42,8 +43,8 @@ class FakeSession:
         self.model = model
         self._overview = {
             "name": spec.name,
-            "account_key": getattr(spec, "account_key", spec.name),
-            "account_email": spec.account_email,
+            "account_key": auth_source_agent or getattr(spec, "account_key", spec.name),
+            "account_email": account_email or spec.account_email,
             "accent_color": spec.accent_color,
             "status": "idle",
             "thread_id": None,
@@ -140,6 +141,33 @@ class FakeSession:
 
     def recent_transcript(self, lines: int = 12) -> list[_FakeEntry]:
         return []
+
+
+LIMIT_ERROR_DETAIL = (
+    '{"error": {"message": "You\'ve hit your usage limit. To get more access now, send a request to your admin or '
+    'try again at Mar 10th, 2026 7:20 PM.", "codexErrorInfo": "usageLimitExceeded", "additionalDetails": null}, '
+    '"willRetry": false, "threadId": "019cd3e3-0171-79b2-8de2-2c109bcbd5d2", '
+    '"turnId": "019cd3e3-1425-76d1-956b-b17c2d0761c8"}'
+)
+
+
+def _codex_accounts_for_failover() -> list[orch.ProviderAccountSpec]:
+    return [
+        orch.ProviderAccountSpec(
+            name="account-1",
+            account_key="account-1",
+            account_email="first@example.com",
+            provider="openai",
+            accent_color=2,
+        ),
+        orch.ProviderAccountSpec(
+            name="account-2",
+            account_key="account-2",
+            account_email="second@example.com",
+            provider="openai",
+            accent_color=3,
+        ),
+    ]
 
 
 class FakeControlServer:
@@ -797,6 +825,75 @@ def test_monitoring_does_not_interrupt_long_running_manager_turn(monkeypatch) ->
     controller._check_for_stalls(rows)
 
     assert controller.manager.interrupt_count == 0
+
+
+def test_manager_status_changed_error_detects_limit_from_last_error(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller.manager._overview["status"] = "error"
+    controller.manager._overview["last_error"] = LIMIT_ERROR_DETAIL
+
+    kind = controller._event_limit_kind(
+        SessionEvent(
+            ts=0.0,
+            agent="manager",
+            kind="status_changed",
+            message="status changed to error",
+            data={"status": "error"},
+        )
+    )
+
+    assert kind == "token_limit"
+
+
+def test_health_monitor_failsover_manager_after_usage_limit_error(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+    monkeypatch.setattr(orch, "codex_account_specs", _codex_accounts_for_failover)
+
+    controller = orch.MultiShellController()
+
+    initial_account = controller._codex_accounts.assigned_spec("manager")
+    assert initial_account is not None
+    assert initial_account.account_key == "account-1"
+
+    controller.manager._overview["status"] = "error"
+    controller.manager._overview["last_error"] = LIMIT_ERROR_DETAIL
+    controller.manager._overview["cwd"] = "/tmp/manager"
+    controller.manager._overview["persona_label"] = "Multishell Manager"
+
+    manager_row = next(row for row in controller.session_rows() if row["name"] == "manager")
+    controller._emit_health_alerts([manager_row])
+
+    replacement = controller._codex_accounts.assigned_spec("manager")
+    assert replacement is not None
+    assert replacement.account_key == "account-2"
+    assert controller.manager.overview()["account_key"] == "account-2"
+    assert controller.manager.started_calls[-1] == ("/tmp/manager", controller.manager.initial_prompt, "Multishell Manager")
+    assert controller.manager.stopped == 1
+
+    prompt, source, cwd = controller.manager.enqueued[0]
+    assert source == "system"
+    assert cwd == "/tmp/manager"
+    assert "Resume the same task without restarting from scratch." in prompt
+    assert "Previous account: first@example.com" in prompt
+    assert "New account: second@example.com" in prompt
+
+    messages = controller.recent_messages(10)
+    assert any(
+        message.text == "manager: switched from first@example.com to second@example.com after token limit"
+        and message.level == "warn"
+        for message in messages
+    )
+    assert all("manager entered error state" not in message.text for message in messages)
 
 
 def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:

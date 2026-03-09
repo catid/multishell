@@ -1119,10 +1119,38 @@ class MultiShellController:
                 continue
             self._last_session_alerts[str(row["name"])] = signature
             if row["status"] == "error":
+                if self._maybe_recover_limit_error_row(row):
+                    continue
                 detail = str(row["last_error"] or "unknown error")
                 self._push_message("system", f"{row['name']} entered error state: {detail}", level="error")
             elif previous and previous[0] == "error":
                 self._push_message("system", f"{row['name']} recovered to {row['status']}", level="info")
+
+    def _maybe_recover_limit_error_row(self, row: dict[str, object]) -> bool:
+        session_name = str(row.get("name") or "").strip()
+        last_error = str(row.get("last_error") or "").strip()
+        if not session_name or not last_error:
+            return False
+        if self._message_limit_kind(last_error, assistant_message=False) is None:
+            return False
+        try:
+            session = self._session_for_name(session_name)
+        except KeyError:
+            return False
+        current = session.overview()
+        if str(current.get("status") or "") != "error":
+            return True
+        if str(current.get("last_error") or "").strip() != last_error:
+            return False
+        return self._maybe_failover_account(
+            SessionEvent(
+                ts=time.time(),
+                agent=session_name,
+                kind="error",
+                message=last_error,
+                data={"recovery_source": "health_monitor"},
+            )
+        )
 
     def _maybe_interrupt_manager_for_worker_event(self, event: SessionEvent) -> bool:
         manager_overview = self.manager.overview()
@@ -1419,10 +1447,16 @@ class MultiShellController:
 
     def _event_limit_kind(self, event: SessionEvent) -> str | None:
         message = event.message.strip()
-        if not message:
-            return None
-        assistant_message = event.kind == "assistant_message"
-        return self._message_limit_kind(message, assistant_message=assistant_message)
+        if message:
+            assistant_message = event.kind == "assistant_message"
+            matched = self._message_limit_kind(message, assistant_message=assistant_message)
+            if matched is not None:
+                return matched
+        if event.kind == "status_changed" and str(event.data.get("status") or "") == "error":
+            current_error = self._current_session_error_message(event.agent)
+            if current_error:
+                return self._message_limit_kind(current_error, assistant_message=False)
+        return None
 
     def _message_limit_kind(self, message: str, *, assistant_message: bool) -> str | None:
         lowered = " ".join(message.lower().split())
@@ -1442,6 +1476,13 @@ class MultiShellController:
         if any(marker in lowered for marker in ("out_of_tokens", "out of tokens", "token limit", "usage limit", "token budget")):
             return "token_limit"
         return None
+
+    def _current_session_error_message(self, session_name: str) -> str:
+        try:
+            session = self._session_for_name(session_name)
+        except KeyError:
+            return ""
+        return str(session.overview().get("last_error") or "").strip()
 
     def _build_account_failover_prompt(
         self,
