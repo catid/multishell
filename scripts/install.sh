@@ -129,6 +129,7 @@ VENV_DIR="$RELEASE_DIR/venv"
 
 mkdir -p "$INSTALL_ROOT" "$BIN_DIR" "$RELEASES_DIR"
 rm -rf "$RELEASE_DIR"
+mkdir -p "$RELEASE_DIR"
 cp -R "$src_dir" "$APP_DIR"
 
 log_step "Creating Python virtual environment"
