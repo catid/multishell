@@ -9,13 +9,17 @@ import pytest
 from multishell.web_reasoners import (
     CHATGPT_LOGIN_URL,
     WebReasonerEvent,
+    WebNavigatorError,
     WebReasonerManager,
+    _prepare_chatgpt_pro_surface,
+    _prepare_gemini_deepthink_surface,
     _ensure_chatgpt_pro_workspace,
     _ensure_chatgpt_logged_in,
     _ensure_google_logged_in,
     _preferred_openai_flow_page,
     _wait_for_chatgpt_login_completion,
     _web_profile_name,
+    _submit_prompt,
 )
 
 
@@ -138,6 +142,77 @@ class _FakePage:
         return False
 
 
+class _FakePromptKeyboard:
+    def __init__(self, page: "_FakePromptPage") -> None:
+        self.page = page
+
+    def press(self, key: str) -> None:
+        self.page.keys.append(key)
+
+    def type(self, text: str, delay: int | None = None) -> None:
+        self.page.typed.append((text, delay))
+        self.page.composer_value = text
+
+
+class _FakePromptLocator:
+    def __init__(self, page: "_FakePromptPage", kind: str) -> None:
+        self.page = page
+        self.kind = kind
+        self.first = self
+
+    def wait_for(self, state: str = "visible", timeout: int | None = None) -> None:
+        if self.kind == "send" and not self.page.send_visible:
+            raise RuntimeError("not visible")
+
+    def click(self, timeout: int | None = None) -> None:
+        if self.kind == "send":
+            self.page.send_clicked += 1
+            self.page.composer_value = ""
+            return
+        self.page.composer_clicked += 1
+
+    def fill(self, value: str) -> None:
+        self.page.composer_value = value
+
+    def input_value(self, timeout: int | None = None) -> str:
+        return self.page.composer_value
+
+    def inner_text(self, timeout: int | None = None) -> str:
+        return self.page.composer_value
+
+    def text_content(self, timeout: int | None = None) -> str:
+        return self.page.composer_value
+
+    def count(self) -> int:
+        if self.kind == "send":
+            return 1 if self.page.send_visible else 0
+        return 1
+
+    def nth(self, index: int) -> "_FakePromptLocator":
+        return self
+
+
+class _FakePromptPage:
+    def __init__(self) -> None:
+        self.composer_value = ""
+        self.send_visible = True
+        self.send_clicked = 0
+        self.composer_clicked = 0
+        self.keys: list[str] = []
+        self.typed: list[tuple[str, int | None]] = []
+        self.keyboard = _FakePromptKeyboard(self)
+
+    def locator(self, selector: str) -> _FakePromptLocator:
+        if selector == "textarea:visible":
+            return _FakePromptLocator(self, "textarea")
+        if selector == "[contenteditable='true']:visible, [role='textbox']:visible":
+            raise RuntimeError("contenteditable not used")
+        return _FakePromptLocator(self, "send")
+
+    def wait_for_timeout(self, _timeout_ms: int) -> None:
+        return None
+
+
 def test_google_password_screen_prefers_password_input_over_account_picker(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded: list[tuple[str, tuple[str, ...]]] = []
     page = _FakePage("https://accounts.google.com/v3/signin/challenge/pwd")
@@ -202,6 +277,35 @@ def test_chatgpt_workspace_reuses_openai_consent_flow(monkeypatch: pytest.Monkey
     assert consent_calls == ["consent"]
 
 
+def test_chatgpt_workspace_accepts_ready_composer_without_exact_model_label(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://chatgpt.com/")
+    clicks: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        "multishell.web_reasoners._body_text",
+        lambda _page: "Conversation with ChatGPT\nAsk anything",
+    )
+    monkeypatch.setattr(
+        "multishell.web_reasoners._has_visible",
+        lambda _page, selectors, timeout_ms: any(
+            token in " ".join(selectors) for token in ("textarea", "contenteditable", "textbox")
+        ),
+    )
+    monkeypatch.setattr(
+        "multishell.web_reasoners._click_optional",
+        lambda _page, selectors: clicks.append(tuple(selectors)),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._dismiss_managed_profile_notice_in_context", lambda _page: None)
+    monkeypatch.setattr("multishell.web_reasoners._preferred_openai_flow_page", lambda page_obj: page_obj)
+    monkeypatch.setattr("multishell.web_reasoners._check_cancel", lambda _flag: None)
+    monkeypatch.setattr("time.sleep", lambda *_args, **_kwargs: None)
+    page.wait_for_timeout = lambda *_args, **_kwargs: None
+
+    _ensure_chatgpt_pro_workspace(page, Event())
+
+    assert len(clicks) == 2
+
+
 def test_chatgpt_login_starts_from_direct_openai_auth_url(monkeypatch: pytest.MonkeyPatch) -> None:
     page = _FakePage("https://chatgpt.com/")
     normalize_calls: list[str] = []
@@ -261,6 +365,83 @@ def test_chatgpt_login_prefers_homepage_google_modal_when_available(monkeypatch:
     assert page.gotos == []
     assert clicks == [("button:has-text('Log in')", "a:has-text('Log in')")]
     assert google_calls == [("bot@kuang2.ai", "secret")]
+
+
+def test_submit_prompt_clicks_send_when_enter_leaves_text_in_composer() -> None:
+    page = _FakePromptPage()
+
+    _submit_prompt(page, "Reply with exactly OK.", Event())
+
+    assert page.composer_clicked == 1
+    assert page.send_clicked == 1
+    assert page.composer_value == ""
+
+
+def test_prepare_chatgpt_pro_surface_uses_web_navigator(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://chatgpt.com/")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "multishell.web_reasoners.drive_web_navigation_with_cli",
+        lambda page_obj, **kwargs: captured.update({"page": page_obj, **kwargs}) or page_obj,
+    )
+
+    result = _prepare_chatgpt_pro_surface(page, email="bot@kuang2.ai", password="secret", debug_label="debug-chatgpt")
+
+    assert result is page
+    assert captured["flow_label"] == "chatgpt_pro"
+    assert captured["engine_order"] == ("codex", "claude")
+    assert captured["debug_label"] == "debug-chatgpt"
+    assert captured["secret_values"] == {"account_email": "bot@kuang2.ai", "password": "secret"}
+    assert CHATGPT_LOGIN_URL in captured["allowed_urls"]
+
+
+def test_prepare_chatgpt_pro_surface_falls_back_to_legacy_flow(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://chatgpt.com/")
+    calls: list[str] = []
+
+    monkeypatch.setattr(
+        "multishell.web_reasoners.drive_web_navigation_with_cli",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(WebNavigatorError("navigator failed")),
+    )
+    monkeypatch.setattr(
+        "multishell.web_reasoners._ensure_chatgpt_logged_in",
+        lambda *_args, **_kwargs: calls.append("login"),
+    )
+    monkeypatch.setattr(
+        "multishell.web_reasoners._ensure_chatgpt_pro_workspace",
+        lambda *_args, **_kwargs: calls.append("workspace"),
+    )
+
+    result = _prepare_chatgpt_pro_surface(page, email="bot@kuang2.ai", password="secret")
+
+    assert result is page
+    assert calls == ["login", "workspace"]
+    assert page.gotos == ["https://chatgpt.com/"]
+
+
+def test_prepare_gemini_deepthink_surface_prefers_claude_first(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakePage("https://gemini.google.com/app")
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        "multishell.web_reasoners.drive_web_navigation_with_cli",
+        lambda page_obj, **kwargs: captured.update({"page": page_obj, **kwargs}) or page_obj,
+    )
+
+    result = _prepare_gemini_deepthink_surface(
+        page,
+        email="bot@kuang2.ai",
+        password="secret",
+        debug_label="debug-gemini",
+    )
+
+    assert result is page
+    assert captured["flow_label"] == "gemini_deepthink"
+    assert captured["engine_order"] == ("claude", "codex")
+    assert captured["debug_label"] == "debug-gemini"
+    assert captured["secret_values"] == {"account_email": "bot@kuang2.ai", "password": "secret"}
+    assert "https://gemini.google.com/app" in captured["allowed_urls"]
 
 
 def test_preferred_openai_flow_page_prioritizes_auth_pages_over_managed_notice() -> None:

@@ -1270,7 +1270,7 @@ def _best_advance_target(snapshot: dict[str, object]) -> str:
 
 def _apply_auth_action(page: object, action: AuthModelAction, *, secret_values: dict[str, str]) -> None:
     if action.action == "click":
-        _locate_tagged_element(page, action.target).click(timeout=5000)
+        _click_auth_locator(page, _locate_tagged_element(page, action.target), timeout=5000)
         _settle_after_action(page)
         return
     if action.action == "fill":
@@ -1285,7 +1285,7 @@ def _apply_auth_action(page: object, action: AuthModelAction, *, secret_values: 
             return
         locator = _locate_tagged_element(page, action.target)
         try:
-            locator.click(timeout=5000)
+            _click_auth_locator(page, locator, timeout=5000)
             page.keyboard.press("Control+A")
             page.keyboard.type(value, delay=20)
         except Exception:
@@ -1304,6 +1304,34 @@ def _apply_auth_action(page: object, action: AuthModelAction, *, secret_values: 
             return
         return
     raise AuthModelProtocolError(f"unsupported executable auth action: {action.action!r}")
+
+
+def _click_auth_locator(page: object, locator: object, *, timeout: int) -> None:
+    click = getattr(locator, "click")
+    last_exc: Exception | None = None
+    try:
+        click(timeout=timeout)
+        return
+    except Exception as exc:
+        last_exc = exc
+        message = str(exc).lower()
+        if "intercepts pointer events" not in message and "another element would receive the click" not in message:
+            raise
+    try:
+        click(timeout=timeout, force=True)
+        return
+    except Exception as exc:
+        last_exc = exc
+    evaluate = getattr(locator, "evaluate", None)
+    if callable(evaluate):
+        try:
+            evaluate("(element) => element.click()")
+            return
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise AuthModelProtocolError("unable to click auth locator")
 
 
 def _locate_tagged_element(page: object, target: str):

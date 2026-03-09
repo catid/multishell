@@ -21,6 +21,7 @@ from .autologin import (
 )
 from .config import account_for_agent, provider_account_for_name
 from .runtime import apply_node_warning_suppression
+from .web_navigator import WebNavigatorError, drive_web_navigation_with_cli
 
 
 SUPPORTED_PROVIDERS = frozenset({"chatgpt_pro", "gemini_deepthink"})
@@ -325,11 +326,15 @@ class WebReasonerManager:
         _check_cancel(cancel_flag)
         page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(2000)
-        _ensure_chatgpt_logged_in(page, email, password, cancel_flag)
+        page = _prepare_chatgpt_pro_surface(
+            page,
+            email=email,
+            password=password,
+            debug_label=self._debug_target(job.id),
+        )
         _check_cancel(cancel_flag)
         page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(3000)
-        _ensure_chatgpt_pro_workspace(page, cancel_flag)
         baseline = _extract_last_assistant_message(page)
         _submit_prompt(page, job.prompt, cancel_flag)
         return _wait_for_chatgpt_response(
@@ -345,8 +350,12 @@ class WebReasonerManager:
         _check_cancel(cancel_flag)
         page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(3000)
-        _ensure_google_logged_in(page, email, password, cancel_flag)
-        _ensure_gemini_deepthink_ready(page, cancel_flag)
+        page = _prepare_gemini_deepthink_surface(
+            page,
+            email=email,
+            password=password,
+            debug_label=self._debug_target(job.id),
+        )
         baseline = _extract_last_assistant_message(page)
         _submit_prompt(page, job.prompt, cancel_flag)
         return _wait_for_gemini_response(
@@ -395,6 +404,75 @@ def _resolve_gemini_account(account_name: str) -> tuple[str, str]:
     if not account.email or not account.password:
         raise WebReasonerError(f"missing Gemini OAuth credentials for {account_name}")
     return account.email, account.password
+
+
+def _prepare_chatgpt_pro_surface(
+    page: object,
+    *,
+    email: str,
+    password: str,
+    debug_label: str | None = None,
+) -> object:
+    try:
+        return drive_web_navigation_with_cli(
+            page,
+            flow_label="chatgpt_pro",
+            goal=(
+                "Reach the ChatGPT conversation surface. Sign in with Google if needed, handle ChatGPT consent "
+                "or workspace prompts, close blocking dialogs, and make the normal prompt composer ready. "
+                "Prefer ChatGPT 5.4 Pro or Pro when that selector is available. Do not send the user's prompt."
+            ),
+            done_when=(
+                "The active page is ready for a new ChatGPT prompt, with a visible composer and no remaining "
+                "login, consent, or workspace blocker."
+            ),
+            secret_values={"account_email": email, "password": password},
+            allowed_urls=[CHATGPT_LOGIN_URL, "https://chatgpt.com/"],
+            engine_order=("codex", "claude"),
+            debug_label=debug_label,
+        )
+    except WebNavigatorError as exc:
+        try:
+            # Keep the legacy OpenAI-specific path as a backstop for workspace consent pages
+            # that are structurally opaque to the snapshot-driven navigator.
+            _ensure_chatgpt_logged_in(page, email, password, threading.Event())
+            page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
+            page.wait_for_timeout(3000)
+            _ensure_chatgpt_pro_workspace(page, threading.Event())
+            return page
+        except Exception as fallback_exc:
+            raise WebReasonerError(
+                f"web navigator could not prepare ChatGPT Pro: {exc}; fallback failed: {fallback_exc}"
+            ) from fallback_exc
+
+
+def _prepare_gemini_deepthink_surface(
+    page: object,
+    *,
+    email: str,
+    password: str,
+    debug_label: str | None = None,
+) -> object:
+    try:
+        return drive_web_navigation_with_cli(
+            page,
+            flow_label="gemini_deepthink",
+            goal=(
+                "Reach the Gemini conversation surface. Sign in with Google if needed, close blocking dialogs, "
+                "and make the normal prompt composer ready. Prefer Deep Think or Gemini 2.5 Pro when those "
+                "choices are available. Do not send the user's prompt."
+            ),
+            done_when=(
+                "The active page is ready for a new Gemini prompt, with a visible composer and no remaining "
+                "login or setup blocker."
+            ),
+            secret_values={"account_email": email, "password": password},
+            allowed_urls=["https://gemini.google.com/app", "https://gemini.google.com/"],
+            engine_order=("claude", "codex"),
+            debug_label=debug_label,
+        )
+    except WebNavigatorError as exc:
+        raise WebReasonerError(f"web navigator could not prepare Gemini Deep Think: {exc}") from exc
 
 
 def _check_cancel(cancel_flag: threading.Event) -> None:
@@ -686,11 +764,36 @@ def _ensure_chatgpt_pro_workspace(page: object, cancel_flag: threading.Event) ->
                 continue
             raise WebReasonerError("ChatGPT workspace chooser did not offer the Kuang2 workspace")
 
-        if "ChatGPT 5.4 Pro" in body and _has_visible(
+        composer_ready = _has_visible(
             page,
             ["textarea", "[contenteditable='true']", "[role='textbox']"],
             timeout_ms=2000,
+        )
+        if composer_ready and not any(
+            token in body for token in ("log in", "continue with google", "sign in to chatgpt", "workspace")
         ):
+            _click_optional(
+                page,
+                [
+                    "[data-testid='model-switcher-dropdown-button']",
+                    "button[aria-label*='Model selector']",
+                ],
+            )
+            page.wait_for_timeout(1000)
+            _click_optional(
+                page,
+                [
+                    "button:has-text('ChatGPT 5.4 Pro')",
+                    "button:has-text('ChatGPT 5.4')",
+                    "button:has-text('GPT-5')",
+                    "button:has-text('Pro')",
+                    "text=ChatGPT 5.4 Pro",
+                    "text=ChatGPT 5.4",
+                    "text=GPT-5",
+                    "text=Pro",
+                ],
+            )
+            page.wait_for_timeout(1200)
             return
 
         if _has_visible(
@@ -792,8 +895,8 @@ def _submit_prompt(page: object, prompt: str, cancel_flag: threading.Event) -> N
             except Exception:
                 page.keyboard.press("Control+A")
                 page.keyboard.type(prompt, delay=10)
-            page.keyboard.press("Enter")
-            return
+            if _finalize_prompt_submission(page, area, prompt):
+                return
         except Exception:
             pass
 
@@ -803,12 +906,79 @@ def _submit_prompt(page: object, prompt: str, cancel_flag: threading.Event) -> N
             area.click()
             page.keyboard.press("Control+A")
             page.keyboard.type(prompt, delay=10)
-            page.keyboard.press("Enter")
-            return
+            if _finalize_prompt_submission(page, area, prompt):
+                return
         except Exception:
             time.sleep(1)
 
     raise WebReasonerError("unable to find a visible prompt composer")
+
+
+def _finalize_prompt_submission(page: object, area: object, prompt: str) -> bool:
+    page.keyboard.press("Enter")
+    try:
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+    if not _composer_still_contains_prompt(area, prompt):
+        return True
+    if _click_visible_send_button(page):
+        try:
+            page.wait_for_timeout(750)
+        except Exception:
+            pass
+        return not _composer_still_contains_prompt(area, prompt)
+    return False
+
+
+def _composer_still_contains_prompt(area: object, prompt: str) -> bool:
+    normalized_prompt = " ".join(prompt.split()).strip()
+    if not normalized_prompt:
+        return False
+    candidates: list[str] = []
+    try:
+        input_value = getattr(area, "input_value", None)
+        if callable(input_value):
+            candidates.append(str(input_value(timeout=500) or ""))
+    except Exception:
+        pass
+    for attr in ("inner_text", "text_content"):
+        try:
+            reader = getattr(area, attr, None)
+            if callable(reader):
+                candidates.append(str(reader(timeout=500) or ""))
+        except Exception:
+            pass
+    for candidate in candidates:
+        if normalized_prompt and normalized_prompt in " ".join(candidate.split()):
+            return True
+    return False
+
+
+def _click_visible_send_button(page: object) -> bool:
+    selectors = [
+        "button[aria-label*='Send message']",
+        "button[aria-label*='Send']",
+        "button[aria-label*='Submit']",
+        "button.send-button",
+        "button:has-text('Send')",
+        "button:has-text('Submit')",
+    ]
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            count = locator.count()
+        except Exception:
+            count = 0
+        candidates = [locator.nth(index) for index in range(count)] or [locator.first]
+        for candidate in candidates:
+            try:
+                candidate.wait_for(state="visible", timeout=1000)
+                candidate.click(timeout=2000)
+                return True
+            except Exception:
+                continue
+    return False
 
 
 def _wait_for_chatgpt_response(

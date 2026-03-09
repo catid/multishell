@@ -1062,6 +1062,32 @@ def test_apply_auth_action_uses_visible_device_code_helper(monkeypatch) -> None:
     assert seen["settled"] is True
 
 
+def test_apply_auth_action_click_uses_force_fallback_on_pointer_intercept(monkeypatch) -> None:
+    seen = {"clicks": [], "settled": False}
+
+    class _FakeLocator:
+        def click(self, *, timeout: int, force: bool = False) -> None:
+            seen["clicks"].append((timeout, force))
+            if not force:
+                raise RuntimeError("subtree intercepts pointer events")
+
+        def evaluate(self, _script: str) -> None:
+            raise AssertionError("force click should have succeeded first")
+
+    monkeypatch.setattr("multishell.auth_flow_model._locate_tagged_element", lambda *_args, **_kwargs: _FakeLocator())
+    monkeypatch.setattr(
+        "multishell.auth_flow_model._settle_after_action",
+        lambda _page: seen.__setitem__("settled", True),
+    )
+
+    from multishell.auth_flow_model import _apply_auth_action
+
+    _apply_auth_action(object(), AuthModelAction(action="click", target="ms-auth-log-in"), secret_values={})
+
+    assert seen["clicks"] == [(5000, False), (5000, True)]
+    assert seen["settled"] is True
+
+
 def test_normalize_auth_action_submits_filled_field_with_enter_when_no_advance_target() -> None:
     action = _normalize_auth_action(
         {
