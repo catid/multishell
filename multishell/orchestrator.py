@@ -322,9 +322,27 @@ def _archetype_for_worker(worker_name: str) -> WorkerArchetype:
     )
 
 
-def manager_prompt(codex_specs: list[AgentSpec], claude_specs: list[AgentSpec]) -> str:
+def manager_prompt(
+    codex_specs: list[AgentSpec],
+    claude_specs: list[AgentSpec],
+    *,
+    max_codex_workers: int,
+    max_claude_workers: int,
+) -> str:
     codex_lines = [f"- {spec.name}: {spec.personality}" for spec in codex_specs]
     claude_lines = [f"- {spec.name}: {spec.personality}" for spec in claude_specs]
+    expansion_lines: list[str] = []
+    if max_codex_workers > len(codex_specs):
+        expansion_lines.append(
+            f"- Additional Codex lanes are available on demand as worker-2 through worker-{max_codex_workers}. "
+            "Name a higher-numbered worker only when you actually need more parallelism; the controller will materialize it on first use."
+        )
+    if max_claude_workers > len(claude_specs):
+        expansion_lines.append(
+            f"- Additional Claude lanes are available on demand as claude-worker-2 through claude-worker-{max_claude_workers}. "
+            "Create them only when a different-model perspective is actually needed."
+        )
+    expansion_block = "\n".join(expansion_lines)
     return f"""You are the multishell manager.
 
 Operate only through delegation, session management, long-running reasoning tools, and user communication.
@@ -356,12 +374,16 @@ Rules:
 - Choose worker working directories intentionally. You can pass `cwd` when starting, restarting, or delegating.
 - Do not send a final success update until every required worker and reasoner for the task is terminal and the required verification has actually completed.
 - Keep messages concise and operational.
+- The controller only materializes a small starter set of workers at startup. Add higher-numbered workers only when the task actually needs more lanes.
 
 Codex workers:
 {chr(10).join(codex_lines)}
 
 Claude workers:
 {chr(10).join(claude_lines)}
+
+Additional worker capacity:
+{expansion_block or "- No extra worker capacity is currently configured."}
 """
 
 
@@ -448,8 +470,8 @@ class MultiShellController:
     _MAX_HANDOFF_CHARS = 6000
 
     def __init__(self) -> None:
-        self._codex_worker_specs = runtime_codex_worker_specs()
-        self._claude_worker_specs = runtime_claude_worker_specs()
+        self._all_codex_worker_specs = runtime_codex_worker_specs()
+        self._all_claude_worker_specs = runtime_claude_worker_specs()
         self._codex_account_specs = codex_account_specs()
         self._claude_account_specs = claude_account_specs()
         self._codex_accounts = ProviderAccountPool(
@@ -466,7 +488,12 @@ class MultiShellController:
         )
         self.manager = CodexSession(
             MANAGER_SPEC,
-            manager_prompt(self._codex_worker_specs, self._claude_worker_specs),
+            manager_prompt(
+                self._all_codex_worker_specs[:1],
+                self._all_claude_worker_specs[:1],
+                max_codex_workers=len(self._all_codex_worker_specs),
+                max_claude_workers=len(self._all_claude_worker_specs),
+            ),
             mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name),
             working_dir=manager_workspace_root(),
             persona_label="Multishell Manager",
@@ -480,62 +507,17 @@ class MultiShellController:
         self.codex_workers: dict[str, CodexSession] = {}
         self.claude_workers: dict[str, ClaudeSession] = {}
         self.spark_workers: dict[str, CodexSession] = {}
-        self._codex_worker_names = {spec.name for spec in self._codex_worker_specs}
+        self._codex_worker_names = {spec.name for spec in self._all_codex_worker_specs}
+        self._claude_worker_names = {spec.name for spec in self._all_claude_worker_specs}
+        self._started_controller = False
+        self._lifecycle: dict[str, SessionLifecycleMetadata] = {
+            self.manager.spec.name: SessionLifecycleMetadata()
+        }
 
-        initial_codex_account = self._codex_account_specs[0] if self._codex_account_specs else None
-        for spec in self._codex_worker_specs:
-            session = CodexSession(
-                spec,
-                _worker_prompt(spec.name, spec.personality, engine="codex"),
-                mcp_bridge_command=_bridge_command("worker", spec.name),
-                working_dir=workspace_root(),
-                startup_prompt="Reply once that you are ready for assignments.",
-                persona_label=self._default_persona_label(spec.name),
-                event_callback=self._handle_worker_event,
-                turn_timeout_seconds=900,
-                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else spec.name,
-                account_email=spec.account_email,
-            )
-            self.codex_workers[spec.name] = session
-            self.workers[spec.name] = session
-
-        initial_claude_account = self._claude_account_specs[0] if self._claude_account_specs else None
-        for spec in self._claude_worker_specs:
-            session = ClaudeSession(
-                spec,
-                _worker_prompt(spec.name, spec.personality, engine="claude"),
-                working_dir=workspace_root(),
-                startup_prompt="Reply once that you are ready for assignments.",
-                persona_label=self._default_persona_label(spec.name),
-                event_callback=self._handle_worker_event,
-                turn_timeout_seconds=900,
-                auth_source_agent=initial_claude_account.account_key if initial_claude_account is not None else spec.name,
-                account_email=spec.account_email,
-            )
-            self.claude_workers[spec.name] = session
-            self.workers[spec.name] = session
-
-        for spec in self._codex_worker_specs:
-            spark_spec = AgentSpec(
-                name=spark_agent_name(spec.name),
-                account_email=spec.account_email,
-                role="spark",
-                personality=f"Draft delegate paired with {spec.name}",
-                accent_color=spec.accent_color,
-                account_key=spec.account_key,
-            )
-            self.spark_workers[spec.name] = CodexSession(
-                spark_spec,
-                _spark_prompt(spec.name, spec.personality, persona_name=f"{self._default_persona_label(spec.name)} Draft Partner"),
-                working_dir=workspace_root(),
-                persona_label=f"{self._default_persona_label(spec.name)} Spark",
-                event_callback=self._handle_spark_session_event,
-                turn_timeout_seconds=900,
-                model=SPARK_MODEL,
-                reasoning_effort=SPARK_REASONING_EFFORT,
-                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else spec.name,
-                account_email=spec.account_email,
-            )
+        if self._all_codex_worker_specs:
+            self._materialize_worker(self._all_codex_worker_specs[0].name)
+        if self._all_claude_worker_specs:
+            self._materialize_worker(self._all_claude_worker_specs[0].name)
 
         self.spark_pool = SparkCoordinator(self.spark_workers, callback=self._handle_spark_update)
         self.web_reasoners = WebReasonerManager(callback=self._handle_web_reasoner_event)
@@ -547,19 +529,107 @@ class MultiShellController:
         self._last_session_alerts: dict[str, tuple[object, ...]] = {}
         self._last_stall_alerts: dict[str, int] = {}
         self._last_manager_event_signatures: dict[tuple[str, str], float] = {}
-        self._lifecycle: dict[str, SessionLifecycleMetadata] = {}
         self._user_message_count = 0
         self._last_user_message = ""
         self._last_manager_interrupt_turn: str | None = None
         self._shutting_down = False
 
-        for session_name in [
-            self.manager.spec.name,
-            *self.codex_workers.keys(),
-            *self.claude_workers.keys(),
-            *[spark.spec.name for spark in self.spark_workers.values()],
-        ]:
-            self._lifecycle[session_name] = SessionLifecycleMetadata()
+        for spark in self.spark_workers.values():
+            self._lifecycle.setdefault(spark.spec.name, SessionLifecycleMetadata())
+
+    def _codex_worker_spec(self, worker_name: str) -> AgentSpec | None:
+        for spec in self._all_codex_worker_specs:
+            if spec.name == worker_name:
+                return spec
+        return None
+
+    def _claude_worker_spec(self, worker_name: str) -> AgentSpec | None:
+        for spec in self._all_claude_worker_specs:
+            if spec.name == worker_name:
+                return spec
+        return None
+
+    def _materialized_codex_specs(self) -> list[AgentSpec]:
+        return [spec for spec in self._all_codex_worker_specs if spec.name in self.codex_workers]
+
+    def _materialized_claude_specs(self) -> list[AgentSpec]:
+        return [spec for spec in self._all_claude_worker_specs if spec.name in self.claude_workers]
+
+    def _materialize_worker(self, worker_name: str) -> ManagedSession | None:
+        existing = self.workers.get(worker_name)
+        if existing is not None:
+            return existing
+
+        codex_spec = self._codex_worker_spec(worker_name)
+        if codex_spec is not None:
+            initial_codex_account = self._codex_account_specs[0] if self._codex_account_specs else None
+            session = CodexSession(
+                codex_spec,
+                _worker_prompt(codex_spec.name, codex_spec.personality, engine="codex"),
+                mcp_bridge_command=_bridge_command("worker", codex_spec.name),
+                working_dir=workspace_root(),
+                startup_prompt="Reply once that you are ready for assignments.",
+                persona_label=self._default_persona_label(codex_spec.name),
+                event_callback=self._handle_worker_event,
+                turn_timeout_seconds=900,
+                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else codex_spec.name,
+                account_email=codex_spec.account_email,
+            )
+            self.codex_workers[codex_spec.name] = session
+            self.workers[codex_spec.name] = session
+
+            spark_spec = AgentSpec(
+                name=spark_agent_name(codex_spec.name),
+                account_email=codex_spec.account_email,
+                role="spark",
+                personality=f"Draft delegate paired with {codex_spec.name}",
+                accent_color=codex_spec.accent_color,
+                account_key=codex_spec.account_key,
+            )
+            self.spark_workers[codex_spec.name] = CodexSession(
+                spark_spec,
+                _spark_prompt(
+                    codex_spec.name,
+                    codex_spec.personality,
+                    persona_name=f"{self._default_persona_label(codex_spec.name)} Draft Partner",
+                ),
+                working_dir=workspace_root(),
+                persona_label=f"{self._default_persona_label(codex_spec.name)} Spark",
+                event_callback=self._handle_spark_session_event,
+                turn_timeout_seconds=900,
+                model=SPARK_MODEL,
+                reasoning_effort=SPARK_REASONING_EFFORT,
+                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else codex_spec.name,
+                account_email=codex_spec.account_email,
+            )
+            self._lifecycle[codex_spec.name] = SessionLifecycleMetadata()
+            self._lifecycle[spark_spec.name] = SessionLifecycleMetadata()
+            if self._started_controller and not self._shutting_down:
+                session.start(start_session=False)
+                self.spark_workers[codex_spec.name].start(start_session=False)
+            return session
+
+        claude_spec = self._claude_worker_spec(worker_name)
+        if claude_spec is None:
+            return None
+        initial_claude_account = self._claude_account_specs[0] if self._claude_account_specs else None
+        session = ClaudeSession(
+            claude_spec,
+            _worker_prompt(claude_spec.name, claude_spec.personality, engine="claude"),
+            working_dir=workspace_root(),
+            startup_prompt="Reply once that you are ready for assignments.",
+            persona_label=self._default_persona_label(claude_spec.name),
+            event_callback=self._handle_worker_event,
+            turn_timeout_seconds=900,
+            auth_source_agent=initial_claude_account.account_key if initial_claude_account is not None else claude_spec.name,
+            account_email=claude_spec.account_email,
+        )
+        self.claude_workers[claude_spec.name] = session
+        self.workers[claude_spec.name] = session
+        self._lifecycle[claude_spec.name] = SessionLifecycleMetadata()
+        if self._started_controller and not self._shutting_down:
+            session.start(start_session=False)
+        return session
 
     def start(self) -> None:
         missing_codex = missing_codex_logins()
@@ -572,6 +642,7 @@ class MultiShellController:
                 problems.append(f"missing Claude login for: {', '.join(missing_claude)}")
             raise RuntimeError("; ".join(problems))
         self._shutting_down = False
+        self._started_controller = True
         self._control_server.start()
         self.manager.start()
         for worker in self.codex_workers.values():
@@ -585,6 +656,7 @@ class MultiShellController:
 
     def stop(self) -> None:
         self._shutting_down = True
+        self._started_controller = False
         self._stop.set()
         self._control_server.stop()
         self.web_reasoners.stop()
@@ -614,6 +686,12 @@ class MultiShellController:
         except (SparkError, WebReasonerError, KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
+    def _lookup_worker(self, worker_name: str) -> ManagedSession | None:
+        worker = self.workers.get(worker_name)
+        if worker is not None:
+            return worker
+        return self._materialize_worker(worker_name)
+
     def _handle_manager_request(self, tool: object, arguments: dict[str, object]) -> dict[str, object]:
         if tool == "notify_user":
             message = str(arguments.get("message", "")).strip()
@@ -633,7 +711,7 @@ class MultiShellController:
             worker_name = str(arguments.get("worker", "")).strip()
             task = str(arguments.get("task", "")).strip()
             cwd = str(arguments.get("cwd", "")).strip() or None
-            worker = self.workers.get(worker_name)
+            worker = self._lookup_worker(worker_name)
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             if worker.overview()["status"] == "stopped":
@@ -646,7 +724,7 @@ class MultiShellController:
         if tool == "start_worker_session":
             worker_name = str(arguments.get("worker", "")).strip()
             cwd = str(arguments.get("cwd", "")).strip() or None
-            worker = self.workers.get(worker_name)
+            worker = self._lookup_worker(worker_name)
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             if worker.overview()["status"] != "stopped":
@@ -671,7 +749,7 @@ class MultiShellController:
 
         if tool == "stop_worker_session":
             worker_name = str(arguments.get("worker", "")).strip()
-            worker = self.workers.get(worker_name)
+            worker = self._lookup_worker(worker_name)
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             worker.stop_session(clear_pending=True)
@@ -684,7 +762,7 @@ class MultiShellController:
         if tool == "restart_worker_session":
             worker_name = str(arguments.get("worker", "")).strip()
             cwd = str(arguments.get("cwd", "")).strip() or None
-            worker = self.workers.get(worker_name)
+            worker = self._lookup_worker(worker_name)
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             account = self._ensure_worker_binding(worker_name, prefer_current=True)
@@ -715,7 +793,7 @@ class MultiShellController:
             except (TypeError, ValueError):
                 return {"ok": False, "error": "lines must be an integer"}
             line_count = max(1, min(40, line_count))
-            worker = self.workers.get(worker_name)
+            worker = self._lookup_worker(worker_name)
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             entries = [{"ts": entry.ts, "source": entry.source, "text": entry.text} for entry in worker.recent_transcript(line_count)]
@@ -888,21 +966,30 @@ class MultiShellController:
 
     def session_rows(self) -> list[dict[str, object]]:
         rows = [self._decorate_overview(self.manager.spec.name, self.manager.overview())]
-        rows.extend(self._decorate_overview(worker.spec.name, worker.overview()) for worker in self.codex_workers.values())
-        rows.extend(self._decorate_overview(worker.spec.name, worker.overview()) for worker in self.claude_workers.values())
+        rows.extend(
+            self._decorate_overview(spec.name, self.codex_workers[spec.name].overview())
+            for spec in self._materialized_codex_specs()
+        )
+        rows.extend(
+            self._decorate_overview(spec.name, self.claude_workers[spec.name].overview())
+            for spec in self._materialized_claude_specs()
+        )
         return rows
 
     def monitor_items(self) -> list[dict[str, object]]:
         items = [self._monitor_from_session("manager", self.manager.overview())]
 
-        for index, spec in enumerate(self._codex_worker_specs, start=1):
-            items.append(self._monitor_from_session(f"codex-{index}", self.codex_workers[spec.name].overview()))
+        for spec in self._materialized_codex_specs():
+            worker_index = spec.name.split("-")[-1]
+            items.append(self._monitor_from_session(f"codex-{worker_index}", self.codex_workers[spec.name].overview()))
 
-        for index, spec in enumerate(self._claude_worker_specs, start=1):
-            items.append(self._monitor_from_session(f"claude-{index}", self.claude_workers[spec.name].overview()))
+        for spec in self._materialized_claude_specs():
+            worker_index = spec.name.split("-")[-1]
+            items.append(self._monitor_from_session(f"claude-{worker_index}", self.claude_workers[spec.name].overview()))
 
-        for index, spec in enumerate(self._codex_worker_specs, start=1):
-            items.append(self._monitor_from_session(f"spark-{index}", self.spark_workers[spec.name].overview()))
+        for spec in self._materialized_codex_specs():
+            worker_index = spec.name.split("-")[-1]
+            items.append(self._monitor_from_session(f"spark-{worker_index}", self.spark_workers[spec.name].overview()))
 
         gptpro_jobs = self.web_reasoners.list_jobs(provider="chatgpt_pro")
         items.append(self._monitor_from_reasoner("gptpro-1", gptpro_jobs[0] if len(gptpro_jobs) >= 1 else None, accent_color=1))

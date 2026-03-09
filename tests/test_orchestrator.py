@@ -491,14 +491,49 @@ def test_monitor_items_use_compact_swarm_labels(monkeypatch) -> None:
 
     assert labels[0] == "manager"
     assert "codex-1" in labels
-    assert "codex-9" in labels
     assert "claude-1" in labels
-    assert "claude-10" in labels
     assert "spark-1" in labels
-    assert "spark-9" in labels
     assert "gptpro-1" in labels
     assert "gptpro-2" in labels
     assert "deepthink" in labels
+    assert "codex-2" not in labels
+    assert "claude-2" not in labels
+    assert "spark-2" not in labels
+
+
+def test_worker_slots_materialize_only_when_used(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+
+    assert "worker-1" in controller.workers
+    assert "claude-worker-1" in controller.workers
+    assert "worker-2" not in controller.workers
+    assert "claude-worker-2" not in controller.workers
+    assert "worker-2" not in controller.spark_workers
+
+    response = controller.handle_control_request(
+        {
+            "tool": "restart_worker_session",
+            "arguments": {
+                "worker": "worker-2",
+                "cwd": "/tmp/repo-b",
+                "persona_name": "John von Neumann",
+                "task_context": "top-k candidate focused on raw implementation speed",
+                "extra_instructions": "Attack the problem with an aggressive performance mindset.",
+            },
+        }
+    )
+
+    assert response["ok"] is True
+    assert "worker-2" in controller.workers
+    assert "worker-2" in controller.codex_workers
+    assert "worker-2" in controller.spark_workers
+    assert controller.codex_workers["worker-2"].restarted_calls[-1][0] == "/tmp/repo-b"
 
 
 def test_session_rows_hide_last_error_for_intentional_stop(monkeypatch) -> None:
@@ -535,7 +570,7 @@ def test_handle_transport_closed_worker_event_surfaces_error_and_supervision_pro
     controller._handle_worker_event(
         SessionEvent(
             ts=0.0,
-            agent="worker-2",
+            agent="worker-1",
             kind="transport_closed",
             message="app-server connection closed",
         )
@@ -544,7 +579,7 @@ def test_handle_transport_closed_worker_event_surfaces_error_and_supervision_pro
     messages = controller.recent_messages(1)
     assert messages[-1].source == "system"
     assert messages[-1].level == "warn"
-    assert messages[-1].text == "worker-2: app-server disconnected; automatically restarted idle session"
+    assert messages[-1].text == "worker-1: app-server disconnected; automatically restarted idle session"
     assert controller.manager.enqueued == []
 
 
