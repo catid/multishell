@@ -43,6 +43,7 @@ from .updater import (
     check_startup_update,
     current_release_version,
     current_version,
+    install_release,
     install_latest_release,
     rollback_to_version,
 )
@@ -94,6 +95,38 @@ def _bin_dir() -> Path:
     return Path(override).expanduser() if override else DEFAULT_BIN_DIR
 
 
+def _can_prompt_for_update() -> bool:
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _handle_startup_update_prompt(startup_update) -> int | None:
+    if startup_update.message is None:
+        return None
+    available_release = getattr(startup_update, "available_release", None)
+    if available_release is None or not _can_prompt_for_update():
+        print(startup_update.message, flush=True)
+        return None
+    response = input(f"{startup_update.message}\nInstall this update now and exit? [y/N] ").strip().lower()
+    if response not in {"y", "yes"}:
+        return None
+    try:
+        install_release(
+            available_release,
+            python_bin=sys.executable,
+            target_install_root=_install_root(),
+            target_bin_dir=_bin_dir(),
+        )
+    except UpdaterError as exc:
+        print(str(exc))
+        return 1
+    print(f"installed {available_release.tag_name} into {_install_root()}")
+    print("multishell updated; restart it to use the new version")
+    return 0
+
+
 def cmd_run(_: argparse.Namespace) -> int:
     if _maybe_reexec_into_venv("websockets"):
         return 0
@@ -103,8 +136,9 @@ def cmd_run(_: argparse.Namespace) -> int:
     state_root().mkdir(parents=True, exist_ok=True)
     ensure_runtime_environment(role="controller", agent=MANAGER_SPEC.name)
     startup_update = check_startup_update()
-    if startup_update.message:
-        print(startup_update.message, flush=True)
+    prompt_result = _handle_startup_update_prompt(startup_update)
+    if prompt_result is not None:
+        return prompt_result
     if startup_update.restart_python is not None:
         os.execv(str(startup_update.restart_python), [str(startup_update.restart_python), "-m", "multishell", *sys.argv[1:]])
     cleanup_messages = cleanup_stale_runtime()

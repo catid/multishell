@@ -107,6 +107,74 @@ def test_run_fails_when_any_agent_login_is_missing(monkeypatch, tmp_path: Path, 
     assert "multishell refuses to start until every configured agent is logged in" in out
 
 
+def test_run_prompts_for_startup_update_and_installs_on_yes(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    installed: dict[str, object] = {}
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.__main__.state_root", lambda: tmp_path / ".multishell")
+    monkeypatch.setattr("multishell.__main__.ensure_runtime_environment", lambda **_kwargs: "instance-1")
+    monkeypatch.setattr(
+        "multishell.__main__.check_startup_update",
+        lambda: SimpleNamespace(
+            message="update available: 0.1.2 -> 0.1.3 (v0.1.3). Run `multishell update`.",
+            restart_python=None,
+            available_release=SimpleNamespace(tag_name="v0.1.3", version="0.1.3"),
+        ),
+    )
+    monkeypatch.setattr("multishell.__main__._can_prompt_for_update", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda prompt: installed.__setitem__("prompt", prompt) or "y")
+    monkeypatch.setattr("multishell.__main__._install_root", lambda: tmp_path / "install")
+    monkeypatch.setattr("multishell.__main__._bin_dir", lambda: tmp_path / "bin")
+    monkeypatch.setattr(
+        "multishell.__main__.install_release",
+        lambda release, **kwargs: installed.update({"release": release, "kwargs": kwargs}) or (tmp_path / "install" / "releases" / "0.1.3"),
+    )
+
+    args = parser.parse_args(["run"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "Install this update now and exit?" in installed["prompt"]
+    assert installed["release"].tag_name == "v0.1.3"
+    assert installed["kwargs"]["target_install_root"] == tmp_path / "install"
+    assert installed["kwargs"]["target_bin_dir"] == tmp_path / "bin"
+    assert "installed v0.1.3" in out
+    assert "restart it to use the new version" in out
+
+
+def test_run_continues_when_startup_update_is_declined(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    install_called = {"value": False}
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.__main__.state_root", lambda: tmp_path / ".multishell")
+    monkeypatch.setattr("multishell.__main__.ensure_runtime_environment", lambda **_kwargs: "instance-1")
+    monkeypatch.setattr("multishell.__main__.cleanup_stale_runtime", lambda: [])
+    monkeypatch.setattr("multishell.__main__.ensure_agent_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.ensure_claude_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "multishell.__main__.check_startup_update",
+        lambda: SimpleNamespace(
+            message="update available: 0.1.2 -> 0.1.3 (v0.1.3). Run `multishell update`.",
+            restart_python=None,
+            available_release=SimpleNamespace(tag_name="v0.1.3", version="0.1.3"),
+        ),
+    )
+    monkeypatch.setattr("multishell.__main__._can_prompt_for_update", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    monkeypatch.setattr("multishell.__main__.install_release", lambda *args, **kwargs: install_called.__setitem__("value", True))
+    monkeypatch.setattr("multishell.__main__.missing_codex_logins", lambda: [])
+    monkeypatch.setattr("multishell.__main__.missing_claude_logins", lambda: ["claude-worker-2"])
+
+    args = parser.parse_args(["run"])
+
+    assert args.func(args) == 1
+    assert install_called["value"] is False
+    out = capsys.readouterr().out
+    assert "missing Claude login for: claude-worker-2" in out
+
+
 def test_check_update_prints_available_release(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
     parser = build_parser()
 

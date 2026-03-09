@@ -79,13 +79,13 @@ multishell rollback 0.1.0
 
 `multishell` keeps installed releases under `~/.local/share/multishell/releases/<version>` and points the wrapper at `~/.local/share/multishell/current`.
 
-By default, startup checks for updates at most once per day and prints a notice when a newer tagged release exists. To disable the startup check entirely:
+By default, startup checks for updates at most once per day and prompts whether to install a newer tagged release before the TUI opens. If you accept, `multishell` installs the update and exits so you can restart into the new version. To disable the startup check entirely:
 
 ```bash
 export MULTISHELL_AUTO_UPDATE=off
 ```
 
-To automatically install the newest tagged release at startup before the TUI opens, then restart into it:
+To automatically install the newest tagged release at startup before the TUI opens, then restart into it without prompting:
 
 ```bash
 export MULTISHELL_AUTO_UPDATE=apply

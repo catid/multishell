@@ -44,6 +44,7 @@ class ReleaseInfo:
 class StartupUpdateResult:
     message: str | None = None
     restart_python: Path | None = None
+    available_release: ReleaseInfo | None = None
 
 
 def configured_github_repo() -> str:
@@ -214,7 +215,8 @@ def check_startup_update(*, repo: str | None = None) -> StartupUpdateResult:
         message=(
             f"update available: {current_version()} -> {update.version} "
             f"({update.tag_name}). Run `multishell update`."
-        )
+        ),
+        available_release=update,
     )
 
 

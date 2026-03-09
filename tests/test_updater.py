@@ -115,6 +115,12 @@ def test_check_startup_update_returns_notice_when_update_is_available(monkeypatc
     assert isinstance(result, StartupUpdateResult)
     assert result.message == "update available: 0.1.0 -> 0.2.0 (v0.2.0). Run `multishell update`."
     assert result.restart_python is None
+    assert result.available_release == ReleaseInfo(
+        tag_name="v0.2.0",
+        version="0.2.0",
+        tarball_url="https://example.invalid/v0.2.0.tar.gz",
+        html_url="https://example.invalid/v0.2.0",
+    )
 
 
 def test_check_startup_update_can_apply_and_request_restart(monkeypatch, tmp_path: Path) -> None:
