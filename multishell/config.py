@@ -371,8 +371,6 @@ def provider_account_for_name(name: str) -> AccountRecord:
 
 
 def home_owner_name(agent_name: str) -> str:
-    if agent_name.endswith("-spark"):
-        return home_owner_name(agent_name[: -len("-spark")])
     return agent_name
 
 
