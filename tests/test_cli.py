@@ -86,6 +86,26 @@ def test_auth_login_for_claude_agent_suppresses_node_warnings(monkeypatch, tmp_p
     assert "ANTHROPIC_API_KEY" not in captured["env"]
 
 
+def test_run_fails_when_any_agent_login_is_missing(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+
+    monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.__main__.state_root", lambda: tmp_path / ".multishell")
+    monkeypatch.setattr("multishell.__main__.ensure_runtime_environment", lambda **_kwargs: "instance-1")
+    monkeypatch.setattr("multishell.__main__.cleanup_stale_runtime", lambda: [])
+    monkeypatch.setattr("multishell.__main__.ensure_agent_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.ensure_claude_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.missing_codex_logins", lambda: [])
+    monkeypatch.setattr("multishell.__main__.missing_claude_logins", lambda: ["claude-worker-2"])
+
+    args = parser.parse_args(["run"])
+
+    assert args.func(args) == 1
+    out = capsys.readouterr().out
+    assert "missing Claude login for: claude-worker-2" in out
+    assert "multishell refuses to start until every configured agent is logged in" in out
+
+
 def test_init_config_writes_template(monkeypatch, tmp_path: Path) -> None:
     parser = build_parser()
     target = tmp_path / ".multishell" / ".env"

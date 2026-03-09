@@ -17,6 +17,8 @@ ENV_ROLE = "MULTISHELL_ROLE"
 ENV_AGENT = "MULTISHELL_AGENT"
 ENV_NODE_NO_WARNINGS = "NODE_NO_WARNINGS"
 ENV_PLAYWRIGHT_BROWSERS_PATH = "PLAYWRIGHT_BROWSERS_PATH"
+ENV_CARGO_HOME = "CARGO_HOME"
+ENV_RUSTUP_HOME = "RUSTUP_HOME"
 DEFAULT_INSTALL_ROOT = Path.home() / ".local" / "share" / "multishell"
 
 
@@ -57,6 +59,7 @@ def child_env(
     *,
     role: str | None = None,
     agent: str | None = None,
+    home: str | Path | None = None,
 ) -> dict[str, str]:
     ensure_runtime_environment()
     env = suppress_node_warnings(base_env)
@@ -67,6 +70,8 @@ def child_env(
         env[ENV_ROLE] = role
     if agent is not None:
         env[ENV_AGENT] = agent
+    if home is not None:
+        apply_toolchain_home(env, home=home)
     return env
 
 
@@ -95,6 +100,43 @@ def apply_playwright_browser_path(env: MutableMapping[str, str] | None = None) -
     target = os.environ if env is None else env
     target[ENV_PLAYWRIGHT_BROWSERS_PATH] = str(playwright_browsers_path())
     return target
+
+
+def apply_toolchain_home(
+    env: MutableMapping[str, str] | None = None,
+    *,
+    home: str | Path,
+) -> MutableMapping[str, str]:
+    target = os.environ if env is None else env
+    inherited_home = Path(str(target.get("HOME") or Path.home())).expanduser()
+    inherited_cargo_home = Path(str(target.get(ENV_CARGO_HOME) or (inherited_home / ".cargo"))).expanduser()
+    inherited_rustup_home = Path(str(target.get(ENV_RUSTUP_HOME) or (inherited_home / ".rustup"))).expanduser()
+    resolved_home = Path(home).expanduser()
+    cargo_home = resolved_home / ".cargo"
+    rustup_home = resolved_home / ".rustup"
+    target["HOME"] = str(resolved_home)
+    target[ENV_CARGO_HOME] = str(_select_toolchain_home(cargo_home, inherited_cargo_home, marker="bin"))
+    target[ENV_RUSTUP_HOME] = str(_select_toolchain_home(rustup_home, inherited_rustup_home, marker="toolchains"))
+    return target
+
+
+def _select_toolchain_home(preferred: Path, fallback: Path, *, marker: str) -> Path:
+    if _toolchain_home_ready(preferred, marker=marker):
+        return preferred
+    if fallback != preferred and _toolchain_home_ready(fallback, marker=marker):
+        return fallback
+    return preferred
+
+
+def _toolchain_home_ready(path: Path, *, marker: str) -> bool:
+    marker_path = path / marker
+    if not marker_path.is_dir():
+        return False
+    try:
+        next(marker_path.iterdir())
+    except (StopIteration, OSError):
+        return False
+    return True
 
 
 def cleanup_stale_runtime(grace_seconds: float = 3.0) -> list[str]:

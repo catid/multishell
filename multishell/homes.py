@@ -6,7 +6,17 @@ import subprocess
 import shutil
 from pathlib import Path
 
-from .config import MODEL, MODEL_REASONING_EFFORT, all_agent_specs, credential_source_agent, home_owner_name, state_root
+from .config import (
+    CLAUDE_WORKER_SPECS,
+    MANAGER_SPEC,
+    MODEL,
+    MODEL_REASONING_EFFORT,
+    WORKER_SPECS,
+    all_agent_specs,
+    credential_source_agent,
+    home_owner_name,
+    state_root,
+)
 from .runtime import suppress_node_warnings
 
 
@@ -50,6 +60,25 @@ def has_claude_auth(agent_name: str) -> bool:
     return claude_auth_path(agent_name).exists() or claude_root_auth_path(agent_name).exists()
 
 
+def codex_logged_in(agent_name: str) -> bool:
+    if not auth_path(agent_name).exists():
+        return False
+    env = suppress_node_warnings(os.environ.copy())
+    env["HOME"] = str(agent_home(agent_name))
+    result = subprocess.run(
+        ["codex", "login", "status"],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return False
+    combined = f"{result.stdout}\n{result.stderr}".strip().lower()
+    return "logged in" in combined
+
+
 def claude_logged_in(agent_name: str) -> bool:
     if not has_claude_auth(agent_name):
         return False
@@ -71,6 +100,14 @@ def claude_logged_in(agent_name: str) -> bool:
     except json.JSONDecodeError:
         return False
     return bool(payload.get("loggedIn"))
+
+
+def missing_codex_logins() -> list[str]:
+    return [spec.name for spec in [MANAGER_SPEC, *WORKER_SPECS] if not codex_logged_in(spec.name)]
+
+
+def missing_claude_logins() -> list[str]:
+    return [spec.name for spec in CLAUDE_WORKER_SPECS if not claude_logged_in(spec.name)]
 
 
 def ensure_agent_home(

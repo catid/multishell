@@ -131,6 +131,10 @@ class SessionState:
         return entry
 
 
+class IntentionalTransportClose(RuntimeError):
+    pass
+
+
 class CodexSession:
     def __init__(
         self,
@@ -330,6 +334,8 @@ class CodexSession:
             try:
                 self._ensure_session_ready()
                 self._run_turn(item)
+            except IntentionalTransportClose:
+                pass
             except Exception as exc:  # pragma: no cover - defensive
                 with self._state_lock:
                     self.state.status = "error"
@@ -354,8 +360,7 @@ class CodexSession:
     def _launch_session(self) -> None:
         self._close_transport()
         port = _reserve_port()
-        env = child_env(os.environ.copy(), role="codex-session", agent=self.spec.name)
-        env["HOME"] = str(self.home)
+        env = child_env(os.environ.copy(), role="codex-session", agent=self.spec.name, home=self.home)
         process = subprocess.Popen(
             ["codex", "app-server", "--listen", f"ws://127.0.0.1:{port}"],
             stdin=subprocess.DEVNULL,
@@ -459,6 +464,10 @@ class CodexSession:
                 self._response_waiters.pop(request_id, None)
             raise RuntimeError(f"timed out waiting for response to {method}") from exc
         if "error" in response:
+            error_payload = response["error"]
+            if isinstance(error_payload, dict) and error_payload.get("intentional_shutdown"):
+                message = str(error_payload.get("message") or "session stopped intentionally")
+                raise IntentionalTransportClose(message)
             raise RuntimeError(f"{method} failed: {json.dumps(response['error'], ensure_ascii=True)}")
         result = response.get("result", {})
         return result if isinstance(result, dict) else {"value": result}
@@ -685,7 +694,8 @@ class CodexSession:
                 self.state.last_error = detail
         if not intentional:
             self._push_line("error" if retryable else "event", detail)
-        self._current_turn_error = self._current_turn_error or detail
+        if not intentional:
+            self._current_turn_error = self._current_turn_error or detail
         self._turn_done.set()
         if not intentional:
             self._emit_event("transport_closed", detail, **event_data)
@@ -693,6 +703,8 @@ class CodexSession:
             waiters = list(self._response_waiters.values())
             self._response_waiters.clear()
         error_payload = {"message": detail, "retryable": retryable, **event_data}
+        if intentional:
+            error_payload["intentional_shutdown"] = True
         for waiter in waiters:
             waiter.put({"error": error_payload})
         return detail

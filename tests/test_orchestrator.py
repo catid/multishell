@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 import multishell.orchestrator as orch
 from multishell.codex_session import SessionEvent
 
@@ -72,6 +74,7 @@ class FakeSession:
         self.restarted_calls: list[tuple[str | None, str | None, str | None]] = []
         self.stopped = 0
         self.start_count = 0
+        self.interrupt_count = 0
 
     def start(self) -> None:
         self.start_count += 1
@@ -115,6 +118,7 @@ class FakeSession:
         self._overview["status"] = "stopped"
 
     def interrupt(self) -> None:
+        self.interrupt_count += 1
         self._overview["status"] = "idle"
 
     def enqueue(self, prompt: str, source: str = "system", cwd: str | None = None) -> None:
@@ -270,6 +274,36 @@ def test_fanout_guidance_for_top_k_requests(monkeypatch) -> None:
     assert "Use multiple Codex and Claude workers in parallel" in guidance
 
 
+def test_fanout_guidance_for_non_trivial_requests_prefers_small_swarm(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    guidance = controller._fanout_guidance("Implement a small Rust command that prints the first ten thousand primes and verify it locally.")
+
+    assert "do not over-fan out by default" in guidance
+    assert "one implementer plus one verifier or reviewer" in guidance
+
+
+def test_send_user_message_includes_dependency_and_completion_gates(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller.send_user_message("Build a file, then verify it.")
+
+    prompt, source, _cwd = controller.manager.enqueued[-1]
+    assert source == "user"
+    assert "do not ask workers to poll in loops" in prompt
+    assert "Do not send a final success update" in prompt
+
+
 def test_handle_control_request_passes_cwd_and_persona_to_worker(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
@@ -327,6 +361,41 @@ def test_handle_control_request_passes_cwd_and_persona_to_worker(monkeypatch) ->
     assert "Session persona: John von Neumann." in restart_prompt
 
 
+def test_notify_user_rejects_premature_final_completion(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller.workers["worker-1"]._overview["status"] = "running"
+
+    response = controller.handle_control_request(
+        {"tool": "notify_user", "arguments": {"message": "Done. Everything succeeded."}}
+    )
+
+    assert response["ok"] is False
+    assert "cannot send a final completion update" in str(response["error"])
+
+
+def test_notify_user_allows_final_completion_once_work_is_idle(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+
+    response = controller.handle_control_request(
+        {"tool": "notify_user", "arguments": {"message": "Done. Everything succeeded."}}
+    )
+
+    assert response["ok"] is True
+    assert controller.recent_messages(1)[-1].text == "Done. Everything succeeded."
+
+
 def test_worker_spark_tool_uses_paired_worker_name(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
@@ -349,19 +418,39 @@ def test_worker_spark_tool_uses_paired_worker_name(monkeypatch) -> None:
     assert response["job"]["status"] == "running"
 
 
-def test_controller_start_skips_claude_workers_without_login(monkeypatch) -> None:
+def test_controller_start_starts_all_workers_when_logins_are_present(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
     monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
-    monkeypatch.setattr(orch, "claude_logged_in", lambda name: False)
+    monkeypatch.setattr(orch, "missing_codex_logins", lambda: [])
+    monkeypatch.setattr(orch, "missing_claude_logins", lambda: [])
 
     controller = orch.MultiShellController()
     controller.start()
 
     assert controller.manager.start_count == 1
     assert all(worker.start_count == 1 for worker in controller.codex_workers.values())
+    assert all(worker.start_count == 1 for worker in controller.claude_workers.values())
+
+
+def test_controller_start_fails_when_any_agent_login_is_missing(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+    monkeypatch.setattr(orch, "missing_codex_logins", lambda: ["worker-2"])
+    monkeypatch.setattr(orch, "missing_claude_logins", lambda: ["claude-worker-3"])
+
+    controller = orch.MultiShellController()
+
+    with pytest.raises(RuntimeError, match="missing Codex login for: worker-2; missing Claude login for: claude-worker-3"):
+        controller.start()
+
+    assert controller.manager.start_count == 0
+    assert all(worker.start_count == 0 for worker in controller.codex_workers.values())
     assert all(worker.start_count == 0 for worker in controller.claude_workers.values())
 
 
@@ -428,6 +517,154 @@ def test_handle_transport_closed_worker_event_surfaces_error_and_supervision_pro
     assert messages[-1].level == "warn"
     assert messages[-1].text == "worker-2: app-server disconnected; automatically restarted idle session"
     assert controller.manager.enqueued == []
+
+
+def test_build_worker_event_prompt_ignores_non_terminal_progress_messages(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "build and verify"
+
+    prompt = controller._build_worker_event_prompt(
+        SessionEvent(ts=0.0, agent="claude-worker-2", kind="assistant_message", message="File doesn't exist yet. Let me poll briefly and retry.")
+    )
+
+    assert prompt is None
+
+
+def test_build_worker_event_prompt_keeps_terminal_worker_messages(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "build and verify"
+
+    prompt = controller._build_worker_event_prompt(
+        SessionEvent(ts=0.0, agent="worker-2", kind="assistant_message", message="Verification complete. Final line: 104729.")
+    )
+
+    assert prompt is not None
+    assert "worker-2 assistant_message: Verification complete. Final line: 104729." in prompt
+
+
+def test_build_worker_event_prompt_keeps_structured_implementer_verification_reports(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "build and verify"
+
+    prompt = controller._build_worker_event_prompt(
+        SessionEvent(
+            ts=0.0,
+            agent="worker-3",
+            kind="assistant_message",
+            message=(
+                "Reused the existing file; no rewrite needed.\n\n"
+                "- Compile command: `rustc /tmp/prime.rs -O -o /tmp/prime`\n"
+                "- Run command: `/tmp/prime > /tmp/prime.out`\n"
+                "- Line count result: `10000`\n"
+                "- Last line: `104729`"
+            ),
+        )
+    )
+
+    assert prompt is not None
+    assert "worker-3 assistant_message: Reused the existing file; no rewrite needed." in prompt
+
+
+def test_build_worker_event_prompt_keeps_structured_verifier_success_reports(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "build and verify"
+
+    prompt = controller._build_worker_event_prompt(
+        SessionEvent(
+            ts=0.0,
+            agent="claude-worker-4",
+            kind="assistant_message",
+            message=(
+                "Verification PASSED - all checks green.\n\n"
+                "Compile command: `rustc prime.rs`\n"
+                "Line count result: `10000`\n"
+                "Last line: `104729`"
+            ),
+        )
+    )
+
+    assert prompt is not None
+    assert "claude-worker-4 assistant_message: Verification PASSED - all checks green." in prompt
+
+
+def test_handle_worker_event_interrupts_stale_manager_turn_for_significant_completion(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "build and verify"
+    controller.manager._overview["status"] = "running"
+    controller.manager._overview["running_for_seconds"] = 12.0
+    controller.manager._overview["turn_id"] = "turn-1"
+
+    controller._handle_worker_event(
+        SessionEvent(ts=0.0, agent="worker-2", kind="assistant_message", message="Verification complete. Final line: 104729.")
+    )
+
+    assert controller.manager.interrupt_count == 1
+    prompt, source, _cwd = controller.manager.enqueued[-1]
+    assert source == "system"
+    assert "worker-2 assistant_message: Verification complete. Final line: 104729." in prompt
+    notice = controller.recent_messages(1)[-1]
+    assert notice.source == "system"
+    assert notice.level == "warn"
+    assert notice.text == "interrupted a stale manager turn to process a significant worker event"
+
+
+def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "build and verify"
+    controller.manager._overview["status"] = "running"
+    controller.manager._overview["running_for_seconds"] = 3.0
+    controller.manager._overview["turn_id"] = "turn-1"
+
+    controller._handle_worker_event(
+        SessionEvent(ts=0.0, agent="worker-2", kind="assistant_message", message="Verification complete. Final line: 104729.")
+    )
+
+    assert controller.manager.interrupt_count == 0
+    prompt, source, _cwd = controller.manager.enqueued[-1]
+    assert source == "system"
+    assert "worker-2 assistant_message: Verification complete. Final line: 104729." in prompt
 
 
 def test_transport_closed_idle_codex_worker_auto_restarts_and_updates_failure_context(monkeypatch) -> None:

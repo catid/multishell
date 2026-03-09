@@ -5,10 +5,12 @@ from pathlib import Path
 from multishell.config import state_root
 from multishell.runtime import (
     ENV_AGENT,
+    ENV_CARGO_HOME,
     ENV_INSTANCE_ID,
     ENV_NODE_NO_WARNINGS,
     ENV_PLAYWRIGHT_BROWSERS_PATH,
     ENV_ROLE,
+    ENV_RUSTUP_HOME,
     ENV_STATE_ROOT,
     ObservedProcess,
     _discover_stale_processes,
@@ -34,6 +36,36 @@ def test_child_env_inherits_runtime_markers(monkeypatch, tmp_path: Path) -> None
     assert env[ENV_NODE_NO_WARNINGS] == "1"
     assert env[ENV_PLAYWRIGHT_BROWSERS_PATH] == str((tmp_path / ".install" / "playwright-browsers"))
     assert env["PATH"] == "/usr/bin"
+
+
+def test_child_env_sets_toolchain_homes_when_home_is_overridden(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(ENV_STATE_ROOT, str(tmp_path / ".multishell"))
+    monkeypatch.setenv(ENV_INSTANCE_ID, "instance-1")
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
+
+    env = child_env({"PATH": "/usr/bin"}, role="codex-session", agent="worker-1", home=tmp_path / "worker-home")
+
+    assert env["HOME"] == str(tmp_path / "worker-home")
+    assert env[ENV_CARGO_HOME] == str(tmp_path / "worker-home" / ".cargo")
+    assert env[ENV_RUSTUP_HOME] == str(tmp_path / "worker-home" / ".rustup")
+
+
+def test_child_env_reuses_populated_inherited_toolchain_homes_when_worker_home_is_empty(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv(ENV_STATE_ROOT, str(tmp_path / ".multishell"))
+    monkeypatch.setenv(ENV_INSTANCE_ID, "instance-1")
+    monkeypatch.setenv("HOME", str(tmp_path / "user-home"))
+    cargo_home = tmp_path / "user-home" / ".cargo" / "bin"
+    rustup_home = tmp_path / "user-home" / ".rustup" / "toolchains" / "stable"
+    cargo_home.mkdir(parents=True)
+    rustup_home.mkdir(parents=True)
+    (cargo_home / "cargo").write_text("", encoding="utf-8")
+    (rustup_home / "rustc").write_text("", encoding="utf-8")
+
+    env = child_env({"PATH": "/usr/bin"}, role="codex-session", agent="worker-1", home=tmp_path / "worker-home")
+
+    assert env["HOME"] == str(tmp_path / "worker-home")
+    assert env[ENV_CARGO_HOME] == str(tmp_path / "user-home" / ".cargo")
+    assert env[ENV_RUSTUP_HOME] == str(tmp_path / "user-home" / ".rustup")
 
 
 def test_suppress_node_warnings_overrides_inherited_setting() -> None:

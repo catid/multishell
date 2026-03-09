@@ -369,9 +369,8 @@ class ClaudeSession:
         self._record_turn_success(outcome=outcome, started_at=started_at, generation=generation)
 
     def _spawn_turn_process(self, prompt: str, resume_session_id: str | None) -> subprocess.Popen[str]:
-        env = child_env(os.environ.copy(), role="claude-session", agent=self.spec.name)
+        env = child_env(os.environ.copy(), role="claude-session", agent=self.spec.name, home=self.home)
         env.pop("ANTHROPIC_API_KEY", None)
-        env["HOME"] = str(self.home)
         command = [
             "claude",
             "-p",

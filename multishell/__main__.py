@@ -17,7 +17,17 @@ from .config import (
     missing_email_env_vars,
     state_root,
 )
-from .homes import agent_home, all_agent_names, auth_path, claude_home, claude_logged_in, ensure_agent_home, ensure_claude_home
+from .homes import (
+    agent_home,
+    all_agent_names,
+    claude_home,
+    claude_logged_in,
+    codex_logged_in,
+    ensure_agent_home,
+    ensure_claude_home,
+    missing_claude_logins,
+    missing_codex_logins,
+)
 from .runtime import (
     apply_node_warning_suppression,
     apply_playwright_browser_path,
@@ -90,19 +100,18 @@ def cmd_run(_: argparse.Namespace) -> int:
     for spec in CLAUDE_WORKER_SPECS:
         ensure_claude_home(spec.name)
 
-    missing_codex = [name for name in [MANAGER_SPEC.name, *[spec.name for spec in WORKER_SPECS]] if not auth_path(name).exists()]
-    missing_claude = [spec.name for spec in CLAUDE_WORKER_SPECS if not claude_logged_in(spec.name)]
-    if missing_codex:
-        print("missing Codex login for:", ", ".join(missing_codex))
+    missing_codex = missing_codex_logins()
+    missing_claude = missing_claude_logins()
+    if missing_codex or missing_claude:
+        if missing_codex:
+            print("missing Codex login for:", ", ".join(missing_codex))
         if missing_claude:
             print("missing Claude login for:", ", ".join(missing_claude))
+        print("multishell refuses to start until every configured agent is logged in")
         print("run `multishell auto-login --all` first")
         print("add `--headed` only if you explicitly want visible browser windows for debugging")
         print("for a single lane, use `multishell auth-login <agent>`")
         return 1
-    if missing_claude:
-        print("warning: missing Claude login for:", ", ".join(missing_claude))
-        print("continuing with those Claude workers unavailable until login succeeds")
 
     controller = MultiShellController()
     try:
@@ -222,10 +231,10 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 def cmd_status(_: argparse.Namespace) -> int:
     ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
-    print(f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} home={agent_home(MANAGER_SPEC.name)} auth={'yes' if auth_path(MANAGER_SPEC.name).exists() else 'no'}")
+    print(f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} home={agent_home(MANAGER_SPEC.name)} auth={'yes' if codex_logged_in(MANAGER_SPEC.name) else 'no'}")
     for spec in WORKER_SPECS:
         ensure_agent_home(spec.name, mcp_bridge_command=_bridge_command("worker", spec.name))
-        print(f"{spec.name}: provider=codex email={spec.account_email} home={agent_home(spec.name)} auth={'yes' if auth_path(spec.name).exists() else 'no'}")
+        print(f"{spec.name}: provider=codex email={spec.account_email} home={agent_home(spec.name)} auth={'yes' if codex_logged_in(spec.name) else 'no'}")
     for spec in CLAUDE_WORKER_SPECS:
         ensure_claude_home(spec.name)
         print(f"{spec.name}: provider=claude email={spec.account_email} home={claude_home(spec.name)} auth={'yes' if claude_logged_in(spec.name) else 'no'}")

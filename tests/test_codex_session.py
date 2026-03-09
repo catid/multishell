@@ -408,3 +408,31 @@ def test_clean_transport_close_is_classified_distinctly(monkeypatch, tmp_path: P
     assert session.overview()["last_disconnect_kind"] == "clean_disconnect"
     assert session.overview()["last_disconnect_retryable"] is False
     assert events[-1].data["retryable"] is False
+
+
+def test_intentional_transport_close_does_not_mark_turn_failed(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir(parents=True)
+    workspace.mkdir(parents=True)
+
+    events: list[SessionEvent] = []
+
+    monkeypatch.setattr("multishell.codex_session.ensure_agent_home", lambda *args, **kwargs: home)
+    monkeypatch.setattr("multishell.codex_session.workspace_root", lambda: workspace)
+
+    session = CodexSession(_spec(), "initial", event_callback=events.append)
+    session.state.thread_id = "thread-1"
+    session.state.turn_id = "turn-1"
+    session.state.session_active = True
+    session.state.process_alive = True
+    session.state.status = "running"
+    session._intentional_transport_close.set()
+
+    detail = session._handle_transport_closed()
+
+    assert "during shutdown" in detail
+    assert session._current_turn_error is None
+    assert session._turn_done.is_set() is True
+    assert session.overview()["last_disconnect_kind"] == "intentional_shutdown"
+    assert events == []

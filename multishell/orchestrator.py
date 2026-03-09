@@ -22,7 +22,7 @@ from .config import (
     workspace_root,
 )
 from .control import ControlServer
-from .homes import claude_logged_in
+from .homes import missing_claude_logins, missing_codex_logins
 from .spark_pool import SparkCoordinator, SparkError
 from .web_reasoners import WebReasonerError, WebReasonerEvent, WebReasonerManager
 
@@ -189,6 +189,7 @@ Rules:
 - Use `delegate_to_worker` to assign concrete tasks to named workers.
 - Use `start_worker_session`, `stop_worker_session`, and `restart_worker_session` to manage worker memory and working directories.
 - Use `get_workers_overview` and `get_worker_transcript` to monitor progress and compare candidates.
+- Do not poll worker transcripts in tight loops. After delegating, prefer to return and wait for significant worker events unless there is a concrete blocker that requires an immediate check.
 - Use `notify_user` for all user-facing messages. Do not assume plain assistant text reaches the user.
 - Use `gpt_5_4_pro` and `gemini_deepthink` for slow planning, research, world knowledge, or math-heavy reasoning in parallel with worker execution.
 - Start slow web reasoners early on hard tasks, continue delegating while they run, then incorporate useful revisions after they complete.
@@ -196,6 +197,8 @@ Rules:
 - When starting or restarting a worker, craft a fresh session persona using `persona_name`, `task_context`, and `extra_instructions`.
 - Worker personalities are intentionally narrow. Do not assume one strong worker will also cover security, performance, UX, operability, and integration concerns automatically.
 - Assign explicit complementary roles when the task warrants it. Useful splits include implementer, correctness reviewer, security reviewer, performance reviewer, UX/operator reviewer, integration closer, and creative alternative generator.
+- Default to a small swarm. For straightforward single-file, single-bug, or otherwise bounded tasks, start with one implementer plus one verifier or reviewer. Add more workers only when the task spans multiple files, has meaningful uncertainty, or clearly benefits from diversity.
+- Gate dependent work. If verification, review, or integration depends on a file, binary, report, or other artifact that does not exist yet, wait for the prerequisite to be produced before delegating that dependent step. Do not ask workers to poll in loops unless there is no better option.
 - For non-trivial tasks, use more than one worker. For top-k or uncertain work, fan out aggressively across Codex and Claude workers.
 - For top-k work, maximize diversity of attack angle, not just worker count. Give each parallel worker a materially different persona, task framing, or review role.
 - For top-k work, keep the diversity emphasis explicit: run diverse candidates in parallel, align them on the exact target and success criteria, validate the winner quickly, and stop once further coordination is lower-value than delivery.
@@ -204,6 +207,7 @@ Rules:
 - Claude is especially useful for code review, idea expansion, alternative framings, and different-model perspective. Treat it as creative but less reliable.
 - Use Gemini Deep Think when you want slower but broader world knowledge or math-heavy parallel reasoning. It runs on the configured Gemini AI Ultra account pool.
 - Choose worker working directories intentionally. You can pass `cwd` when starting, restarting, or delegating.
+- Do not send a final success update until every required worker and reasoner for the task is terminal and the required verification has actually completed.
 - Keep messages concise and operational.
 
 Codex workers:
@@ -299,6 +303,7 @@ Rules:
 class MultiShellController:
     _AUTO_RECOVERY_COOLDOWN_SECONDS = 120.0
     _AUTO_RECOVERY_MAX_DISCONNECTS = 1
+    _MANAGER_EVENT_INTERRUPT_AFTER_SECONDS = 5.0
 
     def __init__(self) -> None:
         self.manager = CodexSession(
@@ -389,16 +394,22 @@ class MultiShellController:
             self._lifecycle[session_name] = SessionLifecycleMetadata()
 
     def start(self) -> None:
+        missing_codex = missing_codex_logins()
+        missing_claude = missing_claude_logins()
+        if missing_codex or missing_claude:
+            problems: list[str] = []
+            if missing_codex:
+                problems.append(f"missing Codex login for: {', '.join(missing_codex)}")
+            if missing_claude:
+                problems.append(f"missing Claude login for: {', '.join(missing_claude)}")
+            raise RuntimeError("; ".join(problems))
         self._shutting_down = False
         self._control_server.start()
         self.manager.start()
         for worker in self.codex_workers.values():
             worker.start()
-        for name, worker in self.claude_workers.items():
-            if claude_logged_in(name):
-                worker.start()
-            else:
-                self._push_message("system", f"{name}: Claude login missing; worker left unavailable", level="warn")
+        for worker in self.claude_workers.values():
+            worker.start()
         self._push_message("system", "multishell started", level="info")
         self._monitor_thread.start()
 
@@ -437,6 +448,14 @@ class MultiShellController:
         if tool == "notify_user":
             message = str(arguments.get("message", "")).strip()
             level = str(arguments.get("level", "info"))
+            if self._looks_like_final_user_update(message):
+                active_workers, active_reasoners = self._active_incomplete_work()
+                if active_workers or active_reasoners:
+                    waiting_on = ", ".join([*active_workers, *active_reasoners])
+                    return {
+                        "ok": False,
+                        "error": f"cannot send a final completion update while work is still active: {waiting_on}",
+                    }
             self._push_message("manager", message, level=level)
             return {"ok": True, "message": "user notified"}
 
@@ -598,6 +617,30 @@ class MultiShellController:
             return {"ok": True, "job": job}
         return {"ok": False, "error": "action must be one of: start, status, list, cancel"}
 
+    def _active_incomplete_work(self) -> tuple[list[str], list[str]]:
+        active_workers: list[str] = []
+        for name, worker in self.workers.items():
+            overview = worker.overview()
+            if overview.get("status") == "running" or int(overview.get("pending_tasks", 0)) > 0:
+                active_workers.append(name)
+
+        active_reasoners: list[str] = []
+        for job in self.web_reasoners.list_jobs():
+            if str(job.get("status") or "") not in {"queued", "running", "canceling"}:
+                continue
+            provider = str(job.get("provider") or "reasoner")
+            label = str(job.get("label") or job.get("id") or provider)
+            active_reasoners.append(f"{provider}:{label}")
+        return active_workers, active_reasoners
+
+    def _looks_like_final_user_update(self, message: str) -> bool:
+        normalized = message.strip().lower()
+        if not normalized:
+            return False
+        if normalized.startswith(("done", "completed", "brief summary", "final summary", "task complete")):
+            return True
+        return "verification summary" in normalized or "outcome: succeeded" in normalized
+
     def send_user_message(self, text: str) -> None:
         manager_overview = self.manager.overview()
         running_for = manager_overview.get("running_for_seconds")
@@ -614,8 +657,12 @@ class MultiShellController:
             "sessions first. Use Codex workers for reliable implementation and Claude workers for diversity, review, and cross-model "
             "perspective. Agents stay narrow to their prompted roles, so explicitly assign complementary jobs instead of assuming one worker covers "
             "everything. Use role splits like implementer, reviewer, performance checker, security skeptic, UX/operator critic, and integration closer "
-            "when appropriate. Start slow web reasoners early when long-horizon planning, outside knowledge, or heavy reasoning may help later. "
-            "For substantial work, split it into distinct parallel assignments with materially different angles. Choose worker working directories intentionally and notify the user."
+            "when appropriate. Default to one implementer plus one verifier or reviewer unless the task clearly benefits from more lanes. "
+            "If later stages depend on a file, binary, or report that does not exist yet, wait for that prerequisite before delegating the dependent work; do not ask workers to poll in loops unless there is no better option. "
+            "Do not sit in a long transcript-polling loop after delegation; return control and wait for significant worker events unless there is a concrete blocker. "
+            "Start slow web reasoners early when long-horizon planning, outside knowledge, or heavy reasoning may help later. "
+            "Do not send a final success update until required workers and reasoners are terminal and the required verification has actually completed. "
+            "Choose worker working directories intentionally and notify the user."
             f"{fanout_guidance}"
         )
         self._user_message_count += 1
@@ -785,6 +832,23 @@ class MultiShellController:
         self.manager.interrupt()
         self._push_message("system", "interrupted a manager turn that exceeded 90 seconds", level="warn")
 
+    def _maybe_interrupt_manager_for_worker_event(self) -> bool:
+        manager_overview = self.manager.overview()
+        running_for = manager_overview.get("running_for_seconds")
+        turn_id = str(manager_overview.get("turn_id") or "")
+        if (
+            manager_overview.get("status") != "running"
+            or not isinstance(running_for, float)
+            or running_for < self._MANAGER_EVENT_INTERRUPT_AFTER_SECONDS
+        ):
+            return False
+        if turn_id and turn_id == self._last_manager_interrupt_turn:
+            return False
+        self._last_manager_interrupt_turn = turn_id or None
+        self.manager.interrupt()
+        self._push_message("system", "interrupted a stale manager turn to process a significant worker event", level="warn")
+        return True
+
     def _handle_manager_message(self, entry: TranscriptEntry) -> None:
         self._push_message("manager", entry.text, level="info")
 
@@ -860,12 +924,74 @@ class MultiShellController:
                 "correctness review, performance review, security scrutiny, UX/operator critique, integration validation, and creative alternatives "
                 "as appropriate. Start one or both slow web reasoners early if long-horizon planning or outside knowledge may revise the path later."
             )
-        if len(text.split()) >= 18:
+        if len(text.split()) >= 12:
             return (
-                "\n\nThis is not a trivial request. Prefer parallel delegation across several Codex and Claude workers rather than serial execution. "
-                "Use explicit complementary roles instead of assuming one worker persona will notice security, performance, UX, and integration issues automatically."
+                "\n\nThis is not a trivial request, but do not over-fan out by default. Start with one implementer plus one verifier or reviewer, "
+                "then add more workers only if the task spans multiple files, has genuine uncertainty, or clearly benefits from an extra review angle."
             )
         return ""
+
+    def _assistant_message_needs_supervision(self, message: str) -> bool:
+        normalized = message.strip().lower()
+        if not normalized or self._is_ready_message(message):
+            return False
+        if normalized.startswith(
+            (
+                "let me ",
+                "i'll ",
+                "i will ",
+                "checking ",
+                "good, ",
+                "file doesn't exist yet",
+                "file appeared",
+                "compiles cleanly",
+                "now let me ",
+            )
+        ):
+            return False
+        if normalized.startswith(
+            (
+                "done",
+                "status:",
+                "verification complete",
+                "blocked",
+                "need",
+                "cannot",
+                "can't",
+                "failed",
+                "error",
+                "checked ",
+                "inspected ",
+                "reviewed ",
+                "created ",
+                "wrote ",
+            )
+        ):
+            return True
+        return any(
+            marker in normalized
+            for marker in (
+                "verification passed",
+                "verification complete",
+                "all checks green",
+                "compile failed",
+                "run failed",
+                "line-count check",
+                "line count result",
+                "final-value check",
+                "last line:",
+                "compile command:",
+                "run command:",
+                "reused the existing file",
+                "created:",
+                "created file:",
+                "blocked",
+                "cannot ",
+                "can't ",
+                " failed",
+                " error",
+            )
+        )
 
     def _resolve_worker_session_prompt(self, worker_name: str, arguments: dict[str, object]) -> tuple[str, str]:
         worker = self.workers[worker_name]
@@ -950,6 +1076,7 @@ class MultiShellController:
             return
         prompt = self._build_worker_event_prompt(event)
         if prompt:
+            self._maybe_interrupt_manager_for_worker_event()
             self.manager.enqueue(prompt, source="system")
 
     def _handle_spark_session_event(self, event: SessionEvent) -> None:
@@ -1010,7 +1137,7 @@ class MultiShellController:
         message = event.message.strip()
         if event.kind == "assistant_message" and not message:
             return None
-        if self._is_ready_message(message):
+        if event.kind == "assistant_message" and not self._assistant_message_needs_supervision(message):
             return None
         signature = (event.agent, f"{event.kind}:{message[:160]}")
         now = time.time()

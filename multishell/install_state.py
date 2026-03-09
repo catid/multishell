@@ -3,9 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from .accounts import load_accounts_from_dotenv
-from .config import CLAUDE_WORKER_SPECS, all_codex_specs, dotenv_path, dotenv_template_text
+from .config import dotenv_path, dotenv_template_text
 from .envfile import DotenvFile
-from .homes import auth_path, claude_logged_in
+from .homes import missing_claude_logins, missing_codex_logins
 
 
 def has_saved_account_credentials(path: Path | None = None) -> bool:
@@ -20,6 +20,6 @@ def needs_account_login(path: Path | None = None) -> bool:
 
 
 def missing_auth_agents() -> list[str]:
-    missing = [spec.name for spec in all_codex_specs() if not auth_path(spec.name).exists()]
-    missing.extend(spec.name for spec in CLAUDE_WORKER_SPECS if not claude_logged_in(spec.name))
+    missing = missing_codex_logins()
+    missing.extend(missing_claude_logins())
     return missing
