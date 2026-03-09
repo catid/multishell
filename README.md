@@ -51,6 +51,46 @@ The login TUI starts with an empty account list. Add as many Google accounts as 
 - Anthropic-enabled accounts determine the available Claude worker pool.
 - Gemini-enabled accounts become the Gemini AI Ultra account pool for Deep Think jobs.
 
+## Updating
+
+Check whether a newer tagged release is available:
+
+```bash
+multishell check-update
+```
+
+Install the latest tagged release into the local install root and repoint the wrapper to it:
+
+```bash
+multishell update
+```
+
+Roll back to the previously installed release:
+
+```bash
+multishell rollback
+```
+
+You can also roll back to a specific installed version:
+
+```bash
+multishell rollback 0.1.0
+```
+
+`multishell` keeps installed releases under `~/.local/share/multishell/releases/<version>` and points the wrapper at `~/.local/share/multishell/current`.
+
+By default, startup checks for updates at most once per day and prints a notice when a newer tagged release exists. To disable the startup check entirely:
+
+```bash
+export MULTISHELL_AUTO_UPDATE=off
+```
+
+To automatically install the newest tagged release at startup before the TUI opens, then restart into it:
+
+```bash
+export MULTISHELL_AUTO_UPDATE=apply
+```
+
 ## Headless Auth Model
 
 `multishell auto-login` now uses a headless Playwright-managed Chromium by default, even on machines with `DISPLAY` set. Pass `--headed` only when you explicitly want visible browser windows for debugging.

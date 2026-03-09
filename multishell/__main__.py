@@ -37,6 +37,15 @@ from .runtime import (
     playwright_browsers_path,
     suppress_node_warnings,
 )
+from .updater import (
+    UpdaterError,
+    check_for_update,
+    check_startup_update,
+    current_release_version,
+    current_version,
+    install_latest_release,
+    rollback_to_version,
+)
 
 
 DEFAULT_BIN_DIR = Path.home() / ".local" / "bin"
@@ -93,6 +102,11 @@ def cmd_run(_: argparse.Namespace) -> int:
 
     state_root().mkdir(parents=True, exist_ok=True)
     ensure_runtime_environment(role="controller", agent=MANAGER_SPEC.name)
+    startup_update = check_startup_update()
+    if startup_update.message:
+        print(startup_update.message, flush=True)
+    if startup_update.restart_python is not None:
+        os.execv(str(startup_update.restart_python), [str(startup_update.restart_python), "-m", "multishell", *sys.argv[1:]])
     cleanup_messages = cleanup_stale_runtime()
     ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
     for spec in WORKER_SPECS:
@@ -127,6 +141,47 @@ def cmd_run(_: argparse.Namespace) -> int:
         return 0
     finally:
         controller.stop()
+    return 0
+
+
+def cmd_check_update(args: argparse.Namespace) -> int:
+    try:
+        update = check_for_update(repo=args.repo)
+    except UpdaterError as exc:
+        print(str(exc))
+        return 1
+    current = current_version()
+    if update is None:
+        print(f"multishell is up to date ({current})")
+        return 0
+    print(f"update available: {current} -> {update.version} ({update.tag_name})")
+    print(f"source: {update.html_url}")
+    return 0
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    try:
+        release = install_latest_release(repo=args.repo, python_bin=sys.executable, target_install_root=_install_root(), target_bin_dir=_bin_dir())
+    except UpdaterError as exc:
+        print(str(exc))
+        return 1
+    print(f"installed {release.tag_name} into {_install_root()}")
+    print(f"wrapper now points to release {current_release_version(_install_root())}")
+    print("restart multishell to use the new version if it is currently running")
+    return 0
+
+
+def cmd_rollback(args: argparse.Namespace) -> int:
+    try:
+        version = rollback_to_version(
+            version=args.version,
+            target_install_root=_install_root(),
+            target_bin_dir=_bin_dir(),
+        )
+    except UpdaterError as exc:
+        print(str(exc))
+        return 1
+    print(f"rolled back multishell to {version}")
     return 0
 
 
@@ -404,6 +459,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     status_parser = subparsers.add_parser("status")
     status_parser.set_defaults(func=cmd_status)
+
+    check_update_parser = subparsers.add_parser("check-update")
+    check_update_parser.add_argument("--repo")
+    check_update_parser.set_defaults(func=cmd_check_update)
+
+    update_parser = subparsers.add_parser("update")
+    update_parser.add_argument("--repo")
+    update_parser.set_defaults(func=cmd_update)
+
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("version", nargs="?")
+    rollback_parser.set_defaults(func=cmd_rollback)
 
     login_parser = subparsers.add_parser("login")
     login_parser.set_defaults(func=cmd_login)

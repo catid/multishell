@@ -5,8 +5,8 @@ REPO="${MULTISHELL_GITHUB_REPO:-catid/multishell}"
 REF="${MULTISHELL_GITHUB_REF:-main}"
 INSTALL_ROOT="${MULTISHELL_INSTALL_ROOT:-$HOME/.local/share/multishell}"
 BIN_DIR="${MULTISHELL_BIN_DIR:-$HOME/.local/bin}"
-APP_DIR="$INSTALL_ROOT/app"
-VENV_DIR="$INSTALL_ROOT/venv"
+RELEASES_DIR="$INSTALL_ROOT/releases"
+CURRENT_LINK="$INSTALL_ROOT/current"
 
 log_step() {
   printf '\n==> %s\n' "$*"
@@ -116,8 +116,19 @@ if [[ -z "$src_dir" ]]; then
   exit 1
 fi
 
-mkdir -p "$INSTALL_ROOT" "$BIN_DIR"
-rm -rf "$APP_DIR"
+VERSION="$("$PYTHON_BIN" - <<PY
+import tomllib
+from pathlib import Path
+data = tomllib.loads(Path("$src_dir/pyproject.toml").read_text(encoding="utf-8"))
+print(data["project"]["version"])
+PY
+)"
+RELEASE_DIR="$RELEASES_DIR/$VERSION"
+APP_DIR="$RELEASE_DIR/app"
+VENV_DIR="$RELEASE_DIR/venv"
+
+mkdir -p "$INSTALL_ROOT" "$BIN_DIR" "$RELEASES_DIR"
+rm -rf "$RELEASE_DIR"
 cp -R "$src_dir" "$APP_DIR"
 
 log_step "Creating Python virtual environment"
@@ -129,9 +140,12 @@ log_step "Installing multishell into $VENV_DIR"
 cat > "$BIN_DIR/multishell" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-exec "$VENV_DIR/bin/python" -m multishell "\$@"
+INSTALL_ROOT="\${MULTISHELL_INSTALL_ROOT:-$INSTALL_ROOT}"
+exec "\$INSTALL_ROOT/current/venv/bin/python" -m multishell "\$@"
 EOF
 chmod +x "$BIN_DIR/multishell"
+
+ln -sfn "releases/$VERSION" "$CURRENT_LINK"
 
 export PATH="$BIN_DIR:$PATH"
 

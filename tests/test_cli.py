@@ -90,6 +90,7 @@ def test_run_fails_when_any_agent_login_is_missing(monkeypatch, tmp_path: Path, 
     parser = build_parser()
 
     monkeypatch.setattr("multishell.__main__._maybe_reexec_into_venv", lambda _module: False)
+    monkeypatch.setattr("multishell.__main__.check_startup_update", lambda: SimpleNamespace(message=None, restart_python=None))
     monkeypatch.setattr("multishell.__main__.state_root", lambda: tmp_path / ".multishell")
     monkeypatch.setattr("multishell.__main__.ensure_runtime_environment", lambda **_kwargs: "instance-1")
     monkeypatch.setattr("multishell.__main__.cleanup_stale_runtime", lambda: [])
@@ -104,6 +105,52 @@ def test_run_fails_when_any_agent_login_is_missing(monkeypatch, tmp_path: Path, 
     out = capsys.readouterr().out
     assert "missing Claude login for: claude-worker-2" in out
     assert "multishell refuses to start until every configured agent is logged in" in out
+
+
+def test_check_update_prints_available_release(monkeypatch, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+
+    monkeypatch.setattr("multishell.__main__.check_for_update", lambda repo=None: SimpleNamespace(version="0.2.0", tag_name="v0.2.0", html_url="https://example.invalid/release"))
+    monkeypatch.setattr("multishell.__main__.current_version", lambda: "0.1.0")
+
+    args = parser.parse_args(["check-update"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "update available: 0.1.0 -> 0.2.0 (v0.2.0)" in out
+    assert "https://example.invalid/release" in out
+
+
+def test_update_installs_latest_release(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+
+    monkeypatch.setattr("multishell.__main__._install_root", lambda: tmp_path / "install")
+    monkeypatch.setattr("multishell.__main__._bin_dir", lambda: tmp_path / "bin")
+    monkeypatch.setattr(
+        "multishell.__main__.install_latest_release",
+        lambda **kwargs: SimpleNamespace(tag_name="v0.2.0"),
+    )
+    monkeypatch.setattr("multishell.__main__.current_release_version", lambda _root: "0.2.0")
+
+    args = parser.parse_args(["update"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "installed v0.2.0" in out
+    assert "wrapper now points to release 0.2.0" in out
+
+
+def test_rollback_reports_selected_version(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+
+    monkeypatch.setattr("multishell.__main__._install_root", lambda: tmp_path / "install")
+    monkeypatch.setattr("multishell.__main__._bin_dir", lambda: tmp_path / "bin")
+    monkeypatch.setattr("multishell.__main__.rollback_to_version", lambda **kwargs: "0.1.0")
+
+    args = parser.parse_args(["rollback"])
+
+    assert args.func(args) == 0
+    assert "rolled back multishell to 0.1.0" in capsys.readouterr().out
 
 
 def test_init_config_writes_template(monkeypatch, tmp_path: Path) -> None:
