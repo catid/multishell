@@ -300,6 +300,46 @@ def test_interrupted_turn_records_interrupt_reason(monkeypatch, tmp_path: Path) 
     assert events[-1].data["turn_status"] == "interrupted"
 
 
+def test_run_turn_does_not_double_count_interrupted_completion(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir(parents=True)
+    workspace.mkdir(parents=True)
+
+    events: list[SessionEvent] = []
+
+    monkeypatch.setattr("multishell.codex_session.ensure_agent_home", lambda *args, **kwargs: home)
+    monkeypatch.setattr("multishell.codex_session.workspace_root", lambda: workspace)
+
+    session = CodexSession(_spec(), "initial", event_callback=events.append)
+    session.state.thread_id = "thread-1"
+    session.state.session_active = True
+    session.state.process_alive = True
+    session.state.status = "idle"
+
+    def fake_request(method: str, params: dict[str, object], timeout: float) -> dict[str, object]:
+        if method == "turn/start":
+            session._note_interrupt_request(turn_id="turn-1", reason="session stop was requested", requested_by="controller")
+            session._handle_notification(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "interrupted", "error": None}},
+                }
+            )
+            return {"turn": {"id": "turn-1"}}
+        raise AssertionError(f"unexpected request: {method}")
+
+    monkeypatch.setattr(session, "_request", fake_request)
+
+    session._run_turn(TurnRequest(prompt="ship it", source="user"))
+
+    overview = session.overview()
+    assert overview["failed_turns"] == 1
+    assert overview["last_error"] == "turn interrupted because session stop was requested"
+    assert [event.kind for event in events] == ["turn_failed"]
+    assert events[0].message == "turn interrupted because session stop was requested"
+
+
 def test_thread_closed_notification_stops_session_without_transport_error(monkeypatch, tmp_path: Path) -> None:
     home = tmp_path / "home"
     workspace = tmp_path / "workspace"

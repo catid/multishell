@@ -571,7 +571,7 @@ class CodexSession:
             )
             raise RuntimeError(f"turn timed out after {wait_timeout}s")
         if self._current_turn_error:
-            raise RuntimeError(self._current_turn_error)
+            return
 
     def _socket_reader(self) -> None:
         close_exc: ConnectionClosed | None = None

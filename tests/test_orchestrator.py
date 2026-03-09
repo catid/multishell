@@ -670,6 +670,30 @@ def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) 
     assert "worker-2 assistant_message: Verification complete. Final line: 104729." in prompt
 
 
+def test_enforce_manager_timeout_interrupts_before_turn_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller.manager._overview["status"] = "running"
+    controller.manager._overview["running_for_seconds"] = 80.0
+    controller.manager._overview["turn_id"] = "turn-1"
+
+    controller._enforce_manager_timeout(controller.manager.overview())
+
+    assert controller.manager.interrupt_count == 1
+    notice = controller.recent_messages(1)[-1]
+    assert notice.source == "system"
+    assert notice.level == "warn"
+    assert notice.text == (
+        "interrupted manager turn turn-1 after 80.0s because "
+        "it reached the 75 second watchdog threshold before the 90 second turn timeout"
+    )
+
+
 def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
