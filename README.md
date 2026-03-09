@@ -13,7 +13,7 @@ Prerequisites:
 One-command install and first-time setup:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/catid/multishell/main/scripts/install.sh | bash
+curl -fsSL https://github.com/catid/multishell/releases/latest/download/install.sh | bash
 ```
 
 The installer:
