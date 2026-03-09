@@ -113,11 +113,11 @@ class FakeSession:
             self._overview["persona_label"] = persona_label
         self._overview["status"] = "idle"
 
-    def stop_session(self, clear_pending: bool = False) -> None:
+    def stop_session(self, clear_pending: bool = False, reason: str | None = None) -> None:
         self.stopped += 1
         self._overview["status"] = "stopped"
 
-    def interrupt(self) -> None:
+    def interrupt(self, reason: str | None = None, *, requested_by: str | None = None) -> None:
         self.interrupt_count += 1
         self._overview["status"] = "idle"
 
@@ -640,7 +640,10 @@ def test_handle_worker_event_interrupts_stale_manager_turn_for_significant_compl
     notice = controller.recent_messages(1)[-1]
     assert notice.source == "system"
     assert notice.level == "warn"
-    assert notice.text == "interrupted a stale manager turn to process a significant worker event"
+    assert notice.text == (
+        "interrupted manager turn turn-1 after 12.0s because "
+        "worker-2 reported assistant_message: Verification complete. Final line: 104729."
+    )
 
 
 def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) -> None:
@@ -665,6 +668,36 @@ def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) 
     prompt, source, _cwd = controller.manager.enqueued[-1]
     assert source == "system"
     assert "worker-2 assistant_message: Verification complete. Final line: 104729." in prompt
+
+
+def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+
+    controller._handle_worker_event(
+        SessionEvent(
+            ts=0.0,
+            agent="worker-1",
+            kind="turn_failed",
+            message="turn interrupted because session restart was requested",
+            data={
+                "interrupted": True,
+                "interrupt_reason": "session restart was requested",
+                "duration_seconds": 8.25,
+                "turn_status": "interrupted",
+            },
+        )
+    )
+
+    notice = controller.recent_messages(1)[-1]
+    assert notice.source == "system"
+    assert notice.level == "warn"
+    assert notice.text == "worker-1: turn interrupted after 8.2s because session restart was requested"
 
 
 def test_transport_closed_idle_codex_worker_auto_restarts_and_updates_failure_context(monkeypatch) -> None:

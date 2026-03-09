@@ -190,6 +190,10 @@ class CodexSession:
         self._intentional_transport_close = threading.Event()
         self._transport_closed = threading.Event()
         self._stderr_tail: deque[str] = deque(maxlen=8)
+        self._pending_interrupt_turn_id: str | None = None
+        self._pending_interrupt_reason: str | None = None
+        self._pending_interrupt_requested_by: str | None = None
+        self._pending_interrupt_requested_at: float | None = None
 
     def start(self) -> None:
         if self._started:
@@ -231,13 +235,13 @@ class CodexSession:
         system_prompt: str | None = None,
         persona_label: str | None = None,
     ) -> None:
-        self.stop_session(clear_pending=True)
+        self.stop_session(clear_pending=True, reason="session restart was requested")
         self.start_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
 
-    def stop_session(self, clear_pending: bool = False) -> None:
+    def stop_session(self, clear_pending: bool = False, reason: str | None = None) -> None:
         if clear_pending:
             self._drain_pending_queue()
-        self.interrupt()
+        self.interrupt(reason=reason or "session stop was requested", requested_by="controller")
         self._close_transport()
         with self._state_lock:
             self.state.process_alive = False
@@ -254,14 +258,17 @@ class CodexSession:
             self.state.last_process_exit_code = None
             self.state.last_transport_diagnostics = None
             current_cwd = self.state.current_cwd
+        self._clear_pending_interrupt(None)
         self._emit_event("session_stopped", "session stopped", cwd=current_cwd)
 
-    def interrupt(self) -> None:
+    def interrupt(self, reason: str | None = None, *, requested_by: str | None = None) -> None:
         thread_id = None
         turn_id = None
         with self._state_lock:
             thread_id = self.state.thread_id
             turn_id = self.state.turn_id
+        if turn_id:
+            self._note_interrupt_request(turn_id=turn_id, reason=reason, requested_by=requested_by)
         if thread_id and turn_id:
             try:
                 self._request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id}, timeout=10)
@@ -269,6 +276,37 @@ class CodexSession:
             except Exception:
                 pass
         self._terminate_process()
+
+    def _note_interrupt_request(self, *, turn_id: str, reason: str | None, requested_by: str | None) -> None:
+        clean_reason = str(reason or "").strip() or None
+        clean_source = str(requested_by or "").strip() or None
+        with self._state_lock:
+            self._pending_interrupt_turn_id = turn_id
+            self._pending_interrupt_reason = clean_reason
+            self._pending_interrupt_requested_by = clean_source
+            self._pending_interrupt_requested_at = _now()
+
+    def _consume_interrupt_request(self, turn_id: str | None) -> tuple[str | None, str | None, float | None]:
+        with self._state_lock:
+            if turn_id and self._pending_interrupt_turn_id == turn_id:
+                reason = self._pending_interrupt_reason
+                requested_by = self._pending_interrupt_requested_by
+                requested_at = self._pending_interrupt_requested_at
+                self._pending_interrupt_turn_id = None
+                self._pending_interrupt_reason = None
+                self._pending_interrupt_requested_by = None
+                self._pending_interrupt_requested_at = None
+                return reason, requested_by, requested_at
+            return None, None, None
+
+    def _clear_pending_interrupt(self, turn_id: str | None) -> None:
+        with self._state_lock:
+            if turn_id is not None and self._pending_interrupt_turn_id != turn_id:
+                return
+            self._pending_interrupt_turn_id = None
+            self._pending_interrupt_reason = None
+            self._pending_interrupt_requested_by = None
+            self._pending_interrupt_requested_at = None
 
     def enqueue(self, prompt: str, source: str = "system", cwd: str | None = None) -> None:
         item = TurnRequest(prompt=prompt, source=source, cwd=cwd)
@@ -527,7 +565,10 @@ class CodexSession:
         wait_timeout = self.turn_timeout_seconds
         completed = self._turn_done.wait(timeout=wait_timeout)
         if not completed:
-            self.interrupt()
+            self.interrupt(
+                reason=f"turn exceeded timeout of {wait_timeout}s",
+                requested_by="session",
+            )
             raise RuntimeError(f"turn timed out after {wait_timeout}s")
         if self._current_turn_error:
             raise RuntimeError(self._current_turn_error)
@@ -671,6 +712,7 @@ class CodexSession:
         with self._state_lock:
             self.state.process_alive = False
             self.state.session_active = False
+            active_turn_id = self.state.turn_id
             self.state.turn_id = None
             self.state.updated_at = finished_at
             self.state.last_disconnect_kind = disconnect_kind
@@ -692,6 +734,7 @@ class CodexSession:
                     self.state.consecutive_failures += 1
             elif not intentional:
                 self.state.last_error = detail
+        self._clear_pending_interrupt(active_turn_id)
         if not intentional:
             self._push_line("error" if retryable else "event", detail)
         if not intentional:
@@ -757,31 +800,48 @@ class CodexSession:
             turn = params.get("turn", {})
             turn_error = None
             turn_status = None
+            completed_turn_id = None
             if isinstance(turn, dict):
+                completed_turn_id = str(turn.get("id") or "") or None
                 turn_status = turn.get("status")
                 if turn.get("error") is not None:
                     turn_error = json.dumps(turn.get("error"), ensure_ascii=True)
             finished_at = _now()
+            interrupt_reason = None
+            interrupt_requested_by = None
+            interrupt_requested_at = None
+            failure_text = None
             with self._state_lock:
+                active_turn_id = self.state.turn_id
                 self.state.updated_at = finished_at
                 self.state.last_turn_finished_at = finished_at
                 if self.state.last_turn_started_at is not None:
                     self.state.last_turn_duration = finished_at - self.state.last_turn_started_at
                 self.state.turn_id = None
                 self.state.current_task_source = ""
+                duration = self.state.last_turn_duration
+            interrupt_turn_id = completed_turn_id or active_turn_id
+            if turn_status == "interrupted":
+                interrupt_reason, interrupt_requested_by, interrupt_requested_at = self._consume_interrupt_request(interrupt_turn_id)
+                failure_text = "turn interrupted"
+                if interrupt_reason:
+                    failure_text = f"{failure_text} because {interrupt_reason}"
+            else:
+                self._clear_pending_interrupt(interrupt_turn_id)
+            with self._state_lock:
                 if turn_error or turn_status != "completed":
                     self.state.status = "error"
                     self.state.failed_turns += 1
                     self.state.consecutive_failures += 1
-                    self.state.last_error = turn_error or f"turn completed with status={turn_status}"
+                    self.state.last_error = turn_error or failure_text or f"turn completed with status={turn_status}"
                     self.state.push("error", self.state.last_error)
                     self._current_turn_error = self.state.last_error
                 else:
                     self.state.status = "idle"
                     self.state.completed_turns += 1
                     self.state.consecutive_failures = 0
+                    self.state.last_error = None
                     self._current_turn_error = None
-                duration = self.state.last_turn_duration
                 failure_text = self.state.last_error
             self._turn_done.set()
             if turn_error or turn_status != "completed":
@@ -789,6 +849,11 @@ class CodexSession:
                     "turn_failed",
                     failure_text or "turn failed",
                     duration_seconds=duration,
+                    turn_status=turn_status,
+                    interrupted=(turn_status == "interrupted"),
+                    interrupt_reason=interrupt_reason,
+                    interrupt_requested_by=interrupt_requested_by,
+                    interrupt_requested_at=interrupt_requested_at,
                 )
             else:
                 self._emit_event(
@@ -800,12 +865,14 @@ class CodexSession:
 
         if method == "thread/closed":
             with self._state_lock:
+                active_turn_id = self.state.turn_id
                 self.state.thread_id = None
                 self.state.turn_id = None
                 self.state.session_active = False
                 self.state.process_alive = False
                 self.state.status = "stopped"
                 self.state.updated_at = _now()
+            self._clear_pending_interrupt(active_turn_id)
             self._turn_done.set()
             self._emit_event("thread_closed", "thread closed")
             return

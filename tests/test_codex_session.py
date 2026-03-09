@@ -184,7 +184,7 @@ def test_mcp_failure_and_stop_session_emit_events(monkeypatch, tmp_path: Path) -
     session.state.status = "idle"
 
     monkeypatch.setattr(session, "_drain_pending_queue", lambda: calls.append("drain"))
-    monkeypatch.setattr(session, "interrupt", lambda: calls.append("interrupt"))
+    monkeypatch.setattr(session, "interrupt", lambda *args, **kwargs: calls.append("interrupt"))
     monkeypatch.setattr(session, "_close_transport", lambda: calls.append("close"))
 
     session._handle_notification(
@@ -252,6 +252,52 @@ def test_unexpected_transport_close_marks_running_turn_failed_and_unblocks_waite
         }
     }
     assert [event.kind for event in events] == ["transport_closed"]
+
+
+def test_interrupted_turn_records_interrupt_reason(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "workspace"
+    home.mkdir(parents=True)
+    workspace.mkdir(parents=True)
+
+    events: list[SessionEvent] = []
+    requests: list[tuple[str, dict[str, object]]] = []
+
+    monkeypatch.setattr("multishell.codex_session.ensure_agent_home", lambda *args, **kwargs: home)
+    monkeypatch.setattr("multishell.codex_session.workspace_root", lambda: workspace)
+
+    session = CodexSession(_spec(), "initial", event_callback=events.append)
+    session.state.thread_id = "thread-1"
+    session.state.turn_id = "turn-1"
+    session.state.session_active = True
+    session.state.process_alive = True
+    session.state.status = "running"
+    session.state.last_turn_started_at = 10.0
+
+    monkeypatch.setattr(
+        session,
+        "_request",
+        lambda method, params, timeout: requests.append((method, params)) or {"ok": True},
+    )
+
+    session.interrupt(reason="session restart was requested", requested_by="controller")
+    session._handle_notification(
+        {
+            "method": "turn/completed",
+            "params": {"turn": {"id": "turn-1", "status": "interrupted", "error": None}},
+        }
+    )
+
+    assert requests == [("turn/interrupt", {"threadId": "thread-1", "turnId": "turn-1"})]
+    overview = session.overview()
+    assert overview["status"] == "error"
+    assert overview["last_error"] == "turn interrupted because session restart was requested"
+    assert overview["failed_turns"] == 1
+    assert events[-1].kind == "turn_failed"
+    assert events[-1].message == "turn interrupted because session restart was requested"
+    assert events[-1].data["interrupted"] is True
+    assert events[-1].data["interrupt_reason"] == "session restart was requested"
+    assert events[-1].data["turn_status"] == "interrupted"
 
 
 def test_thread_closed_notification_stops_session_without_transport_error(monkeypatch, tmp_path: Path) -> None:

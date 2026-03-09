@@ -645,8 +645,7 @@ class MultiShellController:
         manager_overview = self.manager.overview()
         running_for = manager_overview.get("running_for_seconds")
         if manager_overview["status"] == "running" and isinstance(running_for, float) and running_for >= 15:
-            self.manager.interrupt()
-            self._push_message("system", "interrupted a stale manager turn to handle new user input", level="warn")
+            self._interrupt_manager_turn(manager_overview, reason="a new user message arrived")
         fanout_guidance = self._fanout_guidance(text)
         prompt = (
             "User message:\n"
@@ -828,11 +827,9 @@ class MultiShellController:
             return
         if turn_id and turn_id == self._last_manager_interrupt_turn:
             return
-        self._last_manager_interrupt_turn = turn_id or None
-        self.manager.interrupt()
-        self._push_message("system", "interrupted a manager turn that exceeded 90 seconds", level="warn")
+        self._interrupt_manager_turn(manager_overview, reason="it exceeded the 90 second supervision limit")
 
-    def _maybe_interrupt_manager_for_worker_event(self) -> bool:
+    def _maybe_interrupt_manager_for_worker_event(self, event: SessionEvent) -> bool:
         manager_overview = self.manager.overview()
         running_for = manager_overview.get("running_for_seconds")
         turn_id = str(manager_overview.get("turn_id") or "")
@@ -844,9 +841,8 @@ class MultiShellController:
             return False
         if turn_id and turn_id == self._last_manager_interrupt_turn:
             return False
-        self._last_manager_interrupt_turn = turn_id or None
-        self.manager.interrupt()
-        self._push_message("system", "interrupted a stale manager turn to process a significant worker event", level="warn")
+        reason = f"{event.agent} reported {event.kind}: {self._single_line_snippet(event.message, limit=120)}"
+        self._interrupt_manager_turn(manager_overview, reason=reason)
         return True
 
     def _handle_manager_message(self, entry: TranscriptEntry) -> None:
@@ -1058,11 +1054,25 @@ class MultiShellController:
                     level="warn",
                 )
             else:
+                level = "error"
                 detail = event.message
+                if event.kind == "turn_failed" and bool(event.data.get("interrupted")):
+                    level = "warn"
+                    detail = "turn interrupted"
+                    duration = event.data.get("duration_seconds")
+                    if isinstance(duration, (int, float)):
+                        detail = f"{detail} after {float(duration):.1f}s"
+                    interrupt_reason = str(event.data.get("interrupt_reason") or "").strip()
+                    if interrupt_reason:
+                        detail = f"{detail} because {interrupt_reason}"
+                    else:
+                        turn_status = str(event.data.get("turn_status") or "").strip()
+                        if turn_status:
+                            detail = f"{detail} (session reported status={turn_status})"
                 meta = self._lifecycle.get(event.agent)
                 if event.kind == "transport_closed" and meta is not None and meta.auto_restart_suppressed:
                     detail = f"{detail} (manual restart recommended after repeated or in-flight disconnect)"
-                self._push_message("system", f"{event.agent}: {detail}", level="error")
+                self._push_message("system", f"{event.agent}: {detail}", level=level)
         elif event.kind in {"session_started", "session_stopped"}:
             if event.kind == "session_started":
                 self._mark_manual_recovery(event.agent, action="session_started")
@@ -1076,7 +1086,7 @@ class MultiShellController:
             return
         prompt = self._build_worker_event_prompt(event)
         if prompt:
-            self._maybe_interrupt_manager_for_worker_event()
+            self._maybe_interrupt_manager_for_worker_event(event)
             self.manager.enqueue(prompt, source="system")
 
     def _handle_spark_session_event(self, event: SessionEvent) -> None:
@@ -1186,6 +1196,21 @@ class MultiShellController:
         if self._is_ready_message(message):
             return "Ready for assignments."
         return message
+
+    def _single_line_snippet(self, text: str, *, limit: int = 96) -> str:
+        clean = " ".join(text.strip().split())
+        if len(clean) <= limit:
+            return clean
+        return f"{clean[: max(0, limit - 3)]}..."
+
+    def _interrupt_manager_turn(self, manager_overview: dict[str, object], *, reason: str) -> None:
+        running_for = manager_overview.get("running_for_seconds")
+        turn_id = str(manager_overview.get("turn_id") or "")
+        self._last_manager_interrupt_turn = turn_id or None
+        self.manager.interrupt(reason=reason, requested_by="controller")
+        duration_suffix = f" after {running_for:.1f}s" if isinstance(running_for, float) else ""
+        turn_suffix = f" {turn_id}" if turn_id else ""
+        self._push_message("system", f"interrupted manager turn{turn_suffix}{duration_suffix} because {reason}", level="warn")
 
     def _is_ready_message(self, message: str) -> bool:
         normalized = " ".join(message.strip().lower().split())
