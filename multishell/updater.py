@@ -431,11 +431,25 @@ def _update_state_path() -> Path:
 
 def _running_from_managed_install(target_install_root: Path | None = None) -> bool:
     selected_install_root = Path(target_install_root or install_root()).expanduser().resolve()
-    try:
-        executable = Path(sys.executable).resolve()
-    except OSError:
-        return False
-    return executable == selected_install_root or selected_install_root in executable.parents
+    candidates: list[Path] = []
+    executable = str(sys.executable).strip()
+    if executable:
+        candidates.append(Path(executable).expanduser())
+    module_path = Path(__file__).expanduser()
+    candidates.append(module_path)
+
+    for candidate in candidates:
+        paths_to_check = [candidate]
+        try:
+            resolved = candidate.resolve()
+        except OSError:
+            resolved = None
+        if resolved is not None and resolved != candidate:
+            paths_to_check.append(resolved)
+        for path in paths_to_check:
+            if path == selected_install_root or selected_install_root in path.parents:
+                return True
+    return False
 
 
 def _load_update_state() -> dict[str, object]:

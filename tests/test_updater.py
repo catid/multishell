@@ -7,6 +7,7 @@ from multishell.updater import (
     ReleaseInfo,
     StartupUpdateResult,
     _default_rollback_target,
+    _running_from_managed_install,
     _write_wrapper,
     check_for_update,
     check_startup_update,
@@ -144,6 +145,18 @@ def test_check_startup_update_can_apply_and_request_restart(monkeypatch, tmp_pat
 
     assert result.message == "updated multishell to v0.2.0; restarting"
     assert result.restart_python == tmp_path / "install" / "current" / "venv" / "bin" / "python"
+
+
+def test_running_from_managed_install_accepts_symlinked_venv_python(monkeypatch, tmp_path: Path) -> None:
+    install_root = tmp_path / "install"
+    python_link = install_root / "current" / "venv" / "bin" / "python"
+    python_link.parent.mkdir(parents=True)
+    python_link.symlink_to(Path("/usr/bin/python3"), target_is_directory=False)
+
+    monkeypatch.setattr("multishell.updater.__file__", str(install_root / "releases" / "0.1.5" / "venv" / "lib" / "python3.12" / "site-packages" / "multishell" / "updater.py"))
+    monkeypatch.setattr("sys.executable", str(python_link))
+
+    assert _running_from_managed_install(target_install_root=install_root) is True
 
 
 def test_write_wrapper_uses_install_root_override(tmp_path: Path) -> None:
