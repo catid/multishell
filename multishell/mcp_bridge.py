@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from .config import SPARK_MODEL
 from .control import send_control_request
 
 
@@ -150,7 +151,7 @@ WORKER_TOOLS = [
     ToolDef(
         name="gpt_5_3_spark",
         description=(
-            "Launch, inspect, or cancel a paired gpt-5.3-spark draft job on your account. "
+            f"Launch, inspect, or cancel a paired {SPARK_MODEL} draft job on your account. "
             "Use it for first-draft ideas or code, then review the result before writing edits."
         ),
         input_schema={

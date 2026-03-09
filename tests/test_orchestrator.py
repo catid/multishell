@@ -6,6 +6,7 @@ import pytest
 
 import multishell.orchestrator as orch
 from multishell.codex_session import SessionEvent
+from multishell.config import SPARK_MODEL
 
 
 @dataclass
@@ -469,6 +470,20 @@ def test_worker_spark_tool_uses_paired_worker_name(monkeypatch) -> None:
     assert response["ok"] is True
     assert response["job"]["worker"] == "worker-1"
     assert response["job"]["status"] == "running"
+
+
+def test_controller_uses_current_spark_model_for_paired_delegate(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+
+    spark = controller.spark_workers["worker-1"]
+    assert spark.model == SPARK_MODEL
+    assert f"using {SPARK_MODEL} at xhigh reasoning" in spark.initial_prompt
 
 
 def test_controller_start_starts_all_workers_when_logins_are_present(monkeypatch) -> None:
