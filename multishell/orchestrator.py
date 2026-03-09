@@ -304,7 +304,6 @@ class MultiShellController:
     _AUTO_RECOVERY_COOLDOWN_SECONDS = 120.0
     _AUTO_RECOVERY_MAX_DISCONNECTS = 1
     _MANAGER_EVENT_INTERRUPT_AFTER_SECONDS = 5.0
-    _MANAGER_TIMEOUT_INTERRUPT_AFTER_SECONDS = 75.0
 
     def __init__(self) -> None:
         self.manager = CodexSession(
@@ -314,7 +313,7 @@ class MultiShellController:
             working_dir=manager_workspace_root(),
             persona_label="Multishell Manager",
             message_callback=self._handle_manager_message,
-            turn_timeout_seconds=90,
+            turn_timeout_seconds=None,
         )
         self.workers: dict[str, ManagedSession] = {}
         self.codex_workers: dict[str, CodexSession] = {}
@@ -718,7 +717,6 @@ class MultiShellController:
     def _monitor_loop(self) -> None:
         while not self._stop.wait(5):
             rows = self.session_rows()
-            self._enforce_manager_timeout(rows[0])
             self._emit_health_alerts(rows)
             self._check_for_stalls(rows)
 
@@ -820,25 +818,6 @@ class MultiShellController:
                 self._push_message("system", f"{row['name']} entered error state: {detail}", level="error")
             elif previous and previous[0] == "error":
                 self._push_message("system", f"{row['name']} recovered to {row['status']}", level="info")
-
-    def _enforce_manager_timeout(self, manager_overview: dict[str, object]) -> None:
-        running_for = manager_overview.get("running_for_seconds")
-        turn_id = str(manager_overview.get("turn_id") or "")
-        if (
-            manager_overview["status"] != "running"
-            or not isinstance(running_for, float)
-            or running_for < self._MANAGER_TIMEOUT_INTERRUPT_AFTER_SECONDS
-        ):
-            return
-        if turn_id and turn_id == self._last_manager_interrupt_turn:
-            return
-        self._interrupt_manager_turn(
-            manager_overview,
-            reason=(
-                f"it reached the {self._MANAGER_TIMEOUT_INTERRUPT_AFTER_SECONDS:.0f} second watchdog threshold "
-                "before the 90 second turn timeout"
-            ),
-        )
 
     def _maybe_interrupt_manager_for_worker_event(self, event: SessionEvent) -> bool:
         manager_overview = self.manager.overview()

@@ -288,6 +288,18 @@ def test_fanout_guidance_for_non_trivial_requests_prefers_small_swarm(monkeypatc
     assert "one implementer plus one verifier or reviewer" in guidance
 
 
+def test_manager_has_no_hard_turn_timeout(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+
+    assert controller.manager.turn_timeout_seconds is None
+
+
 def test_send_user_message_includes_dependency_and_completion_gates(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
@@ -670,7 +682,7 @@ def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) 
     assert "worker-2 assistant_message: Verification complete. Final line: 104729." in prompt
 
 
-def test_enforce_manager_timeout_interrupts_before_turn_timeout(monkeypatch) -> None:
+def test_monitoring_does_not_interrupt_long_running_manager_turn(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
     monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
@@ -682,16 +694,11 @@ def test_enforce_manager_timeout_interrupts_before_turn_timeout(monkeypatch) -> 
     controller.manager._overview["running_for_seconds"] = 80.0
     controller.manager._overview["turn_id"] = "turn-1"
 
-    controller._enforce_manager_timeout(controller.manager.overview())
+    rows = controller.session_rows()
+    controller._emit_health_alerts(rows)
+    controller._check_for_stalls(rows)
 
-    assert controller.manager.interrupt_count == 1
-    notice = controller.recent_messages(1)[-1]
-    assert notice.source == "system"
-    assert notice.level == "warn"
-    assert notice.text == (
-        "interrupted manager turn turn-1 after 80.0s because "
-        "it reached the 75 second watchdog threshold before the 90 second turn timeout"
-    )
+    assert controller.manager.interrupt_count == 0
 
 
 def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:
