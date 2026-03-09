@@ -22,6 +22,7 @@ from .homes import (
     account_home,
     agent_home,
     all_agent_names,
+    browser_profile_path,
     claude_account_home,
     claude_home,
     claude_logged_in,
@@ -30,6 +31,7 @@ from .homes import (
     ensure_agent_home,
     ensure_claude_account_home,
     ensure_claude_home,
+    logout_paths,
     missing_claude_logins,
     missing_codex_logins,
 )
@@ -379,6 +381,50 @@ def cmd_auth_login(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_logout(args: argparse.Namespace) -> int:
+    if args.all:
+        target_agents = all_agent_names()
+    else:
+        if not args.agent:
+            raise SystemExit("provide an agent name or pass --all")
+        if args.agent not in all_agent_names():
+            raise SystemExit(f"unknown agent: {args.agent}")
+        target_agents = [args.agent]
+
+    removed_files = 0
+    removed_dirs = 0
+    seen: set[Path] = set()
+
+    for agent_name in target_agents:
+        for path in logout_paths(agent_name):
+            if path in seen:
+                continue
+            seen.add(path)
+            if path.is_symlink() or path.is_file():
+                path.unlink(missing_ok=True)
+                removed_files += 1
+                continue
+            if path.is_dir():
+                shutil.rmtree(path)
+                removed_dirs += 1
+
+    if args.all:
+        browser_root = browser_profile_path("__all__").parent
+        if browser_root.exists():
+            shutil.rmtree(browser_root)
+            removed_dirs += 1
+        print(
+            f"cleared auth state for all configured agents ({len(target_agents)}); "
+            f"removed {removed_files} files and {removed_dirs} directories"
+        )
+    else:
+        print(
+            f"cleared auth state for {target_agents[0]}; "
+            f"removed {removed_files} files and {removed_dirs} directories"
+        )
+    return 0
+
+
 def _auto_login_server_logger(*, verbose: bool):
     waiting_logged = False
 
@@ -527,6 +573,11 @@ def build_parser() -> argparse.ArgumentParser:
     auth_login_parser = subparsers.add_parser("auth-login")
     auth_login_parser.add_argument("agent")
     auth_login_parser.set_defaults(func=cmd_auth_login)
+
+    logout_parser = subparsers.add_parser("logout")
+    logout_parser.add_argument("agent", nargs="?")
+    logout_parser.add_argument("--all", action="store_true")
+    logout_parser.set_defaults(func=cmd_logout)
 
     auto_login_parser = subparsers.add_parser("auto-login")
     auto_login_parser.add_argument("agent", nargs="?")

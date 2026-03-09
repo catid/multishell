@@ -88,6 +88,10 @@ def claude_account_root_auth_path(account_name: str) -> Path:
     return claude_account_home(account_name) / ".claude.json"
 
 
+def browser_profile_path(agent_name: str) -> Path:
+    return state_root() / "browser-profiles" / agent_name
+
+
 def has_claude_auth(agent_name: str) -> bool:
     account_name = credential_source_agent(agent_name)
     _migrate_legacy_claude_state(account_name)
@@ -303,3 +307,33 @@ def _migrate_legacy_claude_state(account_name: str) -> None:
 
 def all_agent_names() -> list[str]:
     return [spec.name for spec in all_agent_specs()]
+
+
+def logout_paths(agent_name: str) -> list[Path]:
+    account_name = credential_source_agent(agent_name)
+    legacy_home = state_root() / "homes" / account_name
+    paths: set[Path] = {browser_profile_path(agent_name)}
+
+    if agent_name == MANAGER_SPEC.name or agent_name in {spec.name for spec in WORKER_SPECS}:
+        paths.update(
+            {
+                auth_path(agent_name),
+                account_auth_path(account_name),
+                legacy_home / ".codex" / "auth.json",
+            }
+        )
+    elif agent_name in {spec.name for spec in CLAUDE_WORKER_SPECS}:
+        paths.update(
+            {
+                claude_auth_path(agent_name),
+                claude_root_auth_path(agent_name),
+                claude_account_auth_path(account_name),
+                claude_account_root_auth_path(account_name),
+                legacy_home / ".claude" / ".credentials.json",
+                legacy_home / ".claude.json",
+            }
+        )
+    else:
+        raise KeyError(agent_name)
+
+    return sorted(paths)

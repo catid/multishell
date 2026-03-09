@@ -88,6 +88,57 @@ def test_auth_login_for_claude_agent_suppresses_node_warnings(monkeypatch, tmp_p
     assert "ANTHROPIC_API_KEY" not in captured["env"]
 
 
+def test_logout_requires_agent_or_all() -> None:
+    parser = build_parser()
+    args = parser.parse_args(["logout"])
+    with pytest.raises(SystemExit, match="provide an agent name or pass --all"):
+        args.func(args)
+
+
+def test_logout_clears_single_agent_state(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    auth_file = tmp_path / "worker-1-auth.json"
+    browser_dir = tmp_path / "browser-profiles" / "worker-1"
+    auth_file.write_text("{}", encoding="utf-8")
+    browser_dir.mkdir(parents=True)
+
+    monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["worker-1"])
+    monkeypatch.setattr("multishell.__main__.logout_paths", lambda agent: [auth_file, browser_dir] if agent == "worker-1" else [])
+
+    args = parser.parse_args(["logout", "worker-1"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "cleared auth state for worker-1" in out
+    assert not auth_file.exists()
+    assert not browser_dir.exists()
+
+
+def test_logout_all_clears_browser_root_and_deduplicates_paths(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    parser = build_parser()
+    shared_auth = tmp_path / "shared-auth.json"
+    worker_browser = tmp_path / "browser-profiles" / "worker-1"
+    claude_browser = tmp_path / "browser-profiles" / "claude-worker-1"
+    shared_auth.write_text("{}", encoding="utf-8")
+    worker_browser.mkdir(parents=True)
+    claude_browser.mkdir(parents=True)
+
+    monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["worker-1", "claude-worker-1"])
+    monkeypatch.setattr(
+        "multishell.__main__.logout_paths",
+        lambda agent: [shared_auth, worker_browser] if agent == "worker-1" else [shared_auth, claude_browser],
+    )
+    monkeypatch.setattr("multishell.__main__.browser_profile_path", lambda _agent: tmp_path / "browser-profiles" / _agent)
+
+    args = parser.parse_args(["logout", "--all"])
+
+    assert args.func(args) == 0
+    out = capsys.readouterr().out
+    assert "cleared auth state for all configured agents (2)" in out
+    assert not shared_auth.exists()
+    assert not (tmp_path / "browser-profiles").exists()
+
+
 def test_run_fails_when_any_agent_login_is_missing(monkeypatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     parser = build_parser()
 
