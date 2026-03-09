@@ -42,6 +42,7 @@ class FakeSession:
         self.model = model
         self._overview = {
             "name": spec.name,
+            "account_key": getattr(spec, "account_key", spec.name),
             "account_email": spec.account_email,
             "accent_color": spec.accent_color,
             "status": "idle",
@@ -76,9 +77,9 @@ class FakeSession:
         self.start_count = 0
         self.interrupt_count = 0
 
-    def start(self) -> None:
+    def start(self, *, start_session: bool = True) -> None:
         self.start_count += 1
-        self._overview["status"] = "idle"
+        self._overview["status"] = "idle" if start_session else "stopped"
 
     def stop(self) -> None:
         self._overview["status"] = "stopped"
@@ -124,6 +125,15 @@ class FakeSession:
     def enqueue(self, prompt: str, source: str = "system", cwd: str | None = None) -> None:
         self.enqueued.append((prompt, source, cwd))
         self._overview["pending_tasks"] += 1
+
+    def queue_priority_prompt(self, prompt: str, source: str = "system", cwd: str | None = None) -> None:
+        self.enqueued.insert(0, (prompt, source, cwd))
+        self._overview["pending_tasks"] += 1
+
+    def bind_account(self, account_key: str, account_email: str | None = None) -> None:
+        self._overview["account_key"] = account_key
+        if account_email is not None:
+            self._overview["account_email"] = account_email
 
     def overview(self) -> dict[str, object]:
         return dict(self._overview)
@@ -479,9 +489,13 @@ def test_monitor_items_use_compact_swarm_labels(monkeypatch) -> None:
     controller = orch.MultiShellController()
     labels = [item["label"] for item in controller.monitor_items()]
 
-    assert labels[:6] == ["manager", "codex-1", "codex-2", "codex-3", "codex-4", "claude-1"]
-    assert "claude-5" in labels
+    assert labels[0] == "manager"
+    assert "codex-1" in labels
+    assert "codex-9" in labels
+    assert "claude-1" in labels
+    assert "claude-10" in labels
     assert "spark-1" in labels
+    assert "spark-9" in labels
     assert "gptpro-1" in labels
     assert "gptpro-2" in labels
     assert "deepthink" in labels

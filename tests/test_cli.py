@@ -36,8 +36,9 @@ def test_auth_login_for_codex_agent_suppresses_node_warnings(monkeypatch, tmp_pa
     monkeypatch.setattr("multishell.__main__.all_agent_names", lambda: ["worker-1"])
     monkeypatch.setattr("multishell.__main__.WORKER_SPECS", (SimpleNamespace(name="worker-1"),))
     monkeypatch.setattr("multishell.__main__.CLAUDE_WORKER_SPECS", ())
-    monkeypatch.setattr("multishell.__main__.ensure_agent_home", lambda *args, **kwargs: None)
-    monkeypatch.setattr("multishell.__main__.agent_home", lambda _agent: tmp_path / "worker-1")
+    monkeypatch.setattr("multishell.__main__.credential_source_agent", lambda agent: agent)
+    monkeypatch.setattr("multishell.__main__.ensure_account_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.account_home", lambda _agent: tmp_path / "worker-1")
     monkeypatch.setenv("NODE_NO_WARNINGS", "0")
 
     def fake_run(cmd, check, env):
@@ -65,8 +66,9 @@ def test_auth_login_for_claude_agent_suppresses_node_warnings(monkeypatch, tmp_p
         "multishell.__main__.CLAUDE_WORKER_SPECS",
         (SimpleNamespace(name="claude-worker-1", account_email="worker@example.com"),),
     )
-    monkeypatch.setattr("multishell.__main__.ensure_claude_home", lambda *args, **kwargs: None)
-    monkeypatch.setattr("multishell.__main__.claude_home", lambda _agent: tmp_path / "claude-worker-1")
+    monkeypatch.setattr("multishell.__main__.credential_source_agent", lambda agent: agent)
+    monkeypatch.setattr("multishell.__main__.ensure_claude_account_home", lambda *args, **kwargs: None)
+    monkeypatch.setattr("multishell.__main__.claude_account_home", lambda _agent: tmp_path / "claude-worker-1")
     monkeypatch.setenv("NODE_NO_WARNINGS", "0")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "secret")
 

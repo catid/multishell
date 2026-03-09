@@ -3,20 +3,23 @@ from __future__ import annotations
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .claude_session import ClaudeSession
 from .codex_session import CodexSession, SessionEvent, TranscriptEntry
 from .config import (
-    CLAUDE_WORKER_SPECS,
     GEMINI_ACCOUNT_SPECS,
     MANAGER_SPEC,
     SPARK_MODEL,
     SPARK_REASONING_EFFORT,
-    WORKER_SPECS,
     AgentSpec,
+    ProviderAccountSpec,
     app_root,
+    claude_account_specs,
+    codex_account_specs,
     manager_workspace_root,
+    runtime_claude_worker_specs,
+    runtime_codex_worker_specs,
     socket_path,
     spark_agent_name,
     workspace_root,
@@ -28,6 +31,15 @@ from .web_reasoners import WebReasonerError, WebReasonerEvent, WebReasonerManage
 
 
 ManagedSession = CodexSession | ClaudeSession
+
+_CODEX_ARCHETYPE_ROTATION = ("worker-1", "worker-2", "worker-3", "worker-4")
+_CLAUDE_ARCHETYPE_ROTATION = (
+    "claude-worker-1",
+    "claude-worker-2",
+    "claude-worker-3",
+    "claude-worker-4",
+    "claude-worker-5",
+)
 
 
 def _bridge_command(role: str, agent: str) -> list[str]:
@@ -114,6 +126,8 @@ class SessionLifecycleMetadata:
             parts.append("auto-restart suppressed; manual restart recommended")
         elif self.last_recovery_action == "manual_restart":
             parts.append("manually restarted")
+        elif self.last_recovery_action == "account_failover":
+            parts.append("continued on another account")
         elif self.last_recovery_action == "stopped":
             parts.append("stopped intentionally")
         return "; ".join(parts) if parts else None
@@ -177,9 +191,140 @@ WORKER_ARCHETYPES = {
 }
 
 
-def manager_prompt() -> str:
-    codex_lines = [f"- {spec.name}: {spec.personality}" for spec in WORKER_SPECS]
-    claude_lines = [f"- {spec.name}: {spec.personality}" for spec in CLAUDE_WORKER_SPECS]
+@dataclass
+class ProviderAccountState:
+    spec: ProviderAccountSpec
+    leased_sessions: set[str] = field(default_factory=set)
+    last_exhausted_at: float | None = None
+    exhausted_until: float | None = None
+
+    def lease_count(self) -> int:
+        return len(self.leased_sessions)
+
+
+class ProviderAccountPool:
+    def __init__(self, accounts: list[ProviderAccountSpec], *, cooldown_seconds: float) -> None:
+        self._accounts = list(accounts)
+        self._states = {spec.account_key: ProviderAccountState(spec=spec) for spec in accounts}
+        self._bindings: dict[str, str] = {}
+        self._cooldown_seconds = cooldown_seconds
+        self._lock = threading.RLock()
+
+    def assigned_spec(self, session_name: str) -> ProviderAccountSpec | None:
+        with self._lock:
+            account_key = self._bindings.get(session_name)
+            state = self._states.get(account_key or "")
+            return state.spec if state is not None else None
+
+    def release(self, session_name: str) -> None:
+        with self._lock:
+            account_key = self._bindings.pop(session_name, None)
+            if account_key and account_key in self._states:
+                self._states[account_key].leased_sessions.discard(session_name)
+
+    def mark_exhausted(self, session_name: str, *, now: float | None = None) -> ProviderAccountSpec | None:
+        with self._lock:
+            account_key = self._bindings.get(session_name)
+            if not account_key:
+                return None
+            state = self._states.get(account_key)
+            if state is None:
+                return None
+            timestamp = time.time() if now is None else now
+            state.last_exhausted_at = timestamp
+            state.exhausted_until = timestamp + self._cooldown_seconds
+            return state.spec
+
+    def bind(
+        self,
+        session_name: str,
+        *,
+        preferred_key: str | None = None,
+        avoid_keys: set[str] | None = None,
+        reserve_keys: set[str] | None = None,
+        allow_exhausted_fallback: bool = True,
+    ) -> ProviderAccountSpec | None:
+        with self._lock:
+            if not self._accounts:
+                return None
+            avoid = set(avoid_keys or ())
+            reserve = set(reserve_keys or ())
+            if preferred_key and preferred_key not in avoid:
+                preferred = self._states.get(preferred_key)
+                if preferred is not None:
+                    self._apply_binding(session_name, preferred.spec.account_key)
+                    return preferred.spec
+
+            chosen = self._choose_candidate(avoid=avoid, reserve=reserve, allow_exhausted_fallback=allow_exhausted_fallback)
+            if chosen is None:
+                return None
+            self._apply_binding(session_name, chosen.account_key)
+            return chosen
+
+    def _apply_binding(self, session_name: str, account_key: str) -> None:
+        previous = self._bindings.get(session_name)
+        if previous == account_key:
+            self._states[account_key].leased_sessions.add(session_name)
+            return
+        if previous and previous in self._states:
+            self._states[previous].leased_sessions.discard(session_name)
+        self._bindings[session_name] = account_key
+        self._states[account_key].leased_sessions.add(session_name)
+
+    def _choose_candidate(
+        self,
+        *,
+        avoid: set[str],
+        reserve: set[str],
+        allow_exhausted_fallback: bool,
+    ) -> ProviderAccountSpec | None:
+        now = time.time()
+        viable = [state for key, state in self._states.items() if key not in avoid]
+        if not viable:
+            return None
+
+        def sort_key(state: ProviderAccountState) -> tuple[float, int, int, str]:
+            exhausted = bool(state.exhausted_until and state.exhausted_until > now)
+            exhausted_rank = 1 if exhausted else 0
+            reserve_rank = 1 if state.spec.account_key in reserve else 0
+            exhausted_until = state.exhausted_until or 0.0
+            return (exhausted_rank, reserve_rank, state.lease_count(), exhausted_until, state.spec.account_key)
+
+        preferred = [state for state in viable if not (state.exhausted_until and state.exhausted_until > now)]
+        if preferred:
+            return min(preferred, key=sort_key).spec
+        if not allow_exhausted_fallback:
+            return None
+        return min(viable, key=sort_key).spec
+
+
+def _archetype_for_worker(worker_name: str) -> WorkerArchetype:
+    archetype = WORKER_ARCHETYPES.get(worker_name)
+    if archetype is not None:
+        return archetype
+    if worker_name.startswith("claude-worker-"):
+        try:
+            index = max(1, int(worker_name.split("-")[-1]))
+        except ValueError:
+            index = 1
+        return WORKER_ARCHETYPES[_CLAUDE_ARCHETYPE_ROTATION[(index - 1) % len(_CLAUDE_ARCHETYPE_ROTATION)]]
+    if worker_name.startswith("worker-"):
+        try:
+            index = max(1, int(worker_name.split("-")[-1]))
+        except ValueError:
+            index = 1
+        return WORKER_ARCHETYPES[_CODEX_ARCHETYPE_ROTATION[(index - 1) % len(_CODEX_ARCHETYPE_ROTATION)]]
+    return WorkerArchetype(
+        persona_name=worker_name,
+        domain="software engineering",
+        approach="solve the assigned task directly",
+        coaching="Work concretely and note blockers quickly.",
+    )
+
+
+def manager_prompt(codex_specs: list[AgentSpec], claude_specs: list[AgentSpec]) -> str:
+    codex_lines = [f"- {spec.name}: {spec.personality}" for spec in codex_specs]
+    claude_lines = [f"- {spec.name}: {spec.personality}" for spec in claude_specs]
     return f"""You are the multishell manager.
 
 Operate only through delegation, session management, long-running reasoning tools, and user communication.
@@ -189,12 +334,14 @@ Rules:
 - Use `delegate_to_worker` to assign concrete tasks to named workers.
 - Use `start_worker_session`, `stop_worker_session`, and `restart_worker_session` to manage worker memory and working directories.
 - Use `get_workers_overview` and `get_worker_transcript` to monitor progress and compare candidates.
+- Worker sessions may begin stopped. Start the specific lanes you need instead of assuming the full swarm is already live.
 - Do not poll worker transcripts in tight loops. After delegating, prefer to return and wait for significant worker events unless there is a concrete blocker that requires an immediate check.
 - Use `notify_user` for all user-facing messages. Do not assume plain assistant text reaches the user.
 - Use `gpt_5_4_pro` and `gemini_deepthink` for slow planning, research, world knowledge, or math-heavy reasoning in parallel with worker execution.
 - Start slow web reasoners early on hard tasks, continue delegating while they run, then incorporate useful revisions after they complete.
 - Restart workers for unrelated tasks so stale memory does not leak across problems.
 - When starting or restarting a worker, craft a fresh session persona using `persona_name`, `task_context`, and `extra_instructions`.
+- The controller may rebind a worker or the manager to a different account after token, context, or rate-limit exhaustion. When that happens, resume from the supplied handoff context instead of restarting blindly.
 - Worker personalities are intentionally narrow. Do not assume one strong worker will also cover security, performance, UX, operability, and integration concerns automatically.
 - Assign explicit complementary roles when the task warrants it. Useful splits include implementer, correctness reviewer, security reviewer, performance reviewer, UX/operator reviewer, integration closer, and creative alternative generator.
 - Default to a small swarm. For straightforward single-file, single-bug, or otherwise bounded tasks, start with one implementer plus one verifier or reviewer. Add more workers only when the task spans multiple files, has meaningful uncertainty, or clearly benefits from diversity.
@@ -227,15 +374,7 @@ def _worker_prompt(
     task_context: str | None = None,
     extra_instructions: str | None = None,
 ) -> str:
-    archetype = WORKER_ARCHETYPES.get(
-        worker_name,
-        WorkerArchetype(
-            persona_name=worker_name,
-            domain="software engineering",
-            approach="solve the assigned task directly",
-            coaching="Work concretely and note blockers quickly.",
-        ),
-    )
+    archetype = _archetype_for_worker(worker_name)
     resolved_persona = persona_name or archetype.persona_name
     resolved_task_context = task_context or "Handle the assigned work using this session's specialty and angle."
     resolved_extra = extra_instructions or archetype.coaching
@@ -304,24 +443,47 @@ class MultiShellController:
     _AUTO_RECOVERY_COOLDOWN_SECONDS = 120.0
     _AUTO_RECOVERY_MAX_DISCONNECTS = 1
     _MANAGER_EVENT_INTERRUPT_AFTER_SECONDS = 5.0
+    _ACCOUNT_EXHAUSTION_COOLDOWN_SECONDS = 900.0
+    _MAX_HANDOFF_ENTRIES = 18
+    _MAX_HANDOFF_CHARS = 6000
 
     def __init__(self) -> None:
+        self._codex_worker_specs = runtime_codex_worker_specs()
+        self._claude_worker_specs = runtime_claude_worker_specs()
+        self._codex_account_specs = codex_account_specs()
+        self._claude_account_specs = claude_account_specs()
+        self._codex_accounts = ProviderAccountPool(
+            self._codex_account_specs,
+            cooldown_seconds=self._ACCOUNT_EXHAUSTION_COOLDOWN_SECONDS,
+        )
+        self._claude_accounts = ProviderAccountPool(
+            self._claude_account_specs,
+            cooldown_seconds=self._ACCOUNT_EXHAUSTION_COOLDOWN_SECONDS,
+        )
+        manager_account = self._codex_accounts.bind(
+            MANAGER_SPEC.name,
+            preferred_key=self._codex_account_specs[0].account_key if self._codex_account_specs else MANAGER_SPEC.account_key,
+        )
         self.manager = CodexSession(
             MANAGER_SPEC,
-            manager_prompt(),
+            manager_prompt(self._codex_worker_specs, self._claude_worker_specs),
             mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name),
             working_dir=manager_workspace_root(),
             persona_label="Multishell Manager",
             message_callback=self._handle_manager_message,
+            event_callback=self._handle_manager_event,
             turn_timeout_seconds=None,
+            auth_source_agent=manager_account.account_key if manager_account is not None else MANAGER_SPEC.account_key,
+            account_email=manager_account.account_email if manager_account is not None else MANAGER_SPEC.account_email,
         )
         self.workers: dict[str, ManagedSession] = {}
         self.codex_workers: dict[str, CodexSession] = {}
         self.claude_workers: dict[str, ClaudeSession] = {}
         self.spark_workers: dict[str, CodexSession] = {}
-        self._codex_worker_names = {spec.name for spec in WORKER_SPECS}
+        self._codex_worker_names = {spec.name for spec in self._codex_worker_specs}
 
-        for spec in WORKER_SPECS:
+        initial_codex_account = self._codex_account_specs[0] if self._codex_account_specs else None
+        for spec in self._codex_worker_specs:
             session = CodexSession(
                 spec,
                 _worker_prompt(spec.name, spec.personality, engine="codex"),
@@ -331,11 +493,14 @@ class MultiShellController:
                 persona_label=self._default_persona_label(spec.name),
                 event_callback=self._handle_worker_event,
                 turn_timeout_seconds=900,
+                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else spec.name,
+                account_email=spec.account_email,
             )
             self.codex_workers[spec.name] = session
             self.workers[spec.name] = session
 
-        for spec in CLAUDE_WORKER_SPECS:
+        initial_claude_account = self._claude_account_specs[0] if self._claude_account_specs else None
+        for spec in self._claude_worker_specs:
             session = ClaudeSession(
                 spec,
                 _worker_prompt(spec.name, spec.personality, engine="claude"),
@@ -344,11 +509,13 @@ class MultiShellController:
                 persona_label=self._default_persona_label(spec.name),
                 event_callback=self._handle_worker_event,
                 turn_timeout_seconds=900,
+                auth_source_agent=initial_claude_account.account_key if initial_claude_account is not None else spec.name,
+                account_email=spec.account_email,
             )
             self.claude_workers[spec.name] = session
             self.workers[spec.name] = session
 
-        for spec in WORKER_SPECS:
+        for spec in self._codex_worker_specs:
             spark_spec = AgentSpec(
                 name=spark_agent_name(spec.name),
                 account_email=spec.account_email,
@@ -366,7 +533,8 @@ class MultiShellController:
                 turn_timeout_seconds=900,
                 model=SPARK_MODEL,
                 reasoning_effort=SPARK_REASONING_EFFORT,
-                auth_source_agent=spec.name,
+                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else spec.name,
+                account_email=spec.account_email,
             )
 
         self.spark_pool = SparkCoordinator(self.spark_workers, callback=self._handle_spark_update)
@@ -407,9 +575,11 @@ class MultiShellController:
         self._control_server.start()
         self.manager.start()
         for worker in self.codex_workers.values():
-            worker.start()
+            worker.start(start_session=False)
         for worker in self.claude_workers.values():
-            worker.start()
+            worker.start(start_session=False)
+        for spark in self.spark_workers.values():
+            spark.start(start_session=False)
         self._push_message("system", "multishell started", level="info")
         self._monitor_thread.start()
 
@@ -481,6 +651,7 @@ class MultiShellController:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             if worker.overview()["status"] != "stopped":
                 return {"ok": False, "error": f"{worker_name} session is already running; use restart_worker_session"}
+            account = self._ensure_worker_binding(worker_name, prefer_current=False)
             system_prompt, persona_label = self._resolve_worker_session_prompt(worker_name, arguments)
             worker.start_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
             self._mark_manual_recovery(worker_name, action="session_started")
@@ -491,7 +662,11 @@ class MultiShellController:
                 task_context=str(arguments.get("task_context", "")).strip() or None,
                 action="start",
             )
-            self._push_message("manager", f"started {worker_name} session in {worker.overview()['cwd']} as {worker.overview()['persona_label']}")
+            self._push_message(
+                "manager",
+                f"started {worker_name} session in {worker.overview()['cwd']} as {worker.overview()['persona_label']} "
+                f"on {account.account_email}",
+            )
             return {"ok": True, "message": f"started {worker_name}"}
 
         if tool == "stop_worker_session":
@@ -502,6 +677,7 @@ class MultiShellController:
             worker.stop_session(clear_pending=True)
             self._mark_session_stopped(worker_name)
             self._sync_paired_spark_session(worker_name, action="stop")
+            self._release_worker_binding(worker_name)
             self._push_message("manager", f"stopped {worker_name} session")
             return {"ok": True, "message": f"stopped {worker_name}"}
 
@@ -511,6 +687,7 @@ class MultiShellController:
             worker = self.workers.get(worker_name)
             if worker is None:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
+            account = self._ensure_worker_binding(worker_name, prefer_current=True)
             system_prompt, persona_label = self._resolve_worker_session_prompt(worker_name, arguments)
             worker.restart_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
             self._mark_manual_recovery(worker_name, action="manual_restart")
@@ -521,7 +698,11 @@ class MultiShellController:
                 task_context=str(arguments.get("task_context", "")).strip() or None,
                 action="restart",
             )
-            self._push_message("manager", f"restarted {worker_name} session in {worker.overview()['cwd']} as {worker.overview()['persona_label']}")
+            self._push_message(
+                "manager",
+                f"restarted {worker_name} session in {worker.overview()['cwd']} as {worker.overview()['persona_label']} "
+                f"on {account.account_email}",
+            )
             return {"ok": True, "message": f"restarted {worker_name}"}
 
         if tool == "get_workers_overview":
@@ -617,6 +798,42 @@ class MultiShellController:
             return {"ok": True, "job": job}
         return {"ok": False, "error": "action must be one of: start, status, list, cancel"}
 
+    def _ensure_worker_binding(self, worker_name: str, *, prefer_current: bool) -> ProviderAccountSpec:
+        pool = self._account_pool_for_session(worker_name)
+        current = pool.assigned_spec(worker_name)
+        if current is not None and prefer_current:
+            self._bind_session_to_account(worker_name, current)
+            return current
+        reserve: set[str] = set()
+        manager_account = self._codex_accounts.assigned_spec(self.manager.spec.name)
+        if worker_name != self.manager.spec.name and manager_account is not None:
+            reserve.add(manager_account.account_key)
+        preferred_key = current.account_key if current is not None and prefer_current else None
+        chosen = pool.bind(worker_name, preferred_key=preferred_key, reserve_keys=reserve)
+        if chosen is None:
+            raise ValueError(f"no accounts available for {worker_name}")
+        self._bind_session_to_account(worker_name, chosen)
+        return chosen
+
+    def _release_worker_binding(self, worker_name: str) -> None:
+        self._account_pool_for_session(worker_name).release(worker_name)
+
+    def _account_pool_for_session(self, session_name: str) -> ProviderAccountPool:
+        if session_name == self.manager.spec.name or session_name in self.codex_workers:
+            return self._codex_accounts
+        if session_name in self.claude_workers:
+            return self._claude_accounts
+        raise KeyError(session_name)
+
+    def _bind_session_to_account(self, session_name: str, account: ProviderAccountSpec) -> None:
+        if session_name == self.manager.spec.name:
+            self.manager.bind_account(account.account_key, account.account_email)
+            return
+        worker = self.workers[session_name]
+        worker.bind_account(account.account_key, account.account_email)
+        if session_name in self.spark_workers:
+            self.spark_workers[session_name].bind_account(account.account_key, account.account_email)
+
     def _active_incomplete_work(self) -> tuple[list[str], list[str]]:
         active_workers: list[str] = []
         for name, worker in self.workers.items():
@@ -678,13 +895,13 @@ class MultiShellController:
     def monitor_items(self) -> list[dict[str, object]]:
         items = [self._monitor_from_session("manager", self.manager.overview())]
 
-        for index, spec in enumerate(WORKER_SPECS, start=1):
+        for index, spec in enumerate(self._codex_worker_specs, start=1):
             items.append(self._monitor_from_session(f"codex-{index}", self.codex_workers[spec.name].overview()))
 
-        for index, spec in enumerate(CLAUDE_WORKER_SPECS, start=1):
+        for index, spec in enumerate(self._claude_worker_specs, start=1):
             items.append(self._monitor_from_session(f"claude-{index}", self.claude_workers[spec.name].overview()))
 
-        for index, spec in enumerate(WORKER_SPECS, start=1):
+        for index, spec in enumerate(self._codex_worker_specs, start=1):
             items.append(self._monitor_from_session(f"spark-{index}", self.spark_workers[spec.name].overview()))
 
         gptpro_jobs = self.web_reasoners.list_jobs(provider="chatgpt_pro")
@@ -733,7 +950,8 @@ class MultiShellController:
             failure_suffix = f" failure_context={failure_context!r}" if failure_context else ""
             lines.append(
                 f"- {overview['name']}: engine={overview.get('engine', 'codex')} model={overview.get('model', '-')!r} "
-                f"persona={overview['persona_label']!r} status={overview['status']} cwd={overview['cwd']!r} "
+                f"account={overview.get('account_email', '-')!r} persona={overview['persona_label']!r} "
+                f"status={overview['status']} cwd={overview['cwd']!r} "
                 f"pending={overview['pending_tasks']} completed={overview['completed_turns']} failed={overview['failed_turns']}{timing} "
                 f"last_message={overview['last_message']!r}{failure_suffix}"
             )
@@ -839,8 +1057,7 @@ class MultiShellController:
         self._push_message("manager", entry.text, level="info")
 
     def _default_persona_label(self, worker_name: str) -> str:
-        archetype = WORKER_ARCHETYPES.get(worker_name)
-        return archetype.persona_name if archetype is not None else worker_name
+        return _archetype_for_worker(worker_name).persona_name
 
     def _monitor_from_session(self, label: str, overview: dict[str, object]) -> dict[str, object]:
         return {
@@ -1013,6 +1230,11 @@ class MultiShellController:
             return
         self.spark_pool.cancel_active_for_worker(worker_name)
         spark = self.spark_workers[worker_name]
+        worker_overview = self.codex_workers[worker_name].overview()
+        account_key = str(worker_overview.get("account_key") or "").strip()
+        account_email = str(worker_overview.get("account_email") or "").strip() or None
+        if account_key:
+            spark.bind_account(account_key, account_email)
         spark_prompt = _spark_prompt(
             worker_name,
             self.codex_workers[worker_name].spec.personality,
@@ -1028,9 +1250,161 @@ class MultiShellController:
         elif action == "stop":
             spark.stop_session(clear_pending=True)
 
+    def _handle_manager_event(self, event: SessionEvent) -> None:
+        if event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
+            self._record_session_failure(event)
+        if self._maybe_failover_account(event):
+            return
+        if event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
+            self._push_message("system", f"manager: {event.message}", level="warn" if event.kind == "turn_failed" else "error")
+
+    def _maybe_failover_account(self, event: SessionEvent) -> bool:
+        limit_kind = self._event_limit_kind(event)
+        if limit_kind is None:
+            return False
+        try:
+            pool = self._account_pool_for_session(event.agent)
+        except KeyError:
+            return False
+        current = pool.assigned_spec(event.agent)
+        if current is None:
+            return False
+        pool.mark_exhausted(event.agent, now=event.ts)
+        reserve: set[str] = set()
+        manager_account = self._codex_accounts.assigned_spec(self.manager.spec.name)
+        if event.agent != self.manager.spec.name and manager_account is not None:
+            reserve.add(manager_account.account_key)
+        replacement = pool.bind(
+            event.agent,
+            avoid_keys={current.account_key},
+            reserve_keys=reserve,
+            allow_exhausted_fallback=True,
+        )
+        if replacement is None or replacement.account_key == current.account_key:
+            self._push_message(
+                "system",
+                f"{event.agent}: {limit_kind.replace('_', ' ')} on {current.account_email}; no alternate account available",
+                level="error",
+            )
+            return False
+        session = self._session_for_name(event.agent)
+        overview = session.overview()
+        handoff = self._build_account_failover_prompt(
+            event=event,
+            session=session,
+            previous_account=current,
+            next_account=replacement,
+            limit_kind=limit_kind,
+        )
+        self._bind_session_to_account(event.agent, replacement)
+        cwd = str(overview.get("cwd") or workspace_root())
+        persona_label = str(overview.get("persona_label") or event.agent)
+        system_prompt = getattr(session, "initial_prompt", None)
+        if isinstance(session, CodexSession):
+            session.stop_session(clear_pending=False, reason="account failover was requested")
+        else:
+            session.stop_session(clear_pending=False)
+        original_startup_prompt = getattr(session, "startup_prompt", None)
+        if original_startup_prompt is not None:
+            session.startup_prompt = None
+        try:
+            session.start_session(cwd=cwd, system_prompt=system_prompt, persona_label=persona_label)
+        finally:
+            if original_startup_prompt is not None:
+                session.startup_prompt = original_startup_prompt
+        session.queue_priority_prompt(handoff, source="system", cwd=cwd)
+        if event.agent in self.codex_workers:
+            self._sync_paired_spark_session(
+                event.agent,
+                cwd=cwd,
+                persona_label=persona_label,
+                action="restart",
+            )
+        meta = self._lifecycle.get(event.agent)
+        if meta is not None:
+            meta.note_recovery(action="account_failover", now=time.time())
+        self._push_message(
+            "system",
+            f"{event.agent}: switched from {current.account_email} to {replacement.account_email} after {limit_kind.replace('_', ' ')}",
+            level="warn",
+        )
+        return True
+
+    def _event_limit_kind(self, event: SessionEvent) -> str | None:
+        message = event.message.strip()
+        if not message:
+            return None
+        assistant_message = event.kind == "assistant_message"
+        return self._message_limit_kind(message, assistant_message=assistant_message)
+
+    def _message_limit_kind(self, message: str, *, assistant_message: bool) -> str | None:
+        lowered = " ".join(message.lower().split())
+        if assistant_message and not (
+            lowered.startswith("out_of_tokens:")
+            or lowered.startswith("out of tokens")
+            or lowered.startswith("token limit")
+            or lowered.startswith("rate limit")
+            or lowered.startswith("rate limited")
+            or lowered.startswith("context limit")
+        ):
+            return None
+        if any(marker in lowered for marker in ("maximum context length", "context window", "context limit", "prompt is too long")):
+            return "context_limit"
+        if any(marker in lowered for marker in ("too many requests", "rate limit", "rate limited", " 429 ", "status 429")):
+            return "rate_limit"
+        if any(marker in lowered for marker in ("out_of_tokens", "out of tokens", "token limit", "usage limit", "token budget")):
+            return "token_limit"
+        return None
+
+    def _build_account_failover_prompt(
+        self,
+        *,
+        event: SessionEvent,
+        session: CodexSession | ClaudeSession,
+        previous_account: ProviderAccountSpec,
+        next_account: ProviderAccountSpec,
+        limit_kind: str,
+    ) -> str:
+        overview = session.overview()
+        transcript_lines: list[str] = []
+        total_chars = 0
+        for entry in reversed(session.recent_transcript(self._MAX_HANDOFF_ENTRIES)):
+            clean = " ".join(entry.text.split())
+            if not clean:
+                continue
+            snippet = clean if len(clean) <= 360 else f"{clean[:357]}..."
+            rendered = f"- [{entry.source}] {snippet}"
+            total_chars += len(rendered)
+            if total_chars > self._MAX_HANDOFF_CHARS:
+                break
+            transcript_lines.append(rendered)
+        transcript_lines.reverse()
+        transcript_block = "\n".join(transcript_lines) if transcript_lines else "- <no recent transcript captured>"
+        return (
+            "Account failover handoff.\n"
+            f"Previous account: {previous_account.account_email}\n"
+            f"New account: {next_account.account_email}\n"
+            f"Reason: {limit_kind.replace('_', ' ')} while handling this session.\n"
+            f"Latest failure: {event.message}\n"
+            f"Current cwd: {overview.get('cwd')}\n"
+            f"Persona: {overview.get('persona_label')}\n"
+            "Resume the same task without restarting from scratch. Preserve completed work, re-check only what is necessary, "
+            "and continue from the latest useful point.\n\n"
+            "Recent session transcript:\n"
+            f"{transcript_block}"
+        )
+
+    def _session_for_name(self, session_name: str) -> CodexSession | ClaudeSession:
+        if session_name == self.manager.spec.name:
+            return self.manager
+        return self.workers[session_name]
+
     def _handle_worker_event(self, event: SessionEvent) -> None:
         if event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
             self._record_session_failure(event)
+
+        if self._maybe_failover_account(event):
+            return
 
         auto_recovered_transport = False
         if event.kind == "assistant_message":

@@ -30,12 +30,17 @@ from .auth_flow_model import (
 )
 from .config import AgentSpec, account_for_agent, all_agent_specs, credential_source_agent, state_root
 from .homes import (
+    account_auth_path,
+    account_home,
     agent_home,
     auth_path,
+    claude_account_home,
     claude_auth_path,
     claude_home,
     claude_root_auth_path,
+    ensure_account_home,
     ensure_agent_home,
+    ensure_claude_account_home,
     ensure_claude_home,
     has_claude_auth,
 )
@@ -361,19 +366,20 @@ def _raise_auth_model_exception(flow_label: str, exc: Exception, logger: Callabl
 
 def _login_codex_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
     agent_name = credential.spec.name
+    account_name = credential_source_agent(agent_name)
     progress_label = _verbose_progress_label(agent_name)
     page = None
     child = None
     try:
         _log_verbose(agent_name, "preparing Codex login state")
         _ensure_home(credential.spec.name)
-        if auth_path(credential.spec.name).exists():
+        if _codex_logged_in(credential.spec.name):
             _log_progress(agent_name, "already logged in; skipping")
             return
         _log_coarse_progress(agent_name, "running headless browser auth")
 
         env = suppress_node_warnings(os.environ.copy())
-        env["HOME"] = str(agent_home(credential.spec.name))
+        env["HOME"] = str(account_home(account_name))
         _log_verbose(agent_name, "starting `codex login --device-auth`")
         child, url, device_code = _start_codex_device_auth(agent_name, env)
         _log_verbose(agent_name, f"received device code {device_code}; launching browser")
@@ -430,25 +436,18 @@ def _start_codex_device_auth(agent_name: str, env: dict[str, str], *, max_attemp
 
 
 def _ensure_home(agent_name: str) -> None:
-    from .__main__ import _bridge_command
-
-    if agent_name == "manager":
-        ensure_agent_home(agent_name, mcp_bridge_command=_bridge_command("manager", agent_name))
-        return
-    if agent_name.startswith("worker-"):
-        ensure_agent_home(agent_name, mcp_bridge_command=_bridge_command("worker", agent_name))
-        return
-    ensure_agent_home(agent_name)
+    ensure_account_home(credential_source_agent(agent_name))
 
 
 def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_seconds: int, headed: bool) -> None:
     agent_name = credential.spec.name
+    account_name = credential_source_agent(agent_name)
     progress_label = _verbose_progress_label(agent_name)
     page = None
     child = None
     try:
         _log_verbose(agent_name, "preparing Claude login state")
-        ensure_claude_home(credential.spec.name)
+        ensure_claude_account_home(account_name)
         if _claude_logged_in(credential.spec.name):
             _log_progress(agent_name, "already logged in; skipping")
             return
@@ -456,7 +455,7 @@ def _login_claude_one(playwright: object, credential: AgentCredentials, timeout_
 
         env = suppress_node_warnings(os.environ.copy())
         env.pop("ANTHROPIC_API_KEY", None)
-        env["HOME"] = str(claude_home(credential.spec.name))
+        env["HOME"] = str(claude_account_home(account_name))
         _log_verbose(agent_name, f"starting `claude auth login --email {credential.spec.account_email}`")
         child = pexpect.spawn(
             "claude",
@@ -1528,14 +1527,15 @@ def _wait_for_codex_auth(
     deadline = time.time() + timeout_seconds
     last_progress = 0.0
     output_tail: deque[str] = deque(maxlen=12)
+    account_name = credential_source_agent(agent_name)
     while time.time() < deadline:
         _drain_child_output(child, output_tail=output_tail)
-        if auth_path(agent_name).exists() or _codex_logged_in(agent_name):
+        if account_auth_path(account_name).exists() or _codex_logged_in(agent_name):
             child.terminate(force=True)
             return
         if not child.isalive():
             _drain_child_output(child, output_tail=output_tail)
-            if auth_path(agent_name).exists() or _codex_logged_in(agent_name):
+            if account_auth_path(account_name).exists() or _codex_logged_in(agent_name):
                 return
             raise RetryableLoginError(
                 _codex_auth_wait_error(
@@ -1557,8 +1557,9 @@ def _wait_for_codex_auth(
 
 
 def _codex_logged_in(agent_name: str) -> bool:
+    account_name = credential_source_agent(agent_name)
     env = suppress_node_warnings(os.environ.copy())
-    env["HOME"] = str(agent_home(agent_name))
+    env["HOME"] = str(account_home(account_name))
     result = subprocess.run(
         ["codex", "login", "status"],
         check=False,
@@ -1626,9 +1627,10 @@ def _wait_for_claude_auth(
 def _claude_logged_in(agent_name: str) -> bool:
     if not has_claude_auth(agent_name):
         return False
+    account_name = credential_source_agent(agent_name)
     env = suppress_node_warnings(os.environ.copy())
     env.pop("ANTHROPIC_API_KEY", None)
-    env["HOME"] = str(claude_home(agent_name))
+    env["HOME"] = str(claude_account_home(account_name))
     result = subprocess.run(
         ["claude", "auth", "status"],
         check=False,

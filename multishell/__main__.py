@@ -12,18 +12,23 @@ from .config import (
     CLAUDE_WORKER_SPECS,
     MANAGER_SPEC,
     WORKER_SPECS,
+    credential_source_agent,
     dotenv_path,
     dotenv_template_text,
     missing_email_env_vars,
     state_root,
 )
 from .homes import (
+    account_home,
     agent_home,
     all_agent_names,
+    claude_account_home,
     claude_home,
     claude_logged_in,
     codex_logged_in,
+    ensure_account_home,
     ensure_agent_home,
+    ensure_claude_account_home,
     ensure_claude_home,
     missing_claude_logins,
     missing_codex_logins,
@@ -320,13 +325,22 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
 
 def cmd_status(_: argparse.Namespace) -> int:
     ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
-    print(f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} home={agent_home(MANAGER_SPEC.name)} auth={'yes' if codex_logged_in(MANAGER_SPEC.name) else 'no'}")
+    print(
+        f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} "
+        f"home={account_home(credential_source_agent(MANAGER_SPEC.name))} auth={'yes' if codex_logged_in(MANAGER_SPEC.name) else 'no'}"
+    )
     for spec in WORKER_SPECS:
         ensure_agent_home(spec.name, mcp_bridge_command=_bridge_command("worker", spec.name))
-        print(f"{spec.name}: provider=codex email={spec.account_email} home={agent_home(spec.name)} auth={'yes' if codex_logged_in(spec.name) else 'no'}")
+        print(
+            f"{spec.name}: provider=codex email={spec.account_email} "
+            f"home={account_home(credential_source_agent(spec.name))} auth={'yes' if codex_logged_in(spec.name) else 'no'}"
+        )
     for spec in CLAUDE_WORKER_SPECS:
         ensure_claude_home(spec.name)
-        print(f"{spec.name}: provider=claude email={spec.account_email} home={claude_home(spec.name)} auth={'yes' if claude_logged_in(spec.name) else 'no'}")
+        print(
+            f"{spec.name}: provider=claude email={spec.account_email} "
+            f"home={claude_account_home(credential_source_agent(spec.name))} auth={'yes' if claude_logged_in(spec.name) else 'no'}"
+        )
     missing = missing_email_env_vars()
     if missing:
         print(f"warning: missing email env vars in .env: {', '.join(missing)}")
@@ -343,22 +357,23 @@ def cmd_login(_: argparse.Namespace) -> int:
 def cmd_auth_login(args: argparse.Namespace) -> int:
     if args.agent not in all_agent_names():
         raise SystemExit(f"unknown agent: {args.agent}")
+    account_name = credential_source_agent(args.agent)
 
     if args.agent == MANAGER_SPEC.name:
-        ensure_agent_home(args.agent, mcp_bridge_command=_bridge_command("manager", args.agent))
+        ensure_account_home(account_name)
     elif args.agent in {spec.name for spec in WORKER_SPECS}:
-        ensure_agent_home(args.agent, mcp_bridge_command=_bridge_command("worker", args.agent))
+        ensure_account_home(account_name)
     else:
-        ensure_claude_home(args.agent)
+        ensure_claude_account_home(account_name)
 
     env = suppress_node_warnings(os.environ.copy())
     if args.agent in {spec.name for spec in CLAUDE_WORKER_SPECS}:
         email_by_name = {spec.name: spec.account_email for spec in CLAUDE_WORKER_SPECS}
         env.pop("ANTHROPIC_API_KEY", None)
-        env["HOME"] = str(claude_home(args.agent))
+        env["HOME"] = str(claude_account_home(account_name))
         cmd = ["claude", "auth", "login", "--email", email_by_name[args.agent]]
     else:
-        env["HOME"] = str(agent_home(args.agent))
+        env["HOME"] = str(account_home(account_name))
         cmd = ["codex", "login", "--device-auth"]
     subprocess.run(cmd, check=True, env=env)
     return 0

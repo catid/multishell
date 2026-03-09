@@ -90,6 +90,8 @@ class TurnRequest:
 class SessionState:
     spec: AgentSpec
     home: Path
+    account_key: str = ""
+    account_email: str = ""
     thread_id: str | None = None
     turn_id: str | None = None
     status: str = "stopped"
@@ -150,6 +152,7 @@ class CodexSession:
         model: str = MODEL,
         reasoning_effort: str = MODEL_REASONING_EFFORT,
         auth_source_agent: str | None = None,
+        account_email: str | None = None,
     ) -> None:
         self.spec = spec
         self._default_initial_prompt = initial_prompt
@@ -158,16 +161,25 @@ class CodexSession:
         self.startup_prompt = startup_prompt
         self.model = model
         self.reasoning_effort = reasoning_effort
+        self._mcp_bridge_command = mcp_bridge_command
+        self._auth_source_agent = auth_source_agent or spec.account_key
         self.home = ensure_agent_home(
             spec.name,
             mcp_bridge_command=mcp_bridge_command,
             model=model,
             reasoning_effort=reasoning_effort,
-            auth_source_agent=auth_source_agent,
+            auth_source_agent=self._auth_source_agent,
         )
         self.working_dir = Path(working_dir or workspace_root())
         self.working_dir.mkdir(parents=True, exist_ok=True)
-        self.state = SessionState(spec=spec, home=self.home, current_cwd=str(self.working_dir), persona_label=self.persona_label)
+        self.state = SessionState(
+            spec=spec,
+            home=self.home,
+            account_key=self._auth_source_agent,
+            account_email=account_email or spec.account_email,
+            current_cwd=str(self.working_dir),
+            persona_label=self.persona_label,
+        )
         self._state_lock = threading.RLock()
         self._queue: queue.Queue[TurnRequest | None] = queue.Queue()
         self._turn_thread = threading.Thread(target=self._worker_loop, name=f"multishell-{spec.name}", daemon=True)
@@ -195,12 +207,15 @@ class CodexSession:
         self._pending_interrupt_requested_by: str | None = None
         self._pending_interrupt_requested_at: float | None = None
 
-    def start(self) -> None:
+    def start(self, *, start_session: bool = True) -> None:
         if self._started:
+            if start_session and self.overview()["status"] == "stopped":
+                self.start_session()
             return
         self._started = True
         self._turn_thread.start()
-        self.start_session()
+        if start_session:
+            self.start_session()
 
     def stop(self) -> None:
         if not self._started:
@@ -315,6 +330,32 @@ class CodexSession:
             self.state.push(source, prompt)
         self._queue.put(item)
 
+    def queue_priority_prompt(self, prompt: str, source: str = "system", cwd: str | None = None) -> None:
+        preserved = self._drain_pending_queue_items()
+        item = TurnRequest(prompt=prompt, source=source, cwd=cwd)
+        with self._state_lock:
+            self.state.pending_tasks += 1 + len(preserved)
+            self.state.push(source, prompt)
+        self._queue.put(item)
+        for pending in preserved:
+            self._queue.put(pending)
+
+    def bind_account(self, account_key: str, account_email: str | None = None) -> None:
+        self._auth_source_agent = account_key
+        self.home = ensure_agent_home(
+            self.spec.name,
+            mcp_bridge_command=self._mcp_bridge_command,
+            model=self.model,
+            reasoning_effort=self.reasoning_effort,
+            auth_source_agent=account_key,
+        )
+        with self._state_lock:
+            self.state.home = self.home
+            self.state.account_key = account_key
+            if account_email is not None:
+                self.state.account_email = account_email
+            self.state.updated_at = _now()
+
     def overview(self) -> dict[str, object]:
         with self._state_lock:
             running_for = None
@@ -322,7 +363,8 @@ class CodexSession:
                 running_for = max(0.0, _now() - self.state.last_turn_started_at)
             return {
                 "name": self.spec.name,
-                "account_email": self.spec.account_email,
+                "account_key": self.state.account_key,
+                "account_email": self.state.account_email,
                 "accent_color": self.spec.accent_color,
                 "status": self.state.status,
                 "thread_id": self.state.thread_id,
@@ -981,18 +1023,22 @@ class CodexSession:
         self._event_callback(event)
 
     def _drain_pending_queue(self) -> None:
-        removed = 0
+        self._drain_pending_queue_items()
+
+    def _drain_pending_queue_items(self) -> list[TurnRequest]:
+        removed: list[TurnRequest] = []
         while True:
             try:
                 item = self._queue.get_nowait()
             except queue.Empty:
                 break
             if item is not None:
-                removed += 1
+                removed.append(item)
             self._queue.task_done()
         if removed:
             with self._state_lock:
-                self.state.pending_tasks = max(0, self.state.pending_tasks - removed)
+                self.state.pending_tasks = max(0, self.state.pending_tasks - len(removed))
+        return removed
 
     def _terminate_process(self) -> None:
         with self._process_lock:

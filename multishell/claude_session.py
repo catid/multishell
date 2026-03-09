@@ -35,6 +35,8 @@ class TurnRequest:
 class SessionState:
     spec: AgentSpec
     home: Path
+    account_key: str = ""
+    account_email: str = ""
     thread_id: str | None = None
     turn_id: str | None = None
     status: str = "stopped"
@@ -95,6 +97,7 @@ class ClaudeSession:
         model: str = CLAUDE_MODEL,
         reasoning_effort: str = CLAUDE_REASONING_EFFORT,
         auth_source_agent: str | None = None,
+        account_email: str | None = None,
         permission_mode: str = "bypassPermissions",
     ) -> None:
         self.spec = spec
@@ -104,10 +107,18 @@ class ClaudeSession:
         self.model = model
         self.reasoning_effort = reasoning_effort
         self.permission_mode = permission_mode
-        self.home = ensure_claude_home(spec.name, auth_source_agent=auth_source_agent)
+        self._auth_source_agent = auth_source_agent or spec.account_key
+        self.home = ensure_claude_home(spec.name, auth_source_agent=self._auth_source_agent)
         self.working_dir = Path(working_dir or workspace_root())
         self.working_dir.mkdir(parents=True, exist_ok=True)
-        self.state = SessionState(spec=spec, home=self.home, current_cwd=str(self.working_dir), persona_label=self.persona_label)
+        self.state = SessionState(
+            spec=spec,
+            home=self.home,
+            account_key=self._auth_source_agent,
+            account_email=account_email or spec.account_email,
+            current_cwd=str(self.working_dir),
+            persona_label=self.persona_label,
+        )
 
         self._state_lock = threading.RLock()
         self._queue: queue.Queue[TurnRequest | None] = queue.Queue()
@@ -123,12 +134,15 @@ class ClaudeSession:
         self._interrupt_requested = threading.Event()
         self._session_generation = 0
 
-    def start(self) -> None:
+    def start(self, *, start_session: bool = True) -> None:
         if self._started:
+            if start_session and self.overview()["status"] == "stopped":
+                self.start_session()
             return
         self._started = True
         self._turn_thread.start()
-        self.start_session()
+        if start_session:
+            self.start_session()
 
     def stop(self) -> None:
         if not self._started:
@@ -222,6 +236,26 @@ class ClaudeSession:
             self.state.push(source, prompt)
         self._queue.put(item)
 
+    def queue_priority_prompt(self, prompt: str, source: str = "system", cwd: str | None = None) -> None:
+        preserved = self._drain_pending_queue_items()
+        item = TurnRequest(prompt=prompt, source=source, cwd=cwd)
+        with self._state_lock:
+            self.state.pending_tasks += 1 + len(preserved)
+            self.state.push(source, prompt)
+        self._queue.put(item)
+        for pending in preserved:
+            self._queue.put(pending)
+
+    def bind_account(self, account_key: str, account_email: str | None = None) -> None:
+        self._auth_source_agent = account_key
+        self.home = ensure_claude_home(self.spec.name, auth_source_agent=account_key)
+        with self._state_lock:
+            self.state.home = self.home
+            self.state.account_key = account_key
+            if account_email is not None:
+                self.state.account_email = account_email
+            self.state.updated_at = _now()
+
     def overview(self) -> dict[str, object]:
         with self._state_lock:
             running_for = None
@@ -229,7 +263,8 @@ class ClaudeSession:
                 running_for = max(0.0, _now() - self.state.last_turn_started_at)
             return {
                 "name": self.spec.name,
-                "account_email": self.spec.account_email,
+                "account_key": self.state.account_key,
+                "account_email": self.state.account_email,
                 "accent_color": self.spec.accent_color,
                 "status": self.state.status,
                 "thread_id": self.state.thread_id,
@@ -657,18 +692,22 @@ class ClaudeSession:
                 self._process = None
 
     def _drain_pending_queue(self) -> None:
-        removed = 0
+        self._drain_pending_queue_items()
+
+    def _drain_pending_queue_items(self) -> list[TurnRequest]:
+        removed: list[TurnRequest] = []
         while True:
             try:
                 item = self._queue.get_nowait()
             except queue.Empty:
                 break
             if item is not None:
-                removed += 1
+                removed.append(item)
             self._queue.task_done()
         if removed:
             with self._state_lock:
-                self.state.pending_tasks = max(0, self.state.pending_tasks - removed)
+                self.state.pending_tasks = max(0, self.state.pending_tasks - len(removed))
+        return removed
 
     def _push_line(self, source: str, text: str) -> None:
         with self._state_lock:

@@ -27,6 +27,7 @@ MISSING_ENV_PREFIX = "<missing:"
 ENV_FILE_ENV_VAR = "MULTISHELL_ENV_FILE"
 STATE_ROOT_ENV_VAR = "MULTISHELL_STATE_ROOT"
 WORKSPACE_ROOT_ENV_VAR = "MULTISHELL_WORKSPACE_ROOT"
+ACCOUNT_CAPACITY_MULTIPLE_ENV_VAR = "MULTISHELL_ACCOUNT_CAPACITY_MULTIPLE"
 DEFAULT_DOTENV_TEMPLATE = """# Multishell stores its Google account inventory in this file.
 # Use `multishell login` to add or remove accounts and toggle OpenAI, Anthropic, and Gemini access.
 MULTISHELL_ACCOUNTS="[]"
@@ -177,6 +178,19 @@ def _cycled(values: tuple[tuple[str, int], ...], index: int) -> tuple[str, int]:
     return values[(index - 1) % len(values)]
 
 
+def _dynamic_account_value(provider: str) -> str:
+    return f"<dynamic:{provider}>"
+
+
+def account_capacity_multiple() -> int:
+    raw = os.environ.get(ACCOUNT_CAPACITY_MULTIPLE_ENV_VAR, "").strip()
+    try:
+        value = int(raw or "2")
+    except ValueError:
+        value = 2
+    return max(1, min(8, value))
+
+
 def _manager_account() -> AccountRecord | None:
     if _OPENAI_ACCOUNTS:
         return _OPENAI_ACCOUNTS[0]
@@ -234,6 +248,63 @@ GEMINI_ACCOUNT_SPECS = [
     )
     for index, account in enumerate(_GEMINI_ACCOUNTS, start=1)
 ]
+
+
+def codex_account_specs() -> list[ProviderAccountSpec]:
+    return [
+        ProviderAccountSpec(
+            name=f"codex-account-{index}",
+            account_key=account.key,
+            account_email=account.email or _missing_account_value(f"{account.key}-email"),
+            provider=PROVIDER_OPENAI,
+            accent_color=_cycled(_CODEX_PERSONALITIES, index)[1],
+        )
+        for index, account in enumerate(_OPENAI_ACCOUNTS, start=1)
+    ]
+
+
+def claude_account_specs() -> list[ProviderAccountSpec]:
+    return [
+        ProviderAccountSpec(
+            name=f"claude-account-{index}",
+            account_key=account.key,
+            account_email=account.email or _missing_account_value(f"{account.key}-email"),
+            provider=PROVIDER_ANTHROPIC,
+            accent_color=_cycled(_CLAUDE_PERSONALITIES, index)[1],
+        )
+        for index, account in enumerate(_ANTHROPIC_ACCOUNTS, start=1)
+    ]
+
+
+def runtime_codex_worker_specs() -> list[AgentSpec]:
+    slot_count = max(0, len(_OPENAI_ACCOUNTS) * account_capacity_multiple() - 1)
+    return [
+        AgentSpec(
+            name=f"worker-{index}",
+            account_key=f"worker-slot-{index}",
+            account_email=_dynamic_account_value(PROVIDER_OPENAI),
+            role="worker",
+            personality=_cycled(_CODEX_PERSONALITIES, index)[0],
+            accent_color=_cycled(_CODEX_PERSONALITIES, index)[1],
+        )
+        for index in range(1, slot_count + 1)
+    ]
+
+
+def runtime_claude_worker_specs() -> list[AgentSpec]:
+    slot_count = len(_ANTHROPIC_ACCOUNTS) * account_capacity_multiple()
+    return [
+        AgentSpec(
+            name=f"claude-worker-{index}",
+            account_key=f"claude-worker-slot-{index}",
+            account_email=_dynamic_account_value(PROVIDER_ANTHROPIC),
+            role="claude-worker",
+            personality=_cycled(_CLAUDE_PERSONALITIES, index)[0],
+            accent_color=_cycled(_CLAUDE_PERSONALITIES, index)[1],
+            engine="claude",
+        )
+        for index in range(1, slot_count + 1)
+    ]
 
 
 def manager_workspace_root() -> Path:
@@ -300,20 +371,17 @@ def provider_account_for_name(name: str) -> AccountRecord:
 
 
 def home_owner_name(agent_name: str) -> str:
-    spec = maybe_spec_by_name(agent_name)
-    if spec is not None:
-        return spec.account_key
     if agent_name.endswith("-spark"):
         return home_owner_name(agent_name[: -len("-spark")])
     return agent_name
 
 
 def password_env_var(agent_name: str) -> str:
-    return account_config_label(home_owner_name(agent_name), "password")
+    return account_config_label(credential_source_agent(agent_name), "password")
 
 
 def email_env_var(agent_name: str) -> str:
-    return account_config_label(home_owner_name(agent_name), "email")
+    return account_config_label(credential_source_agent(agent_name), "email")
 
 
 def gemini_email_env_var() -> str:
@@ -329,6 +397,11 @@ def account_config_label(account_key: str, field: str) -> str:
 
 
 def credential_source_agent(agent_name: str) -> str:
+    spec = maybe_spec_by_name(agent_name)
+    if spec is not None:
+        return spec.account_key
+    if agent_name.endswith("-spark"):
+        return credential_source_agent(agent_name[: -len("-spark")])
     return home_owner_name(agent_name)
 
 
