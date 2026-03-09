@@ -6,7 +6,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import SPARK_MODEL
 from .control import send_control_request
 
 
@@ -147,28 +146,7 @@ MANAGER_TOOLS = [
     ),
 ]
 
-WORKER_TOOLS = [
-    ToolDef(
-        name="gpt_5_3_spark",
-        description=(
-            f"Launch, inspect, or cancel a paired {SPARK_MODEL} draft job on your account. "
-            "Use it for first-draft ideas or code, then review the result before writing edits."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["start", "status", "list", "cancel"]},
-                "prompt": {"type": "string"},
-                "job_id": {"type": "string"},
-                "label": {"type": "string"},
-                "cwd": {"type": "string"},
-                "timeout_seconds": {"type": "integer", "minimum": 30, "maximum": 1800},
-            },
-            "required": ["action"],
-            "additionalProperties": False,
-        },
-    )
-]
+WORKER_TOOLS: list[ToolDef] = []
 
 
 def tools_for_role(role: str) -> list[ToolDef]:

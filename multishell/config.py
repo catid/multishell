@@ -19,8 +19,6 @@ from .envfile import parse_env_value
 
 MODEL = "gpt-5.4"
 MODEL_REASONING_EFFORT = "high"
-SPARK_MODEL = "gpt-5.3-codex-spark"
-SPARK_REASONING_EFFORT = "xhigh"
 CLAUDE_MODEL = "claude-opus-4-6"
 CLAUDE_REASONING_EFFORT = "high"
 MISSING_ENV_PREFIX = "<missing:"
@@ -398,13 +396,7 @@ def credential_source_agent(agent_name: str) -> str:
     spec = maybe_spec_by_name(agent_name)
     if spec is not None:
         return spec.account_key
-    if agent_name.endswith("-spark"):
-        return credential_source_agent(agent_name[: -len("-spark")])
     return home_owner_name(agent_name)
-
-
-def spark_agent_name(worker_name: str) -> str:
-    return f"{worker_name}-spark"
 
 
 def is_missing_env_value(value: str) -> bool:

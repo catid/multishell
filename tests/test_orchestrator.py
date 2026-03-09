@@ -6,7 +6,6 @@ import pytest
 
 import multishell.orchestrator as orch
 from multishell.codex_session import SessionEvent
-from multishell.config import SPARK_MODEL
 
 
 @dataclass
@@ -183,46 +182,6 @@ class FakeControlServer:
         return None
 
 
-class FakeSparkCoordinator:
-    def __init__(self, sessions, callback=None) -> None:
-        self.sessions = sessions
-        self.callback = callback
-        self.jobs: dict[str, dict[str, object]] = {}
-
-    def start_job(self, worker, prompt, *, cwd=None, label=None, timeout_seconds=900):
-        job = {
-            "job_id": "spark-1",
-            "worker": worker,
-            "status": "running",
-            "cwd": cwd,
-            "label": label or "spark",
-            "prompt_preview": prompt,
-            "timeout_seconds": timeout_seconds,
-            "result_text": "",
-            "error": None,
-            "out_of_tokens": False,
-        }
-        self.jobs[job["job_id"]] = job
-        return dict(job)
-
-    def snapshot(self, job_id):
-        return dict(self.jobs[job_id])
-
-    def list_jobs(self, worker=None):
-        jobs = list(self.jobs.values())
-        if worker is not None:
-            jobs = [job for job in jobs if job["worker"] == worker]
-        return [dict(job) for job in jobs]
-
-    def cancel_job(self, job_id):
-        job = self.jobs[job_id]
-        job["status"] = "cancelled"
-        return dict(job)
-
-    def cancel_active_for_worker(self, worker):
-        return None
-
-
 class FakeWebReasonerManager:
     def __init__(self, callback=None, event_callback=None, **kwargs) -> None:
         self.callback = callback or event_callback
@@ -264,7 +223,6 @@ class FakeWebReasonerManager:
 def test_build_worker_event_prompt_ignores_ready_messages(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -284,7 +242,6 @@ def test_build_worker_event_prompt_ignores_ready_messages(monkeypatch) -> None:
 def test_ready_messages_are_condensed_in_main_chat(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -306,7 +263,6 @@ def test_ready_messages_are_condensed_in_main_chat(monkeypatch) -> None:
 def test_fanout_guidance_for_top_k_requests(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -319,7 +275,6 @@ def test_fanout_guidance_for_top_k_requests(monkeypatch) -> None:
 def test_fanout_guidance_for_non_trivial_requests_prefers_small_swarm(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -333,7 +288,6 @@ def test_fanout_guidance_for_non_trivial_requests_prefers_small_swarm(monkeypatc
 def test_manager_has_no_hard_turn_timeout(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -345,7 +299,6 @@ def test_manager_has_no_hard_turn_timeout(monkeypatch) -> None:
 def test_send_user_message_includes_dependency_and_completion_gates(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -361,7 +314,6 @@ def test_send_user_message_includes_dependency_and_completion_gates(monkeypatch)
 def test_handle_control_request_passes_cwd_and_persona_to_worker(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -418,7 +370,6 @@ def test_handle_control_request_passes_cwd_and_persona_to_worker(monkeypatch) ->
 def test_notify_user_rejects_premature_final_completion(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -436,7 +387,6 @@ def test_notify_user_rejects_premature_final_completion(monkeypatch) -> None:
 def test_notify_user_allows_final_completion_once_work_is_idle(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -450,46 +400,9 @@ def test_notify_user_allows_final_completion_once_work_is_idle(monkeypatch) -> N
     assert controller.recent_messages(1)[-1].text == "Done. Everything succeeded."
 
 
-def test_worker_spark_tool_uses_paired_worker_name(monkeypatch) -> None:
-    monkeypatch.setattr(orch, "CodexSession", FakeSession)
-    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
-    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
-    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
-
-    controller = orch.MultiShellController()
-    response = controller.handle_control_request(
-        {
-            "tool": "gpt_5_3_spark",
-            "role": "worker",
-            "agent": "worker-1",
-            "arguments": {"action": "start", "prompt": "draft a first pass", "cwd": "/tmp/repo"},
-        }
-    )
-
-    assert response["ok"] is True
-    assert response["job"]["worker"] == "worker-1"
-    assert response["job"]["status"] == "running"
-
-
-def test_controller_uses_current_spark_model_for_paired_delegate(monkeypatch) -> None:
-    monkeypatch.setattr(orch, "CodexSession", FakeSession)
-    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
-    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
-    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
-
-    controller = orch.MultiShellController()
-
-    spark = controller.spark_workers["worker-1"]
-    assert spark.model == SPARK_MODEL
-    assert f"using {SPARK_MODEL} at xhigh reasoning" in spark.initial_prompt
-
-
 def test_controller_start_starts_all_workers_when_logins_are_present(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
     monkeypatch.setattr(orch, "missing_codex_logins", lambda: [])
@@ -506,7 +419,6 @@ def test_controller_start_starts_all_workers_when_logins_are_present(monkeypatch
 def test_controller_start_fails_when_any_agent_login_is_missing(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
     monkeypatch.setattr(orch, "missing_codex_logins", lambda: ["worker-2"])
@@ -525,7 +437,6 @@ def test_controller_start_fails_when_any_agent_login_is_missing(monkeypatch) -> 
 def test_monitor_items_use_compact_swarm_labels(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -535,19 +446,16 @@ def test_monitor_items_use_compact_swarm_labels(monkeypatch) -> None:
     assert labels[0] == "manager"
     assert "codex-1" in labels
     assert "claude-1" in labels
-    assert "spark-1" in labels
     assert "gptpro-1" in labels
     assert "gptpro-2" in labels
     assert "deepthink" in labels
     assert "codex-2" not in labels
     assert "claude-2" not in labels
-    assert "spark-2" not in labels
 
 
 def test_worker_slots_materialize_only_when_used(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -557,7 +465,6 @@ def test_worker_slots_materialize_only_when_used(monkeypatch) -> None:
     assert "claude-worker-1" in controller.workers
     assert "worker-2" not in controller.workers
     assert "claude-worker-2" not in controller.workers
-    assert "worker-2" not in controller.spark_workers
 
     response = controller.handle_control_request(
         {
@@ -575,14 +482,12 @@ def test_worker_slots_materialize_only_when_used(monkeypatch) -> None:
     assert response["ok"] is True
     assert "worker-2" in controller.workers
     assert "worker-2" in controller.codex_workers
-    assert "worker-2" in controller.spark_workers
     assert controller.codex_workers["worker-2"].restarted_calls[-1][0] == "/tmp/repo-b"
 
 
 def test_session_rows_hide_last_error_for_intentional_stop(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -602,7 +507,6 @@ def test_session_rows_hide_last_error_for_intentional_stop(monkeypatch) -> None:
 def test_handle_transport_closed_worker_event_surfaces_error_and_supervision_prompt(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -629,7 +533,6 @@ def test_handle_transport_closed_worker_event_surfaces_error_and_supervision_pro
 def test_build_worker_event_prompt_ignores_non_terminal_progress_messages(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -647,7 +550,6 @@ def test_build_worker_event_prompt_ignores_non_terminal_progress_messages(monkey
 def test_build_worker_event_prompt_keeps_terminal_worker_messages(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -666,7 +568,6 @@ def test_build_worker_event_prompt_keeps_terminal_worker_messages(monkeypatch) -
 def test_build_worker_event_prompt_keeps_structured_implementer_verification_reports(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -696,7 +597,6 @@ def test_build_worker_event_prompt_keeps_structured_implementer_verification_rep
 def test_build_worker_event_prompt_keeps_structured_verifier_success_reports(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -725,7 +625,6 @@ def test_build_worker_event_prompt_keeps_structured_verifier_success_reports(mon
 def test_handle_worker_event_interrupts_stale_manager_turn_for_significant_completion(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -756,7 +655,6 @@ def test_handle_worker_event_interrupts_stale_manager_turn_for_significant_compl
 def test_handle_web_reasoner_event_marks_weak_capture_as_warning_and_passes_context(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -802,7 +700,6 @@ def test_handle_web_reasoner_event_marks_weak_capture_as_warning_and_passes_cont
 def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -826,7 +723,6 @@ def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) 
 def test_monitoring_does_not_interrupt_long_running_manager_turn(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -845,7 +741,6 @@ def test_monitoring_does_not_interrupt_long_running_manager_turn(monkeypatch) ->
 def test_manager_status_changed_error_detects_limit_from_last_error(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -869,7 +764,6 @@ def test_manager_status_changed_error_detects_limit_from_last_error(monkeypatch)
 def test_health_monitor_failsover_manager_after_usage_limit_error(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
     monkeypatch.setattr(orch, "codex_account_specs", _codex_accounts_for_failover)
@@ -914,7 +808,6 @@ def test_health_monitor_failsover_manager_after_usage_limit_error(monkeypatch) -
 def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -944,7 +837,6 @@ def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:
 def test_transport_closed_idle_codex_worker_auto_restarts_and_updates_failure_context(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 
@@ -982,7 +874,6 @@ def test_transport_closed_idle_codex_worker_auto_restarts_and_updates_failure_co
 def test_repeated_transport_closed_suppresses_auto_restart_and_flags_manual_recovery(monkeypatch) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
-    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
 

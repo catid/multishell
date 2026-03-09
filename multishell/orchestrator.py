@@ -10,8 +10,6 @@ from .codex_session import CodexSession, SessionEvent, TranscriptEntry
 from .config import (
     GEMINI_ACCOUNT_SPECS,
     MANAGER_SPEC,
-    SPARK_MODEL,
-    SPARK_REASONING_EFFORT,
     AgentSpec,
     ProviderAccountSpec,
     app_root,
@@ -21,12 +19,10 @@ from .config import (
     runtime_claude_worker_specs,
     runtime_codex_worker_specs,
     socket_path,
-    spark_agent_name,
     workspace_root,
 )
 from .control import ControlServer
 from .homes import missing_claude_logins, missing_codex_logins
-from .spark_pool import SparkCoordinator, SparkError
 from .web_reasoners import WebReasonerError, WebReasonerEvent, WebReasonerManager
 
 
@@ -430,11 +426,6 @@ def _worker_prompt(
         base.extend(
             [
                 "You are one persistent Codex worker session in a coordinated swarm. Work directly in the assigned repository when given a task.",
-                "Before drafting substantial code or design work, use `gpt_5_3_spark` to get a first draft, alternative angle, or quick review on the same account.",
-                "Use `gpt_5_3_spark` with `action=start`, keep inspecting the repo while it runs, then use `action=status` or `action=list` to collect the result.",
-                "If spark reports OUT_OF_TOKENS, says it is out of tokens, or the tool fails, continue the work yourself without blocking.",
-                "Do not trust spark to modify existing files. Treat spark output as draft or review material only. Review any proposed edits before writing them.",
-                "Spark may create new scratch files only when explicitly asked; it should not be trusted to edit existing files directly.",
                 "Be concrete, state what you changed, and note blockers quickly.",
                 "If you are part of a top-k exploration, lean into your assigned angle instead of averaging toward the other workers.",
                 "Do not silently claim coverage outside your assigned angle. Ask for complementary peer review when security, performance, UX, or integration risk matters.",
@@ -442,23 +433,6 @@ def _worker_prompt(
             ]
         )
     return "\n".join(base)
-
-
-def _spark_prompt(worker_name: str, worker_personality: str, *, persona_name: str) -> str:
-    return f"""You are {spark_agent_name(worker_name)}, the paired draft delegate for {worker_name}.
-
-Session persona: {persona_name}.
-You are a persistent Codex session using {SPARK_MODEL} at xhigh reasoning.
-Primary job: produce first drafts, alternative approaches, review notes, candidate code, and scratch artifacts for {worker_name}.
-Base specialty of the paired owner worker: {worker_personality}
-You are not the final authority. Your output will be reviewed by {worker_name} before it reaches disk.
-
-Rules:
-- Do not edit existing files.
-- If asked to write something, prefer inline draft content or new scratch files only.
-- If the task exceeds your token or context budget, reply starting with `OUT_OF_TOKENS:` and stop.
-- Keep answers direct, practical, and draft-oriented.
-"""
 
 
 class MultiShellController:
@@ -506,7 +480,6 @@ class MultiShellController:
         self.workers: dict[str, ManagedSession] = {}
         self.codex_workers: dict[str, CodexSession] = {}
         self.claude_workers: dict[str, ClaudeSession] = {}
-        self.spark_workers: dict[str, CodexSession] = {}
         self._codex_worker_names = {spec.name for spec in self._all_codex_worker_specs}
         self._claude_worker_names = {spec.name for spec in self._all_claude_worker_specs}
         self._started_controller = False
@@ -519,7 +492,6 @@ class MultiShellController:
         if self._all_claude_worker_specs:
             self._materialize_worker(self._all_claude_worker_specs[0].name)
 
-        self.spark_pool = SparkCoordinator(self.spark_workers, callback=self._handle_spark_update)
         self.web_reasoners = WebReasonerManager(callback=self._handle_web_reasoner_event)
         self.messages: list[UiMessage] = []
         self._lock = threading.Lock()
@@ -533,9 +505,6 @@ class MultiShellController:
         self._last_user_message = ""
         self._last_manager_interrupt_turn: str | None = None
         self._shutting_down = False
-
-        for spark in self.spark_workers.values():
-            self._lifecycle.setdefault(spark.spec.name, SessionLifecycleMetadata())
 
     def _codex_worker_spec(self, worker_name: str) -> AgentSpec | None:
         for spec in self._all_codex_worker_specs:
@@ -577,36 +546,9 @@ class MultiShellController:
             )
             self.codex_workers[codex_spec.name] = session
             self.workers[codex_spec.name] = session
-
-            spark_spec = AgentSpec(
-                name=spark_agent_name(codex_spec.name),
-                account_email=codex_spec.account_email,
-                role="spark",
-                personality=f"Draft delegate paired with {codex_spec.name}",
-                accent_color=codex_spec.accent_color,
-                account_key=codex_spec.account_key,
-            )
-            self.spark_workers[codex_spec.name] = CodexSession(
-                spark_spec,
-                _spark_prompt(
-                    codex_spec.name,
-                    codex_spec.personality,
-                    persona_name=f"{self._default_persona_label(codex_spec.name)} Draft Partner",
-                ),
-                working_dir=workspace_root(),
-                persona_label=f"{self._default_persona_label(codex_spec.name)} Spark",
-                event_callback=self._handle_spark_session_event,
-                turn_timeout_seconds=900,
-                model=SPARK_MODEL,
-                reasoning_effort=SPARK_REASONING_EFFORT,
-                auth_source_agent=initial_codex_account.account_key if initial_codex_account is not None else codex_spec.name,
-                account_email=codex_spec.account_email,
-            )
             self._lifecycle[codex_spec.name] = SessionLifecycleMetadata()
-            self._lifecycle[spark_spec.name] = SessionLifecycleMetadata()
             if self._started_controller and not self._shutting_down:
                 session.start(start_session=False)
-                self.spark_workers[codex_spec.name].start(start_session=False)
             return session
 
         claude_spec = self._claude_worker_spec(worker_name)
@@ -649,8 +591,6 @@ class MultiShellController:
             worker.start(start_session=False)
         for worker in self.claude_workers.values():
             worker.start(start_session=False)
-        for spark in self.spark_workers.values():
-            spark.start(start_session=False)
         self._push_message("system", "multishell started", level="info")
         self._monitor_thread.start()
 
@@ -660,11 +600,8 @@ class MultiShellController:
         self._stop.set()
         self._control_server.stop()
         self.web_reasoners.stop()
-        self.spark_pool.stop()
         for worker in self.workers.values():
             worker.stop()
-        for spark in self.spark_workers.values():
-            spark.stop()
         self.manager.stop()
         if self._monitor_thread.is_alive():
             self._monitor_thread.join(timeout=2)
@@ -678,12 +615,8 @@ class MultiShellController:
             return {"ok": False, "error": "arguments must be an object"}
 
         try:
-            if tool == "gpt_5_3_spark":
-                if bridge_role != "worker" or not bridge_agent:
-                    return {"ok": False, "error": "spark jobs can only be started from a worker bridge"}
-                return self._handle_spark_request(bridge_agent, arguments)
             return self._handle_manager_request(tool, arguments)
-        except (SparkError, WebReasonerError, KeyError, ValueError) as exc:
+        except (WebReasonerError, KeyError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
 
     def _lookup_worker(self, worker_name: str) -> ManagedSession | None:
@@ -733,13 +666,6 @@ class MultiShellController:
             system_prompt, persona_label = self._resolve_worker_session_prompt(worker_name, arguments)
             worker.start_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
             self._mark_manual_recovery(worker_name, action="session_started")
-            self._sync_paired_spark_session(
-                worker_name,
-                cwd=cwd,
-                persona_label=persona_label,
-                task_context=str(arguments.get("task_context", "")).strip() or None,
-                action="start",
-            )
             self._push_message(
                 "manager",
                 f"started {worker_name} session in {worker.overview()['cwd']} as {worker.overview()['persona_label']} "
@@ -754,7 +680,6 @@ class MultiShellController:
                 return {"ok": False, "error": f"unknown worker: {worker_name}"}
             worker.stop_session(clear_pending=True)
             self._mark_session_stopped(worker_name)
-            self._sync_paired_spark_session(worker_name, action="stop")
             self._release_worker_binding(worker_name)
             self._push_message("manager", f"stopped {worker_name} session")
             return {"ok": True, "message": f"stopped {worker_name}"}
@@ -769,13 +694,6 @@ class MultiShellController:
             system_prompt, persona_label = self._resolve_worker_session_prompt(worker_name, arguments)
             worker.restart_session(cwd, system_prompt=system_prompt, persona_label=persona_label)
             self._mark_manual_recovery(worker_name, action="manual_restart")
-            self._sync_paired_spark_session(
-                worker_name,
-                cwd=cwd,
-                persona_label=persona_label,
-                task_context=str(arguments.get("task_context", "")).strip() or None,
-                action="restart",
-            )
             self._push_message(
                 "manager",
                 f"restarted {worker_name} session in {worker.overview()['cwd']} as {worker.overview()['persona_label']} "
@@ -806,38 +724,6 @@ class MultiShellController:
             return self._handle_web_reasoner_request("gemini_deepthink", arguments)
 
         return {"ok": False, "error": f"unknown tool: {tool}"}
-
-    def _handle_spark_request(self, owner_worker: str, arguments: dict[str, object]) -> dict[str, object]:
-        if owner_worker not in self.codex_workers:
-            return {"ok": False, "error": f"{owner_worker} does not have a paired spark delegate"}
-        action = str(arguments.get("action", "")).strip().lower()
-        if action == "start":
-            prompt = str(arguments.get("prompt", "")).strip()
-            label = str(arguments.get("label", "")).strip() or None
-            cwd = str(arguments.get("cwd", "")).strip() or None
-            if not prompt:
-                return {"ok": False, "error": "prompt is required for action=start"}
-            job = self.spark_pool.start_job(owner_worker, prompt, cwd=cwd, label=label)
-            return {"ok": True, "job": job}
-        if action == "status":
-            job_id = str(arguments.get("job_id", "")).strip()
-            if not job_id:
-                return {"ok": False, "error": "job_id is required for action=status"}
-            job = self.spark_pool.job_snapshot(job_id)
-            if job is None or str(job["worker"]) != owner_worker:
-                return {"ok": False, "error": f"unknown spark job: {job_id}"}
-            return {"ok": True, "job": job}
-        if action == "list":
-            return {"ok": True, "jobs": self.spark_pool.list_jobs(owner_worker)}
-        if action == "cancel":
-            job_id = str(arguments.get("job_id", "")).strip()
-            if not job_id:
-                return {"ok": False, "error": "job_id is required for action=cancel"}
-            job = self.spark_pool.job_snapshot(job_id)
-            if job is None or str(job["worker"]) != owner_worker:
-                return {"ok": False, "error": f"unknown spark job: {job_id}"}
-            return {"ok": True, "job": self.spark_pool.cancel_job(job_id)}
-        return {"ok": False, "error": "action must be one of: start, status, list, cancel"}
 
     def _handle_web_reasoner_request(self, provider: str, arguments: dict[str, object]) -> dict[str, object]:
         action = str(arguments.get("action", "")).strip().lower()
@@ -909,8 +795,6 @@ class MultiShellController:
             return
         worker = self.workers[session_name]
         worker.bind_account(account.account_key, account.account_email)
-        if session_name in self.spark_workers:
-            self.spark_workers[session_name].bind_account(account.account_key, account.account_email)
 
     def _active_incomplete_work(self) -> tuple[list[str], list[str]]:
         active_workers: list[str] = []
@@ -986,10 +870,6 @@ class MultiShellController:
         for spec in self._materialized_claude_specs():
             worker_index = spec.name.split("-")[-1]
             items.append(self._monitor_from_session(f"claude-{worker_index}", self.claude_workers[spec.name].overview()))
-
-        for spec in self._materialized_codex_specs():
-            worker_index = spec.name.split("-")[-1]
-            items.append(self._monitor_from_session(f"spark-{worker_index}", self.spark_workers[spec.name].overview()))
 
         gptpro_jobs = self.web_reasoners.list_jobs(provider="chatgpt_pro")
         items.append(self._monitor_from_reasoner("gptpro-1", gptpro_jobs[0] if len(gptpro_jobs) >= 1 else None, accent_color=1))
@@ -1332,39 +1212,6 @@ class MultiShellController:
             persona_name,
         )
 
-    def _sync_paired_spark_session(
-        self,
-        worker_name: str,
-        *,
-        cwd: str | None = None,
-        persona_label: str | None = None,
-        task_context: str | None = None,
-        action: str,
-    ) -> None:
-        if worker_name not in self.spark_workers:
-            return
-        self.spark_pool.cancel_active_for_worker(worker_name)
-        spark = self.spark_workers[worker_name]
-        worker_overview = self.codex_workers[worker_name].overview()
-        account_key = str(worker_overview.get("account_key") or "").strip()
-        account_email = str(worker_overview.get("account_email") or "").strip() or None
-        if account_key:
-            spark.bind_account(account_key, account_email)
-        spark_prompt = _spark_prompt(
-            worker_name,
-            self.codex_workers[worker_name].spec.personality,
-            persona_name=f"{persona_label or self._default_persona_label(worker_name)} Draft Partner",
-        )
-        if task_context:
-            spark_prompt = spark_prompt + f"\nCurrent owner task context: {task_context}\n"
-        if action == "start":
-            if spark.overview()["status"] == "stopped":
-                spark.start_session(cwd, system_prompt=spark_prompt, persona_label=f"{persona_label or self._default_persona_label(worker_name)} Spark")
-        elif action == "restart":
-            spark.restart_session(cwd, system_prompt=spark_prompt, persona_label=f"{persona_label or self._default_persona_label(worker_name)} Spark")
-        elif action == "stop":
-            spark.stop_session(clear_pending=True)
-
     def _handle_manager_event(self, event: SessionEvent) -> None:
         if event.kind in {"turn_failed", "transport_closed", "auth_error", "mcp_failed", "error"}:
             self._record_session_failure(event)
@@ -1428,13 +1275,6 @@ class MultiShellController:
             if original_startup_prompt is not None:
                 session.startup_prompt = original_startup_prompt
         session.queue_priority_prompt(handoff, source="system", cwd=cwd)
-        if event.agent in self.codex_workers:
-            self._sync_paired_spark_session(
-                event.agent,
-                cwd=cwd,
-                persona_label=persona_label,
-                action="restart",
-            )
         meta = self._lifecycle.get(event.agent)
         if meta is not None:
             meta.note_recovery(action="account_failover", now=time.time())
@@ -1580,18 +1420,6 @@ class MultiShellController:
         if prompt:
             self._maybe_interrupt_manager_for_worker_event(event)
             self.manager.enqueue(prompt, source="system")
-
-    def _handle_spark_session_event(self, event: SessionEvent) -> None:
-        # Spark jobs are polled via SparkCoordinator; keep the event hook in place for future deeper integration.
-        return None
-
-    def _handle_spark_update(self, kind: str, snapshot: dict[str, object]) -> None:
-        worker = str(snapshot["worker"])
-        job_id = str(snapshot["job_id"])
-        if kind == "failed":
-            self._push_message("system", f"{worker} spark job {job_id} failed: {snapshot.get('error')}", level="warn")
-        elif kind == "completed" and bool(snapshot.get("out_of_tokens")):
-            self._push_message("system", f"{worker} spark job {job_id} reported token exhaustion", level="warn")
 
     def _handle_web_reasoner_event(self, event: WebReasonerEvent) -> None:
         snapshot = event.data
