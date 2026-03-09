@@ -8,6 +8,7 @@ import pytest
 
 from multishell.web_reasoners import (
     CHATGPT_LOGIN_URL,
+    _extract_last_assistant_message,
     WebReasonerEvent,
     WebNavigatorError,
     WebReasonerManager,
@@ -18,6 +19,7 @@ from multishell.web_reasoners import (
     _ensure_google_logged_in,
     _preferred_openai_flow_page,
     _wait_for_chatgpt_login_completion,
+    _wait_for_stable_response,
     _web_profile_name,
     _submit_prompt,
 )
@@ -213,6 +215,11 @@ class _FakePromptPage:
         return None
 
 
+class _FakeStablePage:
+    def wait_for_timeout(self, _timeout_ms: int) -> None:
+        return None
+
+
 def test_google_password_screen_prefers_password_input_over_account_picker(monkeypatch: pytest.MonkeyPatch) -> None:
     recorded: list[tuple[str, tuple[str, ...]]] = []
     page = _FakePage("https://accounts.google.com/v3/signin/challenge/pwd")
@@ -375,6 +382,136 @@ def test_submit_prompt_clicks_send_when_enter_leaves_text_in_composer() -> None:
     assert page.composer_clicked == 1
     assert page.send_clicked == 1
     assert page.composer_value == ""
+
+
+def test_extract_last_assistant_message_skips_page_fallback_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _NoMessageLocator:
+        def __init__(self, selector: str) -> None:
+            self.selector = selector
+            self.first = self
+
+        def count(self) -> int:
+            return 1 if self.selector == "main" else 0
+
+        def nth(self, index: int) -> "_NoMessageLocator":
+            return self
+
+        def inner_text(self, timeout: int | None = None) -> str:
+            if self.selector == "main":
+                return "Gemini UI chrome"
+            return ""
+
+    class _NoMessagePage:
+        def locator(self, selector: str) -> _NoMessageLocator:
+            return _NoMessageLocator(selector)
+
+    monkeypatch.setattr("multishell.web_reasoners._body_text", lambda _page: "Gemini body fallback")
+
+    capture = _extract_last_assistant_message(_NoMessagePage(), allow_page_fallback=False)
+
+    assert capture.text == ""
+    assert capture.source == "none"
+
+
+def test_wait_for_stable_response_rejects_page_level_capture_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakeStablePage()
+    capture = SimpleNamespace(text="Gemini UI chrome", source="main_fallback")
+    clock = {"value": 0.0}
+
+    monkeypatch.setattr("multishell.web_reasoners._extract_last_assistant_message", lambda *_args, **_kwargs: capture)
+    monkeypatch.setattr("multishell.web_reasoners._has_visible", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("multishell.web_reasoners.time.time", lambda: clock.__setitem__("value", clock["value"] + 0.4) or clock["value"])
+
+    with pytest.raises(Exception, match="page-level UI text was visible via main_fallback"):
+        _wait_for_stable_response(
+            page,
+            Event(),
+            timeout_seconds=1,
+            previous_text="",
+            prompt_text="Reply with exactly OK.",
+            stop_selectors=["button:has-text('Stop')"],
+            allow_page_fallback=False,
+            provider_label="Gemini",
+        )
+
+
+def test_wait_for_stable_response_marks_page_level_capture_as_weak_when_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    page = _FakeStablePage()
+    capture = SimpleNamespace(text="Answer text", source="main_fallback")
+
+    monkeypatch.setattr("multishell.web_reasoners._extract_last_assistant_message", lambda *_args, **_kwargs: capture)
+    monkeypatch.setattr("multishell.web_reasoners._has_visible", lambda *_args, **_kwargs: False)
+
+    result = _wait_for_stable_response(
+        page,
+        Event(),
+        timeout_seconds=5,
+        previous_text="",
+        prompt_text="Reply with exactly OK.",
+        stop_selectors=["button:has-text('Stop')"],
+        allow_page_fallback=True,
+        provider_label="ChatGPT",
+    )
+
+    assert result.text == "Answer text"
+    assert result.capture_source == "main_fallback"
+    assert result.quality == "weak"
+    assert "page-level text may include UI chrome" in result.validation_note
+
+
+@pytest.mark.parametrize(
+    ("provider", "prepare_attr", "resolve_attr", "run_attr", "wait_attr"),
+    [
+        (
+            "chatgpt_pro",
+            "_prepare_chatgpt_pro_surface",
+            "_resolve_openai_account",
+            "_run_chatgpt_pro",
+            "_wait_for_chatgpt_response",
+        ),
+        (
+            "gemini_deepthink",
+            "_prepare_gemini_deepthink_surface",
+            "_resolve_gemini_account",
+            "_run_gemini_deepthink",
+            "_wait_for_gemini_response",
+        ),
+    ],
+)
+def test_provider_run_uses_baseline_capture_text(
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    prepare_attr: str,
+    resolve_attr: str,
+    run_attr: str,
+    wait_attr: str,
+) -> None:
+    manager = WebReasonerManager()
+    page = _FakePage("https://example.com/")
+    job = SimpleNamespace(id="job-1", account_agent="manager", prompt="Reply with exactly OK.", timeout_seconds=30)
+    observed: dict[str, object] = {}
+
+    monkeypatch.setattr(manager, "_debug_target", lambda _job_id: "debug-target")
+    monkeypatch.setattr(f"multishell.web_reasoners.{resolve_attr}", lambda _agent: ("user@example.com", "secret"))
+    monkeypatch.setattr(f"multishell.web_reasoners.{prepare_attr}", lambda page_obj, **_kwargs: page_obj)
+    monkeypatch.setattr(
+        "multishell.web_reasoners._extract_last_assistant_message",
+        lambda _page, **_kwargs: SimpleNamespace(text="baseline text", source="[data-testid='assistant-turn']"),
+    )
+    monkeypatch.setattr("multishell.web_reasoners._submit_prompt", lambda *_args, **_kwargs: None)
+
+    def fake_wait(page_obj, cancel_flag, *, timeout_seconds: int, previous_text: str, prompt_text: str):
+        observed["previous_text"] = previous_text
+        observed["prompt_text"] = prompt_text
+        return SimpleNamespace(text="OK", capture_source="main article", quality="ok", validation_note="")
+
+    monkeypatch.setattr(f"multishell.web_reasoners.{wait_attr}", fake_wait)
+
+    result = getattr(manager, run_attr)(page, job, Event())
+
+    assert observed["previous_text"] == "baseline text"
+    assert observed["prompt_text"] == "Reply with exactly OK."
+    assert result.text == "OK"
 
 
 def test_prepare_chatgpt_pro_surface_uses_web_navigator(monkeypatch: pytest.MonkeyPatch) -> None:

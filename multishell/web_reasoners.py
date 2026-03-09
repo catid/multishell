@@ -41,6 +41,20 @@ class _JobCanceled(WebReasonerError):
 
 
 @dataclass(frozen=True)
+class _CapturedResponse:
+    text: str = ""
+    source: str = "none"
+
+
+@dataclass(frozen=True)
+class _WebReasonerResult:
+    text: str
+    capture_source: str = "unknown"
+    quality: str = "ok"
+    validation_note: str = ""
+
+
+@dataclass(frozen=True)
 class WebReasonerEvent:
     ts: float
     kind: str
@@ -65,6 +79,9 @@ class WebReasonerJob:
     started_at: float | None = None
     finished_at: float | None = None
     result: str = ""
+    result_capture_source: str = ""
+    result_quality: str = ""
+    result_validation_note: str = ""
     error: str | None = None
     cancel_requested: bool = False
 
@@ -87,6 +104,9 @@ class WebReasonerJob:
             "cancel_requested": self.cancel_requested,
             "result": self.result,
             "result_text": self.result,
+            "result_capture_source": self.result_capture_source,
+            "result_quality": self.result_quality,
+            "result_validation_note": self.result_validation_note,
             "error": self.error,
         }
 
@@ -262,9 +282,10 @@ class WebReasonerManager:
                 setattr(exc, "_web_reasoner_page", page)
             raise
 
-    def _finalize_success(self, job_id: str, result: str) -> None:
+    def _finalize_success(self, job_id: str, result: _WebReasonerResult | str) -> None:
         job = None
         canceled = False
+        normalized_result = result if isinstance(result, _WebReasonerResult) else _WebReasonerResult(text=str(result))
         with self._lock:
             job = self._jobs[job_id]
             if job.cancel_requested or self._cancel_flags[job_id].is_set():
@@ -273,7 +294,10 @@ class WebReasonerManager:
                 job.error = job.error or "canceled"
             else:
                 job.status = "completed"
-                job.result = result.strip()
+                job.result = normalized_result.text.strip()
+                job.result_capture_source = normalized_result.capture_source
+                job.result_quality = normalized_result.quality
+                job.result_validation_note = normalized_result.validation_note
                 job.error = None
             job.finished_at = _now()
             job.updated_at = job.finished_at
@@ -321,7 +345,7 @@ class WebReasonerManager:
         snapshot = self.snapshot(job_id)
         return f"web-{snapshot['provider']}-{snapshot['account_agent']}-{str(snapshot['job_id'])[:8]}"
 
-    def _run_chatgpt_pro(self, page: object, job: WebReasonerJob, cancel_flag: threading.Event) -> str:
+    def _run_chatgpt_pro(self, page: object, job: WebReasonerJob, cancel_flag: threading.Event) -> _WebReasonerResult:
         email, password = _resolve_openai_account(job.account_agent)
         _check_cancel(cancel_flag)
         page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
@@ -335,7 +359,7 @@ class WebReasonerManager:
         _check_cancel(cancel_flag)
         page.goto("https://chatgpt.com/", wait_until="domcontentloaded", timeout=120000)
         page.wait_for_timeout(3000)
-        baseline = _extract_last_assistant_message(page)
+        baseline = _extract_last_assistant_message(page).text
         _submit_prompt(page, job.prompt, cancel_flag)
         return _wait_for_chatgpt_response(
             page,
@@ -345,7 +369,7 @@ class WebReasonerManager:
             prompt_text=job.prompt,
         )
 
-    def _run_gemini_deepthink(self, page: object, job: WebReasonerJob, cancel_flag: threading.Event) -> str:
+    def _run_gemini_deepthink(self, page: object, job: WebReasonerJob, cancel_flag: threading.Event) -> _WebReasonerResult:
         email, password = _resolve_gemini_account(job.account_agent)
         _check_cancel(cancel_flag)
         page.goto("https://gemini.google.com/app", wait_until="domcontentloaded", timeout=120000)
@@ -356,7 +380,7 @@ class WebReasonerManager:
             password=password,
             debug_label=self._debug_target(job.id),
         )
-        baseline = _extract_last_assistant_message(page)
+        baseline = _extract_last_assistant_message(page).text
         _submit_prompt(page, job.prompt, cancel_flag)
         return _wait_for_gemini_response(
             page,
@@ -988,7 +1012,7 @@ def _wait_for_chatgpt_response(
     timeout_seconds: int,
     previous_text: str,
     prompt_text: str,
-) -> str:
+) -> _WebReasonerResult:
     return _wait_for_stable_response(
         page,
         cancel_flag,
@@ -996,6 +1020,8 @@ def _wait_for_chatgpt_response(
         previous_text=previous_text,
         prompt_text=prompt_text,
         stop_selectors=["button:has-text('Stop')", "button[aria-label*='Stop']", "text=Stop generating"],
+        allow_page_fallback=True,
+        provider_label="ChatGPT",
     )
 
 
@@ -1006,7 +1032,7 @@ def _wait_for_gemini_response(
     timeout_seconds: int,
     previous_text: str,
     prompt_text: str,
-) -> str:
+) -> _WebReasonerResult:
     return _wait_for_stable_response(
         page,
         cancel_flag,
@@ -1014,6 +1040,8 @@ def _wait_for_gemini_response(
         previous_text=previous_text,
         prompt_text=prompt_text,
         stop_selectors=["button:has-text('Stop')", "button:has-text('Cancel')"],
+        allow_page_fallback=False,
+        provider_label="Gemini",
     )
 
 
@@ -1025,35 +1053,59 @@ def _wait_for_stable_response(
     previous_text: str,
     prompt_text: str,
     stop_selectors: list[str],
-) -> str:
+    allow_page_fallback: bool,
+    provider_label: str,
+) -> _WebReasonerResult:
     deadline = time.time() + timeout_seconds
     stable_text = ""
+    stable_source = "none"
     stable_polls = 0
     normalized_previous = previous_text.strip()
     normalized_prompt = prompt_text.strip()
+    last_rejected_reason = ""
 
     while time.time() < deadline:
         _check_cancel(cancel_flag)
         page.wait_for_timeout(2000)
-        candidate = _extract_last_assistant_message(page).strip()
+        capture = _extract_last_assistant_message(page, allow_page_fallback=allow_page_fallback)
+        candidate = capture.text.strip()
         if not candidate:
             continue
         if candidate == normalized_previous or candidate == normalized_prompt:
+            continue
+        if capture.source in {"main_fallback", "body_fallback"} and not allow_page_fallback:
+            last_rejected_reason = (
+                f"{provider_label} response capture never found an assistant turn; "
+                f"only page-level UI text was visible via {capture.source}"
+            )
             continue
 
         if candidate == stable_text:
             stable_polls += 1
         else:
             stable_text = candidate
+            stable_source = capture.source
             stable_polls = 1
 
         if stable_text and stable_polls >= 3 and not _has_visible(page, stop_selectors, timeout_ms=500):
-            return stable_text
+            validation_note = ""
+            quality = "ok"
+            if stable_source in {"main_fallback", "body_fallback"}:
+                quality = "weak"
+                validation_note = f"result was captured via {stable_source}; page-level text may include UI chrome"
+            return _WebReasonerResult(
+                text=stable_text,
+                capture_source=stable_source,
+                quality=quality,
+                validation_note=validation_note,
+            )
 
+    if last_rejected_reason:
+        raise WebReasonerError(last_rejected_reason)
     raise WebReasonerError("timed out waiting for web reasoner response")
 
 
-def _extract_last_assistant_message(page: object) -> str:
+def _extract_last_assistant_message(page: object, *, allow_page_fallback: bool = True) -> _CapturedResponse:
     selectors = [
         "[data-message-author-role='assistant']",
         "[data-testid='assistant-turn']",
@@ -1075,8 +1127,10 @@ def _extract_last_assistant_message(page: object) -> str:
             except Exception:
                 continue
             if text:
-                return text
+                return _CapturedResponse(text=text, source=selector)
+    if not allow_page_fallback:
+        return _CapturedResponse()
     try:
-        return page.locator("main").inner_text(timeout=1000).strip()
+        return _CapturedResponse(text=page.locator("main").inner_text(timeout=1000).strip(), source="main_fallback")
     except Exception:
-        return _body_text(page).strip()
+        return _CapturedResponse(text=_body_text(page).strip(), source="body_fallback")

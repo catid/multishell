@@ -199,6 +199,9 @@ class FakeWebReasonerManager:
             "timeout_seconds": timeout_seconds,
             "prompt_preview": prompt,
             "result_text": "",
+            "result_capture_source": "",
+            "result_quality": "",
+            "result_validation_note": "",
             "error": None,
         }
         self.jobs[job["job_id"]] = job
@@ -656,6 +659,52 @@ def test_handle_worker_event_interrupts_stale_manager_turn_for_significant_compl
         "interrupted manager turn turn-1 after 12.0s because "
         "worker-2 reported assistant_message: Verification complete. Final line: 104729."
     )
+
+
+def test_handle_web_reasoner_event_marks_weak_capture_as_warning_and_passes_context(monkeypatch) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "SparkCoordinator", FakeSparkCoordinator)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+
+    controller = orch.MultiShellController()
+    controller._user_message_count = 1
+    controller._last_user_message = "run a reasoner smoke test"
+
+    event = orch.WebReasonerEvent(
+        ts=0.0,
+        kind="job_completed",
+        provider="gemini_deepthink",
+        job_id="gemini-1",
+        account_agent="gemini-account-1",
+        message="gemini_deepthink job completed",
+        data={
+            "job_id": "gemini-1",
+            "provider": "gemini_deepthink",
+            "label": "smoke",
+            "result": "Gemini UI chrome",
+            "result_quality": "weak",
+            "result_capture_source": "main_fallback",
+            "result_validation_note": "result was captured via main_fallback; page-level text may include UI chrome",
+        },
+    )
+
+    controller._handle_web_reasoner_event(event)
+
+    notice = controller.recent_messages(1)[-1]
+    assert notice.source == "system"
+    assert notice.level == "warn"
+    assert notice.text == (
+        "gemini_deepthink: completed smoke "
+        "(result was captured via main_fallback; page-level text may include UI chrome)"
+    )
+
+    prompt, source, _cwd = controller.manager.enqueued[-1]
+    assert source == "system"
+    assert "Result quality: weak" in prompt
+    assert "Capture source: main_fallback" in prompt
+    assert "describe it as an extraction/capture issue" in prompt
 
 
 def test_handle_worker_event_does_not_interrupt_fresh_manager_turn(monkeypatch) -> None:

@@ -1099,7 +1099,14 @@ class MultiShellController:
             self._push_message("system", f"{provider}: started {label}", level="info")
             return
         if event.kind == "job_completed":
-            self._push_message("system", f"{provider}: completed {label}", level="info")
+            result_quality = str(snapshot.get("result_quality") or "ok")
+            capture_source = str(snapshot.get("result_capture_source") or "unknown")
+            validation_note = str(snapshot.get("result_validation_note") or "")
+            if result_quality == "weak":
+                detail = validation_note or f"low-confidence capture via {capture_source}"
+                self._push_message("system", f"{provider}: completed {label} ({detail})", level="warn")
+            else:
+                self._push_message("system", f"{provider}: completed {label}", level="info")
             result = str(snapshot.get("result") or "")
             if self._user_message_count > 0 and not self._shutting_down:
                 self.manager.enqueue(
@@ -1108,8 +1115,13 @@ class MultiShellController:
                         f"Latest user request: {self._last_user_message}\n"
                         f"Provider: {provider}\n"
                         f"Label: {label}\n"
+                        f"Result quality: {result_quality}\n"
+                        f"Capture source: {capture_source}\n"
+                        f"Validation note: {validation_note or '<none>'}\n"
                         f"Result:\n{result}\n\n"
-                        "Decide whether to revise delegation, restart workers, or send a better user-facing update. Use tools only.\n\n"
+                        "Decide whether to revise delegation, restart workers, or send a better user-facing update. "
+                        "If result quality is weak or the capture source is page-level, describe it as an extraction/capture issue rather than claiming the provider is broken. "
+                        "Use tools only.\n\n"
                         f"{self._overview_text()}"
                     ),
                     source="system",
@@ -1123,7 +1135,9 @@ class MultiShellController:
                     f"Latest user request: {self._last_user_message}\n"
                     f"Provider: {provider}\n"
                     f"Error: {event.message}\n\n"
-                    "React only if this changes delegation or user-visible status. Use tools only.\n\n"
+                    "React only if this changes delegation or user-visible status. "
+                    "If the error points to response extraction or page-level UI capture, describe it as a capture failure rather than as a provider malfunction. "
+                    "Use tools only.\n\n"
                     f"{self._overview_text()}"
                 ),
                 source="system",
