@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -168,6 +170,10 @@ def _codex_accounts_for_failover() -> list[orch.ProviderAccountSpec]:
             accent_color=3,
         ),
     ]
+
+
+def _account_order_path(tmp_path: Path) -> Path:
+    return tmp_path / ".multishell" / "orchestrator-account-order.json"
 
 
 class FakeControlServer:
@@ -761,12 +767,13 @@ def test_manager_status_changed_error_detects_limit_from_last_error(monkeypatch)
     assert kind == "token_limit"
 
 
-def test_health_monitor_failsover_manager_after_usage_limit_error(monkeypatch) -> None:
+def test_health_monitor_failsover_manager_after_usage_limit_error(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(orch, "CodexSession", FakeSession)
     monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
     monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
     monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
     monkeypatch.setattr(orch, "codex_account_specs", _codex_accounts_for_failover)
+    monkeypatch.setattr(orch, "state_root", lambda: tmp_path / ".multishell")
 
     controller = orch.MultiShellController()
 
@@ -803,6 +810,92 @@ def test_health_monitor_failsover_manager_after_usage_limit_error(monkeypatch) -
         for message in messages
     )
     assert all("manager entered error state" not in message.text for message in messages)
+
+    assert json.loads(_account_order_path(tmp_path).read_text(encoding="utf-8")) == {"openai": ["account-2", "account-1"]}
+
+    restarted = orch.MultiShellController()
+    replacement = restarted._codex_accounts.assigned_spec("manager")
+    assert replacement is not None
+    assert replacement.account_key == "account-2"
+
+
+def test_context_limit_failover_does_not_persist_account_reordering(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+    monkeypatch.setattr(orch, "codex_account_specs", _codex_accounts_for_failover)
+    monkeypatch.setattr(orch, "state_root", lambda: tmp_path / ".multishell")
+
+    controller = orch.MultiShellController()
+
+    changed = controller._maybe_failover_account(
+        SessionEvent(
+            ts=0.0,
+            agent="manager",
+            kind="assistant_message",
+            message="context limit reached while continuing the task",
+        )
+    )
+
+    assert changed is True
+    replacement = controller._codex_accounts.assigned_spec("manager")
+    assert replacement is not None
+    assert replacement.account_key == "account-2"
+    assert not _account_order_path(tmp_path).exists()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Google requires manual verification and cannot be automated here: Verify it's you",
+        "Google rejected the browser session as not secure",
+    ],
+)
+def test_google_auth_failover_excludes_manual_verification_and_not_secure_from_persistent_reordering(
+    monkeypatch,
+    tmp_path,
+    message: str,
+) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+    monkeypatch.setattr(orch, "codex_account_specs", _codex_accounts_for_failover)
+    monkeypatch.setattr(orch, "state_root", lambda: tmp_path / ".multishell")
+
+    controller = orch.MultiShellController()
+
+    changed = controller._maybe_failover_account(SessionEvent(ts=0.0, agent="manager", kind="auth_error", message=message))
+
+    assert changed is True
+    replacement = controller._codex_accounts.assigned_spec("manager")
+    assert replacement is not None
+    assert replacement.account_key == "account-2"
+    assert not _account_order_path(tmp_path).exists()
+
+
+def test_google_auth_failover_persists_account_reordering_for_rejected_credentials(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(orch, "CodexSession", FakeSession)
+    monkeypatch.setattr(orch, "ClaudeSession", FakeSession)
+    monkeypatch.setattr(orch, "WebReasonerManager", FakeWebReasonerManager)
+    monkeypatch.setattr(orch, "ControlServer", FakeControlServer)
+    monkeypatch.setattr(orch, "codex_account_specs", _codex_accounts_for_failover)
+    monkeypatch.setattr(orch, "state_root", lambda: tmp_path / ".multishell")
+
+    controller = orch.MultiShellController()
+
+    changed = controller._maybe_failover_account(
+        SessionEvent(
+            ts=0.0,
+            agent="manager",
+            kind="auth_error",
+            message="Google rejected the configured password or requested extra verification: Wrong password",
+        )
+    )
+
+    assert changed is True
+    assert json.loads(_account_order_path(tmp_path).read_text(encoding="utf-8")) == {"openai": ["account-2", "account-1"]}
 
 
 def test_handle_worker_event_logs_interrupted_turn_reason(monkeypatch) -> None:

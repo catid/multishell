@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from .claude_session import ClaudeSession
 from .codex_session import CodexSession, SessionEvent, TranscriptEntry
@@ -16,6 +18,7 @@ from .config import (
     claude_account_specs,
     codex_account_specs,
     manager_workspace_root,
+    state_root,
     runtime_claude_worker_specs,
     runtime_codex_worker_specs,
     socket_path,
@@ -36,6 +39,39 @@ _CLAUDE_ARCHETYPE_ROTATION = (
     "claude-worker-4",
     "claude-worker-5",
 )
+_ACCOUNT_SELECTION_STATE_FILE = "orchestrator-account-order.json"
+_ACCOUNT_SELECTION_STATE_LOCK = threading.RLock()
+
+
+def _account_selection_state_path() -> Path:
+    return state_root() / _ACCOUNT_SELECTION_STATE_FILE
+
+
+def _load_account_selection_state() -> dict[str, list[str]]:
+    path = _account_selection_state_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    normalized: dict[str, list[str]] = {}
+    for key, value in payload.items():
+        if not isinstance(key, str) or not isinstance(value, list):
+            continue
+        normalized[key] = [item for item in value if isinstance(item, str)]
+    return normalized
+
+
+def _store_account_selection_order(state_key: str, ordered_keys: list[str]) -> None:
+    path = _account_selection_state_path()
+    with _ACCOUNT_SELECTION_STATE_LOCK:
+        payload = _load_account_selection_state()
+        payload[state_key] = list(ordered_keys)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def _bridge_command(role: str, agent: str) -> list[str]:
@@ -200,11 +236,42 @@ class ProviderAccountState:
 
 class ProviderAccountPool:
     def __init__(self, accounts: list[ProviderAccountSpec], *, cooldown_seconds: float) -> None:
-        self._accounts = list(accounts)
-        self._states = {spec.account_key: ProviderAccountState(spec=spec) for spec in accounts}
+        self._state_key = self._selection_state_key(accounts)
+        self._accounts = self._ordered_accounts(accounts)
+        self._states = {spec.account_key: ProviderAccountState(spec=spec) for spec in self._accounts}
         self._bindings: dict[str, str] = {}
         self._cooldown_seconds = cooldown_seconds
         self._lock = threading.RLock()
+        self._refresh_order_index()
+
+    @staticmethod
+    def _selection_state_key(accounts: list[ProviderAccountSpec]) -> str:
+        provider = next((spec.provider.strip() for spec in accounts if spec.provider.strip()), "")
+        return provider or "accounts"
+
+    def _ordered_accounts(self, accounts: list[ProviderAccountSpec]) -> list[ProviderAccountSpec]:
+        ordered = list(accounts)
+        if not ordered:
+            return ordered
+        persisted = _load_account_selection_state().get(self._state_key, [])
+        if not persisted:
+            return ordered
+        by_key = {spec.account_key: spec for spec in ordered}
+        arranged: list[ProviderAccountSpec] = []
+        for account_key in persisted:
+            spec = by_key.pop(account_key, None)
+            if spec is not None:
+                arranged.append(spec)
+        arranged.extend(ordered_spec for ordered_spec in ordered if ordered_spec.account_key in by_key)
+        return arranged
+
+    def _refresh_order_index(self) -> None:
+        self._order_index = {spec.account_key: index for index, spec in enumerate(self._accounts)}
+
+    def _persist_order(self) -> None:
+        if not self._accounts:
+            return
+        _store_account_selection_order(self._state_key, [spec.account_key for spec in self._accounts])
 
     def assigned_spec(self, session_name: str) -> ProviderAccountSpec | None:
         with self._lock:
@@ -230,6 +297,20 @@ class ProviderAccountPool:
             state.last_exhausted_at = timestamp
             state.exhausted_until = timestamp + self._cooldown_seconds
             return state.spec
+
+    def move_to_back(self, account_key: str) -> ProviderAccountSpec | None:
+        with self._lock:
+            for index, spec in enumerate(self._accounts):
+                if spec.account_key != account_key:
+                    continue
+                if index == len(self._accounts) - 1:
+                    return spec
+                moved = self._accounts.pop(index)
+                self._accounts.append(moved)
+                self._refresh_order_index()
+                self._persist_order()
+                return moved
+        return None
 
     def bind(
         self,
@@ -279,12 +360,13 @@ class ProviderAccountPool:
         if not viable:
             return None
 
-        def sort_key(state: ProviderAccountState) -> tuple[float, int, int, str]:
+        def sort_key(state: ProviderAccountState) -> tuple[int, int, int, int, float, str]:
             exhausted = bool(state.exhausted_until and state.exhausted_until > now)
             exhausted_rank = 1 if exhausted else 0
             reserve_rank = 1 if state.spec.account_key in reserve else 0
             exhausted_until = state.exhausted_until or 0.0
-            return (exhausted_rank, reserve_rank, state.lease_count(), exhausted_until, state.spec.account_key)
+            order_rank = self._order_index.get(state.spec.account_key, len(self._order_index))
+            return (exhausted_rank, reserve_rank, state.lease_count(), order_rank, exhausted_until, state.spec.account_key)
 
         preferred = [state for state in viable if not (state.exhausted_until and state.exhausted_until > now)]
         if preferred:
@@ -456,10 +538,7 @@ class MultiShellController:
             self._claude_account_specs,
             cooldown_seconds=self._ACCOUNT_EXHAUSTION_COOLDOWN_SECONDS,
         )
-        manager_account = self._codex_accounts.bind(
-            MANAGER_SPEC.name,
-            preferred_key=self._codex_account_specs[0].account_key if self._codex_account_specs else MANAGER_SPEC.account_key,
-        )
+        manager_account = self._codex_accounts.bind(MANAGER_SPEC.name)
         self.manager = CodexSession(
             MANAGER_SPEC,
             manager_prompt(
@@ -1232,6 +1311,8 @@ class MultiShellController:
         if current is None:
             return False
         pool.mark_exhausted(event.agent, now=event.ts)
+        if self._should_deprioritize_account(limit_kind, event.message):
+            pool.move_to_back(current.account_key)
         reserve: set[str] = set()
         manager_account = self._codex_accounts.assigned_spec(self.manager.spec.name)
         if event.agent != self.manager.spec.name and manager_account is not None:
@@ -1315,7 +1396,34 @@ class MultiShellController:
             return "rate_limit"
         if any(marker in lowered for marker in ("out_of_tokens", "out of tokens", "token limit", "usage limit", "token budget")):
             return "token_limit"
+        if self._is_google_auth_failure_message(lowered):
+            return "auth_error"
         return None
+
+    def _should_deprioritize_account(self, limit_kind: str, message: str) -> bool:
+        if limit_kind in {"token_limit", "rate_limit"}:
+            return True
+        if limit_kind != "auth_error":
+            return False
+        lowered = " ".join(message.lower().split())
+        if "manual verification" in lowered or "verify it's you" in lowered:
+            return False
+        if "not secure" in lowered or "may not be secure" in lowered:
+            return False
+        return True
+
+    def _is_google_auth_failure_message(self, lowered_message: str) -> bool:
+        if "google" not in lowered_message:
+            return False
+        auth_markers = (
+            "rejected the configured email",
+            "rejected the configured password",
+            "rejected the sign-in flow",
+            "rejected the browser session",
+            "requires manual verification",
+            "device-auth hit openai rate limits",
+        )
+        return any(marker in lowered_message for marker in auth_markers)
 
     def _current_session_error_message(self, session_name: str) -> str:
         try:

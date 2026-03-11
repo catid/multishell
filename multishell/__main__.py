@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import shutil
 import subprocess
@@ -132,6 +133,66 @@ def _handle_startup_update_prompt(startup_update) -> int | None:
     print(f"installed {available_release.tag_name} into {_install_root()}")
     print("multishell updated; restart it to use the new version")
     return 0
+
+
+def _status_payload() -> dict[str, object]:
+    agents: list[dict[str, object]] = []
+
+    ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
+    manager_account = credential_source_agent(MANAGER_SPEC.name)
+    agents.append(
+        {
+            "name": MANAGER_SPEC.name,
+            "provider": "codex",
+            "email": MANAGER_SPEC.account_email,
+            "home": str(account_home(manager_account)),
+            "auth": codex_logged_in(MANAGER_SPEC.name),
+            "credential_source_agent": manager_account,
+        }
+    )
+
+    for spec in WORKER_SPECS:
+        ensure_agent_home(spec.name, mcp_bridge_command=_bridge_command("worker", spec.name))
+        account_name = credential_source_agent(spec.name)
+        agents.append(
+            {
+                "name": spec.name,
+                "provider": "codex",
+                "email": spec.account_email,
+                "home": str(account_home(account_name)),
+                "auth": codex_logged_in(spec.name),
+                "credential_source_agent": account_name,
+            }
+        )
+
+    for spec in CLAUDE_WORKER_SPECS:
+        ensure_claude_home(spec.name)
+        account_name = credential_source_agent(spec.name)
+        agents.append(
+            {
+                "name": spec.name,
+                "provider": "claude",
+                "email": spec.account_email,
+                "home": str(claude_account_home(account_name)),
+                "auth": claude_logged_in(spec.name),
+                "credential_source_agent": account_name,
+            }
+        )
+
+    authenticated_agents = sum(1 for agent in agents if agent["auth"])
+    missing = missing_email_env_vars()
+    return {
+        "state_root": str(state_root()),
+        "agents": agents,
+        "missing_email_env_vars": missing,
+        "summary": {
+            "total_agents": len(agents),
+            "authenticated_agents": authenticated_agents,
+            "unauthenticated_agents": len(agents) - authenticated_agents,
+            "codex_agents": sum(1 for agent in agents if agent["provider"] == "codex"),
+            "claude_agents": sum(1 for agent in agents if agent["provider"] == "claude"),
+        },
+    }
 
 
 def cmd_run(_: argparse.Namespace) -> int:
@@ -325,25 +386,24 @@ def cmd_uninstall(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_status(_: argparse.Namespace) -> int:
-    ensure_agent_home(MANAGER_SPEC.name, mcp_bridge_command=_bridge_command("manager", MANAGER_SPEC.name))
+def cmd_status(args: argparse.Namespace) -> int:
+    payload = _status_payload()
+    if args.json:
+        print(json.dumps(payload, indent=2))
+        return 0
+
+    for agent in payload["agents"]:
+        print(
+            f"{agent['name']}: provider={agent['provider']} email={agent['email']} "
+            f"home={agent['home']} auth={'yes' if agent['auth'] else 'no'}"
+        )
+    summary = payload["summary"]
     print(
-        f"{MANAGER_SPEC.name}: provider=codex email={MANAGER_SPEC.account_email} "
-        f"home={account_home(credential_source_agent(MANAGER_SPEC.name))} auth={'yes' if codex_logged_in(MANAGER_SPEC.name) else 'no'}"
+        "summary: "
+        f"{summary['authenticated_agents']}/{summary['total_agents']} agents authenticated "
+        f"({summary['codex_agents']} codex, {summary['claude_agents']} claude)"
     )
-    for spec in WORKER_SPECS:
-        ensure_agent_home(spec.name, mcp_bridge_command=_bridge_command("worker", spec.name))
-        print(
-            f"{spec.name}: provider=codex email={spec.account_email} "
-            f"home={account_home(credential_source_agent(spec.name))} auth={'yes' if codex_logged_in(spec.name) else 'no'}"
-        )
-    for spec in CLAUDE_WORKER_SPECS:
-        ensure_claude_home(spec.name)
-        print(
-            f"{spec.name}: provider=claude email={spec.account_email} "
-            f"home={claude_account_home(credential_source_agent(spec.name))} auth={'yes' if claude_logged_in(spec.name) else 'no'}"
-        )
-    missing = missing_email_env_vars()
+    missing = payload["missing_email_env_vars"]
     if missing:
         print(f"warning: missing email env vars in .env: {', '.join(missing)}")
     return 0
@@ -553,6 +613,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(func=cmd_run)
 
     status_parser = subparsers.add_parser("status")
+    status_parser.add_argument("--json", action="store_true")
     status_parser.set_defaults(func=cmd_status)
 
     check_update_parser = subparsers.add_parser("check-update")
